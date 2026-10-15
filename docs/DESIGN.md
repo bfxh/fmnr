@@ -357,7 +357,8 @@ egui immediate-mode **无原生 backdrop blur**。方案：
 | M4 AI/兼容 | MCP server + CLI + HTTP + 拖放 + 默认程序注册 | 外部 MCP 客户端能 list/search/copy |
 | M5 插件 | WASM 宿主 + 图标/预览插件契约 | 装一个自定义预览插件并生效 |
 | M6 白板 | Board 布局 + 空间记忆模式 | 布置+持久化+恢复 |
-| M7 远程+WSL | SSH/SFTP 卷 + WSL UNC 识别 + wslpath | 连一台 SSH 主机浏览（WSL 仅契约测试） |
+| M7 远程+WSL | SSH/SFTP 卷 + WSL UNC 识别 + wslpath | ⚠️ **部分达成，出口判据未满足**：WSL 已本机实测通过（`wsl_live.rs`，真 distro 可浏览）；SSH/SFTP 只有接口 + 纯逻辑测试（端点解析、host key 决策、状态码分类），**未连过任何真实主机**，`ssh_live.rs` 无夹具时自动跳过。归档卷 `fmnr-archive` 已交付并实测（zip/tar/tgz） |
+| CI | — | 未做 |
 
 ---
 

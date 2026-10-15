@@ -1,0 +1,19 @@
+[package]
+name = "fmnr-remote"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+fmnr-core = { path = "../fmnr-core" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+futures = "0.3"
+async-trait = "0.1"
+tracing = { workspace = true }
+# default-features=false 是刻意的：russh 默认开 aws-lc-rs，那要 CMake+NASM，
+# 本机 windows-gnu 编不动。ring 变体实测可编（168 个依赖全绿）。
+russh = { version = "0.64.1", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = "3.0.1"
