@@ -120,10 +120,10 @@ fmnr/
 ├── crates/
 │   ├── fmnr-core/      # 纯库：卷/文件树/操作/搜索/配置（无 UI 依赖）
 │   ├── fmnr-fs/        # 本地文件系统 Volume（jwalk + tokio）
-│   ├── fmnr-archive/   # zip/tar/7z 只读挂载 Volume
-│   ├── fmnr-remote/    # SSH/SFTP、WebDAV Volume（russh / reqwest）
+│   ├── fmnr-archive/   # zip/tar/tar.gz 只读挂载 Volume（7z 未实现）
+│   ├── fmnr-remote/    # SSH/SFTP Volume（russh / russh-sftp）— 仅接口，未连过真实主机
 │   ├── fmnr-icons/     # 图标解析/渲染：内置集+覆盖解析+光栅化
-│   ├── fmnr-plugins/   # WASM 插件宿主（wasmtime + wit-bindgen）
+│   ├── fmnr-plugins/   # WASM 插件宿主（wasmi 解释器 + 自定义 core-module ABI）
 │   ├── fmnr-ai/        # MCP server + HTTP API
 │   ├── fmnr-ui/        # egui 前端（可执行）
 │   └── fmnr-cli/       # 命令行入口（可执行）
@@ -182,7 +182,7 @@ Zexor 有文件夹封面。轻量版：右键「设为封面」，存 `folder.sv
 
 | 类型 | 预览方式 | 说明 |
 |------|---------|------|
-| 文本/代码/HTML/JSON/Markdown | 内置渲染（syntect 高亮） | 只读；行内编辑 v2 候选 |
+| 文本/代码/HTML/JSON/Markdown | 内置渲染（**纯文本，无语法高亮**） | 只读；行内编辑 v2 候选；Markdown 大纲由插件 `md-outline` 提供 |
 | 图片 | resvg/image 解码 | 缩放/平移 |
 | 压缩包 | 导航进虚拟卷 | 双击进 zip 浏览 |
 | 视频/音频 | **不内置解码**：内嵌播放器调系统 codec 或降级「交给默认程序」+角标 | 避免 FFmpeg 体积/许可 |
@@ -273,17 +273,17 @@ egui immediate-mode **无原生 backdrop blur**。方案：
 | 工具链 | rustc/cargo | **1.99.0**（本机实测） | rustup 1.29.1；CI `@stable` |
 | 异步 | tokio | 1.x latest | |
 | 并行遍历 | jwalk | 0.9.0 | |
-| 目录监听 | notify | 9.0.0-rc.5 | rc，锁 `=9.0.0-rc.5` |
+| 目录监听 | ~~notify~~ **未实现** | — | 原计划锁 `=9.0.0-rc.5`；今天没有任何代码用到它，依赖条目已删 |
 | GUI | egui + eframe + egui_extras | latest | 自绘 |
 | 图标渲染 | resvg / usvg / tiny-skia | latest | SVG→纹理 |
-| 语法高亮 | syntect | latest | 代码预览 |
-| 归档 | zip / tar / sevenz-rust | latest | 只读 |
-| SSH/SFTP | russh / russh-sftp | latest | |
+| 语法高亮 | ~~syntect~~ **未实现** | — | 预览是纯文本渲染，代码里 0 处高亮逻辑；`syntect` 从未出现在 `Cargo.lock` |
+| 归档 | zip 9.0 / tar 0.4 / flate2 1.0 | 实测版本 | 只读、懒加载。**7z 未实现**（原计划 sevenz-rust，今天没有可验证的需求，不做占位声明） |
+| SSH/SFTP | russh / russh-sftp | 0.64.1 / 3.0.1 | **须 `default-features = false` + `ring`**：默认 `aws-lc-rs` 要 CMake+NASM，windows-gnu 编不动（实测 ring 变体 168 依赖可编） |
 | HTTP | axum | latest | |
 | MCP | 自实现 JSON-RPC over stdio（薄封装） | 视生态 | 可控 |
-| WASM | wasmtime + wit-bindgen | latest | 沙箱 |
-| 配置 | serde + toml | latest | |
-| 错误 | thiserror + anyhow | latest | |
+| WASM | **wasmi**（解释器，非原计划的 wasmtime + wit-bindgen） | 0.47 | 用户 2026-10-15 拍板。实测依赖树 wasmi 33 crates vs wasmtime 184（裸）/259（含 wasi），开发机空闲内存常年 1.3–1.8GB。代价：**没有 JIT**，故靠燃料表挡死循环（50M/次调用，每次重置）；ABI 走 core module + 自定义段，不是 component model |
+| 配置 | serde + **serde_json** | 实测 | 落盘格式是 **JSON**（`boards/<name>.json`），不是 TOML；`toml` 依赖条目已删 |
+| 错误 | thiserror | 2 | **只有 thiserror**；`anyhow` 全仓 0 处使用，从未进锁 |
 | 日志 | tracing | latest | |
 | 单 EXE | 静态链接 VCRT | — | `fmnr.exe` 无运行时依赖 |
 

@@ -27,13 +27,10 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
 jwalk = "0.9"
-notify = "=9.0.0-rc.5"
 resvg = "0.45"
 usvg = "0.45"
 tiny-skia = "0.11"
-image = "0.25"
 egui = "0.31"
 eframe = { version = "0.31", default-features = false, features = [
     "default_fonts",
@@ -42,8 +39,13 @@ eframe = { version = "0.31", default-features = false, features = [
     "x11",
 ] }
 egui_extras = { version = "0.31", features = ["image", "svg"] }
-rayon = "1"
 wasmi = "0.47"
+
+# 这里刻意**不留**「将来要用的」占位依赖。原先挂着 toml / notify / image / rayon
+# 四条，没有任何成员引用（`Cargo.lock` 里查得到是 0 个），代码里也用不到——
+# 它们只在 DESIGN 的技术选型表里撑场面，等于「文档声称有能力、锁文件里没有」。
+# 需要时再加，比让死条目继续把假能力坐实便宜。
+# 注：`egui_extras::image::*` 是 egui_extras 自己的重导出，不是 image crate。
 
 [profile.release]
 opt-level = 2
