@@ -34,7 +34,13 @@ jobs:
       # clippy --all-targets 才覆盖 tests/ benches：只查 lib 会漏掉
       # 「测试代码里的 lint」这类漂移。
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # --keep-going：不带它时，第一个判红的 crate 会挡住它的所有下游，
+      # 于是「本地绿但 ubuntu 红」要一轮才剥一个错（本仓首两轮 CI 就是这样：
+      # 第一轮 windows-future 依赖没门控，第二轮才露出 cfg(not(windows)) 里
+      # 的未用变量）。加它让一轮尽量把独立 crate 的问题一起报出来。
+      # 注意它仍**不能**穿透失败 crate 的下游（拿不到元数据就没法查），
+      # 所以这不是「一次全知」，只是把每轮的覆盖面撑大。
+      - run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
 
   # ── 门禁 2：主平台 + 可移植性 ──────────────────────────────────────
   # 钉的结论：全部单元/集成测试在 windows（真实目标平台，含 CreateProcessW

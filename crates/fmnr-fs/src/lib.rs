@@ -298,10 +298,16 @@ impl Volume for LocalVolume {
 
         #[cfg(not(windows))]
         {
-            // Unix: 简化——直接在 UI 侧用 std::process 替代，暂不实现此契约。
-            Err(Error::Unsupported(
-                "Unix spawn_external_open 暂未实现，退回 ShellExecute".into(),
-            ))
+            // Unix 侧的这条契约**没实现**：拿不到进程句柄就没有可靠的存活判定，
+            // 而「已在 XX 中打开」角标依赖它（见 DESIGN §4.7）。
+            // 这里用 `std::process::Command` 起进程是**不够**的——它给 PID 不给
+            // 与 Windows 等价的等待语义，且不解决「谁负责 reap」的问题；
+            // 与其给一个半对的实现，不如显式报错让人看见。
+            Err(Error::Unsupported(format!(
+                "非 Windows 平台的 spawn_external_open 未实现：\
+                 无法为 {} 记录 {program} 的进程存活，角标会失效",
+                full.display()
+            )))
         }
     }
 
