@@ -1,0 +1,19 @@
+[package]
+name = "fmnr-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fmnr"
+path = "src/main.rs"
+
+[dependencies]
+fmnr-core = { path = "../fmnr-core" }
+fmnr-fs = { path = "../fmnr-fs" }
+fmnr-ai = { path = "../fmnr-ai" }
+serde_json.workspace = true
+tokio.workspace = true
+clap = { version = "4", features = ["derive"] }

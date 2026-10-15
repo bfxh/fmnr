@@ -223,19 +223,26 @@ fn parse<T: for<'de> Deserialize<'de>>(v: Value) -> Result<T, RpcError> {
     serde_json::from_value(v).map_err(|e| RpcError::new(INVALID_PARAMS, e.to_string()))
 }
 
-/// 分发表。返回 `Result<Value, RpcError>`；`Value` 是 MCP 的 `content` 数组。
-pub async fn dispatch(volume: Arc<dyn Volume>, name: &str, args: Value) -> Result<Value, RpcError> {
+/// 分发表：工具名 + 参数 → **原始 payload**。
+///
+/// MCP 层（`server.rs`）把它包成 `content` 数组，CLI 直接打印 payload——
+/// 两条入口共用这一个 match，才不会出现「CLI 能删、MCP 不能」这类分叉。
+pub async fn dispatch_payload(
+    volume: Arc<dyn Volume>,
+    name: &str,
+    args: Value,
+) -> Result<Value, RpcError> {
     match name {
         "list_volume" => {
             let _: Value = parse(args)?;
             let id = volume.id();
-            Ok(text_result(json!({
+            Ok(json!({
                 "volumes": [{
                     "id": id.0,
                     "kind": format!("{:?}", volume.kind()),
                     "writable": volume.writable(),
                 }]
-            })))
+            }))
         }
 
         "list_dir" => {
@@ -263,9 +270,7 @@ pub async fn dispatch(volume: Arc<dyn Volume>, name: &str, args: Value) -> Resul
                     })
                 })
                 .collect();
-            Ok(text_result(
-                json!({ "path": path, "count": items.len(), "entries": items }),
-            ))
+            Ok(json!({ "path": path, "count": items.len(), "entries": items }))
         }
 
         "search" => {
@@ -280,12 +285,12 @@ pub async fn dispatch(volume: Arc<dyn Volume>, name: &str, args: Value) -> Resul
                 .search(&VPath(root.clone()), a.query.clone(), limit)
                 .await
                 .map_err(to_rpc)?;
-            Ok(text_result(json!({
+            Ok(json!({
                 "root": a.root,
                 "query": a.query,
                 "count": hits.len(),
                 "hits": hits,
-            })))
+            }))
         }
 
         "copy" | "move" => {
@@ -306,12 +311,12 @@ pub async fn dispatch(volume: Arc<dyn Volume>, name: &str, args: Value) -> Resul
                     .await
             }
             .map_err(to_rpc)?;
-            Ok(text_result(json!({
+            Ok(json!({
                 "done": report.done,
                 "skipped": report.skipped,
                 "aborted": report.aborted,
                 "bytes": report.bytes,
-            })))
+            }))
         }
 
         "delete" => {
@@ -322,11 +327,11 @@ pub async fn dispatch(volume: Arc<dyn Volume>, name: &str, args: Value) -> Resul
             let targets: Vec<VPath> = a.targets.iter().map(|s| VPath(s.into())).collect();
             let progress = Arc::new(fmnr_core::Progress::new());
             let report = volume.delete(&targets, progress).await.map_err(to_rpc)?;
-            Ok(text_result(json!({
+            Ok(json!({
                 "done": report.done,
                 "skipped": report.skipped,
                 "aborted": report.aborted,
-            })))
+            }))
         }
 
         "open" => {
@@ -334,11 +339,11 @@ pub async fn dispatch(volume: Arc<dyn Volume>, name: &str, args: Value) -> Resul
             let path = std::path::PathBuf::from(&a.path);
             let route = fmnr_core::open::route_open(&path, a.force_external);
             match route {
-                fmnr_core::open::OpenRoute::Preview => Ok(text_result(json!({
+                fmnr_core::open::OpenRoute::Preview => Ok(json!({
                     "route": "preview",
                     "path": a.path,
                     "note": "该类型走内置预览；本服务不渲染，请由 UI 呈现",
-                }))),
+                })),
                 fmnr_core::open::OpenRoute::External(default_prog) => {
                     let program = a.program.unwrap_or(default_prog);
                     let open = volume
@@ -348,12 +353,12 @@ pub async fn dispatch(volume: Arc<dyn Volume>, name: &str, args: Value) -> Resul
                     volume
                         .external_opens()
                         .insert(path.display().to_string(), open.clone());
-                    Ok(text_result(json!({
+                    Ok(json!({
                         "route": "external",
                         "path": a.path,
                         "program": open.program,
                         "started_at_ms": open.started_at_ms,
-                    })))
+                    }))
                 }
             }
         }
@@ -372,7 +377,7 @@ pub async fn dispatch(volume: Arc<dyn Volume>, name: &str, args: Value) -> Resul
                     })
                 })
                 .collect();
-            Ok(text_result(json!({ "count": items.len(), "opens": items })))
+            Ok(json!({ "count": items.len(), "opens": items }))
         }
 
         other => Err(RpcError::new(
@@ -394,6 +399,12 @@ fn to_rpc(e: fmnr_core::Error) -> RpcError {
 }
 
 /// MCP 工具返回体：`content` 是块数组。这里统一给一个 text 块，内容为 JSON 字符串。
+///
+/// 只在 MCP 边界加这层信封；CLI 直接用 `dispatch_payload` 的原始 JSON。
+pub async fn dispatch(volume: Arc<dyn Volume>, name: &str, args: Value) -> Result<Value, RpcError> {
+    dispatch_payload(volume, name, args).await.map(text_result)
+}
+
 fn text_result(payload: Value) -> Value {
     json!({
         "content": [{

@@ -6,6 +6,7 @@ members = [
     "crates/fmnr-icons",
     "crates/fmnr-ui",
     "crates/fmnr-ai",
+    "crates/fmnr-cli",
     "crates/fmnr-bench",
 ]
 
