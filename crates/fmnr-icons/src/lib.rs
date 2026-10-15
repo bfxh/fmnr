@@ -87,19 +87,28 @@ fn scan_overrides(dir: &Path, out: &mut HashMap<String, PathBuf>) {
 
 fn default_categories() -> HashMap<String, &'static str> {
     let mut m = HashMap::new();
-    for e in ["rs", "py", "js", "ts", "tsx", "jsx", "go", "c", "cpp", "h", "java", "rb", "sh"] {
+    for e in [
+        "rs", "py", "js", "ts", "tsx", "jsx", "go", "c", "cpp", "h", "java", "rb", "sh",
+    ] {
         m.insert(e.to_string(), "code");
     }
-    for e in ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "heic"] {
+    for e in [
+        "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "heic",
+    ] {
         m.insert(e.to_string(), "image");
     }
-    for e in ["mp4", "mkv", "avi", "mov", "webm", "mp3", "flac", "wav", "ogg"] {
+    for e in [
+        "mp4", "mkv", "avi", "mov", "webm", "mp3", "flac", "wav", "ogg",
+    ] {
         m.insert(e.to_string(), "media");
     }
     for e in ["zip", "tar", "gz", "7z", "rar", "bz2", "xz", "zst"] {
         m.insert(e.to_string(), "archive");
     }
-    for e in ["txt", "md", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "json", "toml", "yaml", "yml", "xml", "csv"] {
+    for e in [
+        "txt", "md", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "json", "toml", "yaml",
+        "yml", "xml", "csv",
+    ] {
         m.insert(e.to_string(), "doc");
     }
     for e in ["exe", "dll", "sys", "msi"] {

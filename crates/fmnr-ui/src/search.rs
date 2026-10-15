@@ -29,35 +29,10 @@ pub struct Hit {
 }
 
 /// 子串匹配，返回字符范围；不区分大小写时保留原文位置。
-pub fn find_range(haystack: &str, needle: &str, case_sensitive: bool) -> Option<std::ops::Range<usize>> {
-    if needle.is_empty() {
-        return None;
-    }
-    if case_sensitive {
-        return haystack.find(needle).map(|i| i..i + needle.len());
-    }
-    let h = haystack.to_lowercase();
-    let n = needle.to_lowercase();
-    // to_lowercase 对某些字符（ß 等）会改变长度，字节偏移可能失效，
-    // 故按 char 计数后再用 char_indices 还原到字节位置。
-    let hchars: Vec<char> = h.chars().collect();
-    let nchars: Vec<char> = n.chars().collect();
-    if nchars.len() > hchars.len() {
-        return None;
-    }
-    for i in 0..=(hchars.len() - nchars.len()) {
-        if hchars[i..i + nchars.len()] == nchars[..] {
-            let start = haystack.char_indices().nth(i).map(|(b, _)| b)?;
-            let end = haystack
-                .char_indices()
-                .nth(i + nchars.len())
-                .map(|(b, _)| b)
-                .unwrap_or(haystack.len());
-            return Some(start..end);
-        }
-    }
-    None
-}
+///
+/// 判定实现在内核（`fmnr_core::search`），与 MCP/CLI 的有界搜索共用一份——
+/// 否则「高亮命中」和「搜索命中」会给出不同答案。
+pub use fmnr_core::search::find_range;
 
 pub struct SearchState {
     pub hits: Vec<Hit>,

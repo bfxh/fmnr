@@ -86,10 +86,7 @@ pub struct OpRequest {
 }
 
 /// 在独立线程上跑一个操作，立刻把 `RunningOp` 交回 UI。
-pub fn spawn_op(
-    volume: Arc<dyn Volume>,
-    req: OpRequest,
-) -> Result<RunningOp, String> {
+pub fn spawn_op(volume: Arc<dyn Volume>, req: OpRequest) -> Result<RunningOp, String> {
     let (tx, rx): (Sender<OpOutcome>, Receiver<OpOutcome>) = mpsc::channel();
     let progress = Arc::new(Progress::new());
     let kind = req.kind.clone();
@@ -102,7 +99,10 @@ pub fn spawn_op(
     std::thread::Builder::new()
         .name("fmnr-op".into())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(e) => {
                     let _ = tx.send(OpOutcome::Failed(worker_kind, format!("runtime: {e}")));

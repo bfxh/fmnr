@@ -96,7 +96,9 @@ mod tests {
             IconKey::ByExtension("png".into()),
             IconKey::ByExtension("mp4".into()),
         ] {
-            let path = resolver.resolve(&key).unwrap_or_else(|| panic!("未解析出 {key:?}"));
+            let path = resolver
+                .resolve(&key)
+                .unwrap_or_else(|| panic!("未解析出 {key:?}"));
             let rgba = fmnr_icons::rasterize_svg(&path, ICON_SIZE)
                 .unwrap_or_else(|e| panic!("光栅化 {key:?} 失败：{e}"));
             assert_eq!(rgba.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);

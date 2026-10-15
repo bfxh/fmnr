@@ -15,7 +15,10 @@ use std::time::{Duration, Instant};
 
 /// 造一棵 GiB 级的树：每 64 MiB 一个文件，散在 4 个子目录。
 /// 刻意不用稀疏文件：那样量到的是元数据速度，不是数据搬运速度。
-fn build_fixture(root: &std::path::Path, gib: u64) -> std::io::Result<Vec<(std::path::PathBuf, u64)>> {
+fn build_fixture(
+    root: &std::path::Path,
+    gib: u64,
+) -> std::io::Result<Vec<(std::path::PathBuf, u64)>> {
     const CHUNK: usize = 1 << 20;
     let per_file = 64 * 1024 * 1024u64;
     let files = gib * 1024 * 1024 * 1024 / per_file;
@@ -110,9 +113,7 @@ fn main() {
     let ui_handle = {
         let stop = Arc::clone(&stop);
         let frames = Arc::clone(&frames);
-        std::thread::spawn(move || {
-            ui_loop(stop, frames, ui_progress, Duration::from_micros(833))
-        })
+        std::thread::spawn(move || ui_loop(stop, frames, ui_progress, Duration::from_micros(833)))
     };
 
     let sources: Vec<_> = made.iter().map(|(p, _)| p.clone()).collect();
@@ -176,7 +177,11 @@ fn main() {
         avg,
         1.0 / avg.as_secs_f64()
     );
-    println!("帧间隔 P95     {:?}  ({:.0} fps)", p95, 1.0 / p95.as_secs_f64());
+    println!(
+        "帧间隔 P95     {:?}  ({:.0} fps)",
+        p95,
+        1.0 / p95.as_secs_f64()
+    );
     println!(
         "帧间隔 最坏    {:?}  ({:.0} fps)",
         worst,

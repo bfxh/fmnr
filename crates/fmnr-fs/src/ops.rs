@@ -125,8 +125,12 @@ pub fn copy_tree(
     progress: &Progress,
     remove_src: bool,
 ) -> Result<ItemOutcome> {
-    let meta = std::fs::symlink_metadata(src)
-        .map_err(|e| Error::Io(std::io::Error::new(e.kind(), format!("{}: {e}", src.display()))))?;
+    let meta = std::fs::symlink_metadata(src).map_err(|e| {
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("{}: {e}", src.display()),
+        ))
+    })?;
 
     if meta.is_dir() {
         std::fs::create_dir_all(dest).map_err(Error::Io)?;
@@ -251,8 +255,8 @@ pub fn transfer(
 #[cfg(windows)]
 pub fn delete_to_recycle_bin(targets: &[PathBuf]) -> Result<usize> {
     use windows::Win32::UI::Shell::{
-        SHFileOperationW, SHFILEOPSTRUCTW, FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
-        FOF_NOERRORUI, FOF_SILENT,
+        SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FO_DELETE,
+        SHFILEOPSTRUCTW,
     };
 
     if targets.is_empty() {
@@ -325,13 +329,8 @@ pub fn recycle_bin_items(root: &Path) -> Result<i64> {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    unsafe {
-        SHQueryRecycleBinW(
-            windows::core::PCWSTR(root_wide.as_ptr()),
-            &mut info,
-        )
-    }
-    .map_err(|e| Error::Other(format!("SHQueryRecycleBinW: {e}")))?;
+    unsafe { SHQueryRecycleBinW(windows::core::PCWSTR(root_wide.as_ptr()), &mut info) }
+        .map_err(|e| Error::Other(format!("SHQueryRecycleBinW: {e}")))?;
     Ok(info.i64NumItems)
 }
 
@@ -406,7 +405,14 @@ mod tests {
         std::fs::write(src.join("small.txt"), b"hi").unwrap();
 
         let progress = Progress::new();
-        let report = transfer(std::slice::from_ref(&src), &dst, ConflictPolicy::Skip, &progress, false).unwrap();
+        let report = transfer(
+            std::slice::from_ref(&src),
+            &dst,
+            ConflictPolicy::Skip,
+            &progress,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(report.done, 1);
         assert_eq!(report.bytes, payload.len() as u64 + 2);
@@ -430,7 +436,14 @@ mod tests {
         std::fs::write(&src, b"payload").unwrap();
 
         let progress = Progress::new();
-        let report = transfer(std::slice::from_ref(&src), &dst, ConflictPolicy::Skip, &progress, true).unwrap();
+        let report = transfer(
+            std::slice::from_ref(&src),
+            &dst,
+            ConflictPolicy::Skip,
+            &progress,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(report.done, 1);
         assert!(!src.exists(), "移动必须删掉源");
@@ -448,7 +461,14 @@ mod tests {
 
         let progress = Progress::new();
         progress.cancel();
-        let report = transfer(std::slice::from_ref(&src), &dst, ConflictPolicy::Skip, &progress, false).unwrap();
+        let report = transfer(
+            std::slice::from_ref(&src),
+            &dst,
+            ConflictPolicy::Skip,
+            &progress,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(report.aborted, 1);
         assert_eq!(report.done, 0);
@@ -487,10 +507,7 @@ mod tests {
         let after = recycle_bin_items(volume_root).expect("SHQueryRecycleBinW");
 
         assert_eq!(n, 1);
-        assert!(
-            !victim.exists(),
-            "文件应已从原位置移走（回收站不是软删除）"
-        );
+        assert!(!victim.exists(), "文件应已从原位置移走（回收站不是软删除）");
         assert_eq!(after, before + 1, "回收站条目数必须 +1");
         std::fs::remove_dir_all(&d).ok();
     }

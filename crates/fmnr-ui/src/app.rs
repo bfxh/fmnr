@@ -1,4 +1,5 @@
 use eframe::egui::{self, Color32, Key, Modifiers};
+use fmnr_core::open::{route_open as core_route_open, OpenRoute};
 use fmnr_core::{ListOpts, SortOrder, VPath, Volume};
 use fmnr_fs::LocalVolume;
 use futures::StreamExt;
@@ -158,7 +159,7 @@ impl App {
     }
 
     fn spawn_external(&mut self, path: &Path) {
-        let route = route_open(path);
+        let route = core_route_open(path, false);
         let program = match route {
             OpenRoute::Preview => {
                 self.open_preview(path);
@@ -312,7 +313,12 @@ impl App {
             });
             return;
         }
-        self.start_op(kind, sources, Some(VPath(dest)), fmnr_core::ConflictPolicy::Skip);
+        self.start_op(
+            kind,
+            sources,
+            Some(VPath(dest)),
+            fmnr_core::ConflictPolicy::Skip,
+        );
     }
 
     /// 列出「源名在目标目录已存在」的条目名。
@@ -800,13 +806,18 @@ impl App {
                     } else {
                         egui::RichText::new(format!("{} B", hit.size)).weak()
                     };
-                    let resp = ui.horizontal(|ui| {
-                        ui.label(icon);
-                        ui.label(label);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(size);
-                        });
-                    }).response;
+                    let resp = ui
+                        .horizontal(|ui| {
+                            ui.label(icon);
+                            ui.label(label);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(size);
+                                },
+                            );
+                        })
+                        .response;
                     if resp.double_clicked() {
                         jump = Some((hit.path.clone(), hit.is_dir));
                         break;
@@ -967,7 +978,11 @@ impl App {
                     Pane::Right => &mut self.right_filter,
                 };
                 ui.label("🔍");
-                ui.add(egui::TextEdit::singleline(filter).hint_text("过滤…").desired_width(width - 60.0));
+                ui.add(
+                    egui::TextEdit::singleline(filter)
+                        .hint_text("过滤…")
+                        .desired_width(width - 60.0),
+                );
                 if ui.button("✕").clicked() {
                     filter.clear();
                 }
@@ -1023,47 +1038,43 @@ impl App {
             // 闭包内不借用 self（避免与 selected 冲突），事件收集到闭包外处理。
             let mut clicked: Option<usize> = None;
             let mut dbl: Option<usize> = None;
-            egui::ScrollArea::vertical().show_rows(
-                ui,
-                24.0,
-                entries.len(),
-                |ui, row_range| {
-                    for i in row_range {
-                        let e = entries[i];
-                        let badge = badges[i].as_ref();
-                        let icon = icon_handles[i].clone();
-                        ui.horizontal(|ui| {
-                            // 图标：自绘 SVG 纹理；缺失时退回字形占位
-                            match icon {
-                                Some(h) => {
-                                    ui.add(egui::Image::new((h.id(), egui::vec2(16.0, 16.0))));
-                                }
-                                None => {
-                                    ui.label(if e.is_dir { "📁" } else { "📄" });
-                                }
+            egui::ScrollArea::vertical().show_rows(ui, 24.0, entries.len(), |ui, row_range| {
+                for i in row_range {
+                    let e = entries[i];
+                    let badge = badges[i].as_ref();
+                    let icon = icon_handles[i].clone();
+                    ui.horizontal(|ui| {
+                        // 图标：自绘 SVG 纹理；缺失时退回字形占位
+                        match icon {
+                            Some(h) => {
+                                ui.add(egui::Image::new((h.id(), egui::vec2(16.0, 16.0))));
                             }
-                            // 角标：左侧圆点，仅在该进程仍存活时出现
-                            if let Some(o) = badge {
-                                ui.label(
-                                    egui::RichText::new("●")
-                                        .size(10.0)
-                                        .color(color_for(&o.program)),
-                                );
+                            None => {
+                                ui.label(if e.is_dir { "📁" } else { "📄" });
                             }
-                            let resp = ui.selectable_label(*selected == Some(i), &e.name);
-                            if let Some(o) = badge {
-                                resp.clone().on_hover_text(format!("已在 {} 中打开", o.program));
-                            }
-                            if resp.clicked() {
-                                clicked = Some(i);
-                            }
-                            if resp.double_clicked() {
-                                dbl = Some(i);
-                            }
-                        });
-                    }
-                },
-            );
+                        }
+                        // 角标：左侧圆点，仅在该进程仍存活时出现
+                        if let Some(o) = badge {
+                            ui.label(
+                                egui::RichText::new("●")
+                                    .size(10.0)
+                                    .color(color_for(&o.program)),
+                            );
+                        }
+                        let resp = ui.selectable_label(*selected == Some(i), &e.name);
+                        if let Some(o) = badge {
+                            resp.clone()
+                                .on_hover_text(format!("已在 {} 中打开", o.program));
+                        }
+                        if resp.clicked() {
+                            clicked = Some(i);
+                        }
+                        if resp.double_clicked() {
+                            dbl = Some(i);
+                        }
+                    });
+                }
+            });
 
             if let Some(i) = clicked {
                 match which {
@@ -1092,25 +1103,22 @@ impl App {
                     ui.label(egui::RichText::new("⚠ 已截断（超过 1 MiB）").weak());
                 }
                 egui::ScrollArea::both().show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(text.as_str()).monospace())
-                            .wrap(),
-                    );
+                    ui.add(egui::Label::new(egui::RichText::new(text.as_str()).monospace()).wrap());
                 });
             }
             PreviewContent::Image(img) => {
                 let handle = pv.texture.get_or_insert_with(|| {
                     ctx.load_texture("preview", img.clone(), egui::TextureOptions::LINEAR)
                 });
-                ui.add(egui::Image::new((handle.id(), handle.size_vec2())).fit_to_exact_size(
-                    {
+                ui.add(
+                    egui::Image::new((handle.id(), handle.size_vec2())).fit_to_exact_size({
                         let s = ui.available_size();
                         let scale = (s.x / handle.size_vec2().x)
                             .min(s.y / handle.size_vec2().y)
                             .min(1.0);
                         handle.size_vec2() * scale
-                    },
-                ));
+                    }),
+                );
             }
             PreviewContent::Binary { size } => {
                 ui.label(format!("二进制文件（{size} 字节），无法文本预览"));
@@ -1199,36 +1207,4 @@ fn crumbs_to_path(full: &Path, upto: usize) -> PathBuf {
         p.push(c.as_os_str());
     }
     p
-}
-
-/// 双击分流：预览优先，外置兜底。
-enum OpenRoute {
-    /// 内置预览面板（M3 统一预览）
-    Preview,
-    /// 交给外部程序打开
-    External(String),
-}
-
-/// 可预览扩展名（M3 覆盖文本/代码/图片；音视频仍走外置，不内嵌 FFmpeg）。
-fn is_previewable(path: &Path) -> bool {
-    match path.extension().map(|e| e.to_string_lossy().to_lowercase()) {
-        Some(ext) => matches!(
-            ext.as_str(),
-            "txt" | "md" | "rs" | "py" | "js" | "ts" | "json" | "toml" | "yaml" | "yml"
-                | "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg"
-        ),
-        None => false,
-    }
-}
-
-/// 默认外部程序：未知类型交给系统默认（以扩展名匹配），已知文本类型先走内置预览。
-fn route_open(path: &Path) -> OpenRoute {
-    if is_previewable(path) {
-        OpenRoute::Preview
-    } else {
-        let program = std::env::var("COMSPEC")
-            .or_else(|_| std::env::var("SHELL"))
-            .unwrap_or_else(|_| "cmd.exe".into());
-        OpenRoute::External(program)
-    }
 }

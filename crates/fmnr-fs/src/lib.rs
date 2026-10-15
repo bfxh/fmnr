@@ -51,8 +51,12 @@ impl Volume for LocalVolume {
 
     async fn list(&self, path: &VPath, opts: &ListOpts) -> Result<Vec<Entry>> {
         let dir = self.resolve(path);
-        let read_dir = std::fs::read_dir(&dir)
-            .map_err(|e| Error::Io(std::io::Error::new(e.kind(), format!("{}: {e}", dir.display()))))?;
+        let read_dir = std::fs::read_dir(&dir).map_err(|e| {
+            Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("{}: {e}", dir.display()),
+            ))
+        })?;
 
         let mut entries = Vec::new();
         for item in read_dir {
@@ -114,7 +118,11 @@ impl Volume for LocalVolume {
             entries.push(Entry {
                 name,
                 is_dir,
-                size: if meta.is_file() { Some(meta.len()) } else { None },
+                size: if meta.is_file() {
+                    Some(meta.len())
+                } else {
+                    None
+                },
                 modified: meta.modified().ok(),
                 icon_key,
                 attrs,
@@ -136,7 +144,10 @@ impl Volume for LocalVolume {
             .map_err(Error::Io)?;
         let chunk = bytes.to_vec();
         let stream = futures::stream::iter(std::iter::once(Ok(chunk)));
-        Ok(Box::new(stream) as Box<dyn futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + Unpin>)
+        Ok(Box::new(stream)
+            as Box<
+                dyn futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + Unpin,
+            >)
     }
 
     async fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
@@ -159,11 +170,7 @@ impl Volume for LocalVolume {
     /// 让外部程序打开指定文件，记录进程句柄/程序名、启动时间。
     /// Windows: 走 CreateProcessW，不走 ShellExecute；派生外部窗口可见状态。
     /// 只读卷（归档/远程）返回 Unsupported。
-    async fn spawn_external_open(
-        &self,
-        file_path: &VPath,
-        program: &str,
-    ) -> Result<ExternalOpen> {
+    async fn spawn_external_open(&self, file_path: &VPath, program: &str) -> Result<ExternalOpen> {
         let full = self.resolve(file_path);
         if !full.exists() {
             return Err(Error::NotFound(full.display().to_string()));
@@ -174,15 +181,15 @@ impl Volume for LocalVolume {
             use std::os::windows::ffi::OsStrExt;
             use windows::Win32::Foundation::GetLastError;
             use windows::Win32::System::Threading::{
-                CreateProcessW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+                CreateProcessW, CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT,
+                PROCESS_INFORMATION, STARTUPINFOW,
             };
 
             // `CreateProcessW` 的 lpApplicationName **不搜索 PATH**：传 "cmd.exe"
             // 会直接 ERROR_FILE_NOT_FOUND。必须先自己解析成绝对路径。
             let (prog_raw, args) = split_program(program);
-            let exe = resolve_program(&prog_raw).ok_or_else(|| {
-                Error::NotFound(format!("找不到可执行文件：{prog_raw}"))
-            })?;
+            let exe = resolve_program(&prog_raw)
+                .ok_or_else(|| Error::NotFound(format!("找不到可执行文件：{prog_raw}")))?;
 
             let cmdline = if args.is_empty() {
                 format!("\"{}\" \"{}\"", exe.display(), full.display())
@@ -203,6 +210,14 @@ impl Volume for LocalVolume {
             };
             let mut pi = PROCESS_INFORMATION::default();
 
+            // `CREATE_NEW_CONSOLE` 不是装饰：不指定 STARTF_USESTDHANDLES 时，
+            // Windows **总会**把父进程的标准句柄复制给子进程（与 bInheritHandles
+            // 无关）。对 stdio MCP server 来说那是致命的——子进程会往
+            // stdout（JSON-RPC 通道）里写自己的横幅，客户端立刻收到非法帧。
+            // 给子进程一个独立控制台，它就与我们的 stdio 彻底脱钩；
+            // GUI 程序本来就没有控制台，该标志对其无影响（不会闪黑框）。
+            let flags = CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE;
+
             let ok = unsafe {
                 CreateProcessW(
                     windows::core::PCWSTR(exe_wide.as_ptr()),
@@ -210,7 +225,7 @@ impl Volume for LocalVolume {
                     None,
                     None,
                     false,
-                    CREATE_UNICODE_ENVIRONMENT,
+                    flags,
                     None,
                     None,
                     &si,
@@ -292,7 +307,11 @@ impl Volume for LocalVolume {
         spawn_blocking(move || ops::transfer(&srcs, &dest, policy, &progress, true)).await
     }
 
-    async fn delete(&self, targets: &[VPath], progress: std::sync::Arc<Progress>) -> Result<OpReport> {
+    async fn delete(
+        &self,
+        targets: &[VPath],
+        progress: std::sync::Arc<Progress>,
+    ) -> Result<OpReport> {
         let paths = self.resolve_all(targets);
         let (bytes, files) = paths.iter().fold((0u64, 0u64), |acc, p| {
             let (b, f) = ops::dir_stats(p);
@@ -323,6 +342,32 @@ impl Volume for LocalVolume {
     async fn create_dir(&self, path: &VPath) -> Result<()> {
         let full = self.resolve(path);
         spawn_blocking(move || std::fs::create_dir(&full).map_err(Error::Io)).await
+    }
+
+    async fn search(&self, root: &VPath, needle: String, limit: usize) -> Result<Vec<VPath>> {
+        let dir = self.resolve(root);
+        if !dir.is_dir() {
+            return Err(Error::NotFound(format!("{} 不是目录", dir.display())));
+        }
+        let hits = spawn_blocking(move || {
+            let mut out = Vec::new();
+            for entry in jwalk::WalkDir::new(&dir)
+                .skip_hidden(true)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                if out.len() >= limit {
+                    break;
+                }
+                let name = entry.file_name().to_string_lossy();
+                if fmnr_core::search::name_matches(&name, &needle) {
+                    out.push(VPath(entry.path()));
+                }
+            }
+            Ok(out)
+        })
+        .await?;
+        Ok(hits)
     }
 }
 
@@ -495,7 +540,8 @@ mod watch_tests {
     /// 本进程当前的内核句柄数。
     fn handle_count() -> u32 {
         let mut n = 0u32;
-        unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) }.expect("GetProcessHandleCount");
+        unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) }
+            .expect("GetProcessHandleCount");
         n
     }
 
@@ -545,10 +591,7 @@ mod watch_tests {
             || vol.external_opens().get(&key).is_none(),
             std::time::Duration::from_secs(5),
         );
-        assert!(
-            cleared,
-            "进程已退出但角标仍在——存活判定没有跟随真实进程"
-        );
+        assert!(cleared, "进程已退出但角标仍在——存活判定没有跟随真实进程");
         assert_eq!(vol.external_opens().len(), 0);
         std::fs::remove_file(&file).ok();
     }
@@ -601,10 +644,7 @@ mod watch_tests {
 
         // 预热：让首次的运行时/线程池开销先落定
         for _ in 0..3 {
-            let _ = rt.block_on(vol.spawn_external_open(
-                &VPath(file.clone()),
-                "cmd.exe /c exit",
-            ));
+            let _ = rt.block_on(vol.spawn_external_open(&VPath(file.clone()), "cmd.exe /c exit"));
         }
         // 等预热批次全部回收
         std::thread::sleep(std::time::Duration::from_millis(600));

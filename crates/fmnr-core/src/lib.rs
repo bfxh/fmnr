@@ -1,3 +1,6 @@
+pub mod open;
+pub mod search;
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -101,7 +104,9 @@ pub struct ExternalOpens {
 
 impl ExternalOpens {
     pub fn new() -> Self {
-        Self { map: std::sync::Mutex::new(Vec::new()) }
+        Self {
+            map: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
     /// 注册一个文件的外置打开。
@@ -118,8 +123,13 @@ impl ExternalOpens {
     /// 按文件 ID 取状态。
     pub fn get<N: AsRef<str>>(&self, file_id: N) -> Option<ExternalOpen> {
         let map = self.map.lock().unwrap();
-        map.iter()
-            .find_map(|(id, o)| if id == file_id.as_ref() { Some(o.clone()) } else { None })
+        map.iter().find_map(|(id, o)| {
+            if id == file_id.as_ref() {
+                Some(o.clone())
+            } else {
+                None
+            }
+        })
     }
 
     /// 进程退出时移除它对应的所有条目。
@@ -226,7 +236,8 @@ impl Progress {
 
     /// 请求取消：工作线程在分块循环里轮询 `is_cancelled()`。
     pub fn cancel(&self) {
-        self.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -293,11 +304,7 @@ pub trait Volume: Send + Sync {
 
     /// 让外部程序打开指定文件，记录进程句柄/程序名、启动时间。
     /// 只读卷（归档、远程）返回 Unsupported。返回失败原因。
-    async fn spawn_external_open(
-        &self,
-        file_path: &VPath,
-        program: &str,
-    ) -> Result<ExternalOpen>;
+    async fn spawn_external_open(&self, file_path: &VPath, program: &str) -> Result<ExternalOpen>;
 
     /// 外部打开状态登记表（角标注入与退出清理所用）。
     fn external_opens(&self) -> &ExternalOpens;
@@ -331,4 +338,11 @@ pub trait Volume: Send + Sync {
 
     /// 新建目录。
     async fn create_dir(&self, path: &VPath) -> Result<()>;
+
+    /// 在 `root` 子树内按**文件名子串**搜索（大小写不敏感），最多返回 `limit` 条。
+    ///
+    /// 这是给 MCP / CLI 这类「问一次要一批结果」的客户端用的有界接口。
+    /// UI 另有一条流式变体（`fmnr-ui::search`），为的是「首屏 <500ms」口径下
+    /// 先给用户看一批再补——两者命中判定必须一致，改动时一起改。
+    async fn search(&self, root: &VPath, needle: String, limit: usize) -> Result<Vec<VPath>>;
 }

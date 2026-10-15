@@ -59,7 +59,9 @@ pub fn classify(path: &Path, bytes: &[u8], truncated: bool) -> PreviewContent {
     // 文本：前 8 KiB 含 NUL 视为二进制。
     let probe = &bytes[..bytes.len().min(8192)];
     if probe.contains(&0) {
-        return PreviewContent::Binary { size: bytes.len() as u64 };
+        return PreviewContent::Binary {
+            size: bytes.len() as u64,
+        };
     }
 
     let mut text = String::from_utf8_lossy(bytes).into_owned();
