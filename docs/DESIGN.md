@@ -11,7 +11,7 @@
 1. 「Zexor 的 UX 还是可以的」—— 参考对象，不等于照抄。
 2. 用 **Rust** 写，**最新工具链**。
 3. 文件管理器要**独立**：不依赖系统文件管理器。
-4. 知道子系统里有其他系统 —— 本机 WSL 未启用，因此**按规范实现 WSL 感知，无法本机验证**（见 §6.3）。
+4. 知道子系统里有其他系统 —— 本机 WSL **已启用**（2026-10-16 实测：`Ubuntu-24.04`、`docker-desktop`），故 WSL 感知**已在本机实测**，不再是「按规范实现、无法验证」（见 §6.3、附录 A）。
 5. **图标可以随意更改** —— 指**文件图标**：自绘渲染、不读系统 shell 图标。
 6. **统一预览（UV）+ 状态可见**：部分文件用内建预览打开，部分交给默认软件打开，且**要让用户知道它已被默认软件打开**。
 7. 视觉喜欢 **iOS 26 Liquid Glass**（透明玻璃、胶囊体）；Zexor 部分 UX 不喜欢（硬核、键位隐藏、双击直丢系统）。
@@ -28,7 +28,7 @@
 | R1 | 用 Rust、最新工具链 | Rust **stable 1.99.0**（本机 `rustc 1.99.0 / cargo 1.99.0`）。工具链写 `stable = "1.99"`，不加 nightly | dist 的 `0.100.0` 是**预发布**编号，正式 stable 就是 1.99.0，别被误导。升级走 `rustup update`，CI 用 `@stable` |
 | R2 | 独立于系统文件管理器 | 自研目录枚举、自绘图标、自带预览、自带打开逻辑；核心链路不 shell out 给 explorer/xdg-open | 「独立」≠ 完全不接系统：注册默认程序、调用系统库仍需系统 API。独立指**核心浏览/操作不经过资源管理器** |
 | R3 | 文件图标随意更改 | 内置图标管线：内置集 + 每扩展名覆盖 + 每文件名覆盖 + 每文件 hash 覆盖 + 主题打包 | 用户强调是**文件图标**（非文件夹封面），两者分开治理（§4.5/§4.6） |
-| R4 | 知道 WSL 里还有其他系统 | 识别 `\\wsl$\<distro>\...` UNC + `wslpath` 往返；区分 distro | **本机 WSL 未启用**（`wsl -l -v` 无输出）⇒ 按规范实现 + 契约测试桩 + 标注未真实验证 |
+| R4 | 知道 WSL 里还有其他系统 | 识别 `\\wsl$\<distro>\...` UNC + `wslpath` 往返；区分 distro | **本机已实测**（2026-10-16，WSL2 装了 `Ubuntu-24.04`/`docker-desktop`）⇒ `fmnr-fs/tests/wsl_live.rs` 跑真路径；唯一仍未实测的是「未安装 WSL」的错误文案，故不做文案匹配，可用性按退出码判 |
 | R5 | 统一预览 + 状态可见 | 双击优先内建预览；外置打开走自 spawn 拿句柄 + UI 状态角标「已在 XX 打开」，进程退出消失 | 关键：**自己 spawn 而非 ShellExecute**，否则拿不到进程句柄做存活检测。见 §4.7 |
 | R6 | iOS 26 Liquid Glass | 玻璃半透明层 + 胶囊圆角 + spring 动效，egui acrylic 近似 | immediate-mode 做不了像素级多层 backdrop blur，用窗口 acrylic + 面板半透明近似（§5） |
 | R7 | Zexor 式 UX | 借：双栏+面包屑过滤、空间白板、单 EXE、滚轮调密度。避：硬核暗色、键位隐藏、双击直丢系统、全家桶 | Zexor 闭源（languages API 空），借鉴只能基于官网描述，属**假设**，需评测检验 |
@@ -339,7 +339,7 @@ egui immediate-mode **无原生 backdrop blur**。方案：
 | Liquid Glass 近似不够「真玻璃」 | 中 | 文档标注近似；v3 评估 wgpu 后端 |
 | 外置进程句柄泄漏/僵死 | 中 | spawn 后登记，UI 关闭时 kill 子进程；心跳超时兜底 |
 | 图标 hash 覆盖在远程卷失效 | 中 | 远程卷只走扩展名/文件名覆盖 |
-| WSL 无法本机验证 | 中 | 契约测试桩 + 标注；启用 WSL 后补验证 |
+| ~~WSL 无法本机验证~~ → **已消解** | 低 | 2026-10-16 本机装了 WSL2，`wsl_live.rs` 用真 distro 跑通「UNC 可 read_dir + wslpath 往返落同一文件」；剩余风险只在「无 WSL 的 CI 机器」，测试据此自动跳过而非判红 |
 | MCP 生态协议变更 | 中 | 薄封装，协议层可替换 |
 | 归档/远程卷性能 | 中 | 只读 + 懒加载；大 zip 不全量枚举 |
 | 单 EXE 与 VCRT 静态链接体积/兼容 | 低 | 默认静态链接 CRT |
@@ -388,7 +388,7 @@ egui immediate-mode **无原生 backdrop blur**。方案：
 | Zexor 仓无源码 | api.github.com/repos/metalbug/Zexor | languages API 空 |
 | Rust 本机 1.99.0 | `rustc/cargo --version` | 本机实测 |
 | stable 预发布 0.100.0 | static.rust-lang.org channel-rust-stable.toml | HTTP |
-| 本机 WSL 未启用 | `wsl -l -v` 无输出 | 本机实测 |
+| 本机 WSL **已启用**（v1 曾记为未启用，已作废） | `wsl -l -v` → `Ubuntu-24.04`、`docker-desktop`（WSL2，均 Stopped）；`\\wsl$\Ubuntu-24.04\home` 与 `\\wsl.localhost\…` 都能 `read_dir`；`wslpath` 双向可用 | 本机实测 2026-10-16 |
 | iced 0.14.0 / slint 1.18.1 / notify 9.0.0-rc.5 / jwalk 0.9.0 | crates.io API | HTTP |
 | Data Mountain 等论文 | microsoft.com/research / ACM / tandfonline | WebSearch |
 | egui 选型、Liquid Glass 近似 | 本机 Rust GUI 经验 + 纯Rust自绘约束 | 推理（标注为判断，非实测） |

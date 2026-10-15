@@ -19,7 +19,13 @@ pub struct LocalVolume {
 impl LocalVolume {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
-        let id = VolumeId(format!("local:{}", root.display()));
+        // WSL UNC 的卷名用 `wsl:<distro>`（DESIGN §4.3 的命名），
+        // 而不是把 `\\wsl.localhost\Ubuntu` 整条塞进 id——那会让同一
+        // distro 的不同子目录看起来像不同的卷。
+        let id = match fmnr_core::wsl::parse_wsl_unc(&root) {
+            Some(u) => fmnr_core::wsl::wsl_volume_id(&u.distro),
+            None => VolumeId(format!("local:{}", root.display())),
+        };
         Self {
             id,
             root,
@@ -47,7 +53,14 @@ impl Volume for LocalVolume {
     }
 
     fn kind(&self) -> VolumeKind {
-        VolumeKind::Local
+        // WSL 的 UNC 在 Windows 侧就是可 read_dir 的普通目录，所以复用本实现；
+        // 但**卷的类型必须如实报 Wsl**——图标管线靠它跳过 hash 覆盖
+        // （DESIGN §4.4：远程/虚拟卷做 hash 代价太高）。
+        if fmnr_core::wsl::looks_like_wsl_unc(&self.root) {
+            VolumeKind::Wsl
+        } else {
+            VolumeKind::Local
+        }
     }
 
     async fn list(&self, path: &VPath, opts: &ListOpts) -> Result<Vec<Entry>> {

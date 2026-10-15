@@ -1,0 +1,20 @@
+[package]
+name = "fmnr-archive"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+fmnr-core = { path = "../fmnr-core" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+async-trait = "0.1"
+futures = "0.3"
+zip = "9.0"
+tar = "0.4"
+flate2 = "1.0"
+
+[dev-dependencies]
+tokio = { workspace = true }

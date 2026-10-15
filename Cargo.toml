@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/fmnr-core",
     "crates/fmnr-fs",
+    "crates/fmnr-archive",
     "crates/fmnr-icons",
     "crates/fmnr-plugins",
     "crates/fmnr-ui",
