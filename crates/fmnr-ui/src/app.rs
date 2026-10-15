@@ -90,7 +90,7 @@ enum ViewMode {
     Board,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Hash)]
 enum Pane {
     Left,
     Right,
@@ -106,7 +106,7 @@ struct ConflictPrompt {
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(cjk_font_ok: bool) -> Self {
         let home = dirs_home();
         let volume = Arc::new(LocalVolume::new(home.clone()));
         let mut app = Self {
@@ -122,7 +122,13 @@ impl App {
             sort: SortOrder::Name,
             left_filter: String::new(),
             right_filter: String::new(),
-            status: String::new(),
+            // 没装到 CJK 字体的话，界面所有中文都是豆腐块，而用户无从知道
+            // 是"程序坏了"还是"这台机没字体"。这条要说出来。
+            status: if cjk_font_ok {
+                String::new()
+            } else {
+                "⚠ 未找到中文字体，界面文案会显示成 □□；候选路径见 docs/DESIGN.md §5".to_string()
+            },
             preview: None,
             icons: crate::icons::IconCache::new(
                 overrides_dir(),
@@ -1298,142 +1304,144 @@ impl App {
         let is_active = self.active_pane == which;
         let _ = is_active;
 
-        ui.vertical(|ui| {
-            ui.set_width(width);
-            // 面包屑 + 行内过滤
-            ui.horizontal(|ui| {
-                let crumbs = breadcrumbs(&path);
-                for (i, c) in crumbs.iter().enumerate() {
-                    if ui.button(c).clicked() {
-                        let target = crumbs_to_path(&path, i);
-                        match which {
-                            Pane::Left => self.left_path = target,
-                            Pane::Right => self.right_path = target,
-                        }
-                        self.refresh();
-                    }
-                    if i + 1 < crumbs.len() {
-                        ui.label("›");
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                let filter = match which {
-                    Pane::Left => &mut self.left_filter,
-                    Pane::Right => &mut self.right_filter,
-                };
-                ui.label("🔍");
-                ui.add(
-                    egui::TextEdit::singleline(filter)
-                        .hint_text("过滤…")
-                        .desired_width(width - 60.0),
-                );
-                if ui.button("✕").clicked() {
-                    filter.clear();
-                }
-            });
-            ui.separator();
-
-            // 列视图
-            let base = match which {
-                Pane::Left => self.left_path.clone(),
-                Pane::Right => self.right_path.clone(),
-            };
-            let entries: Vec<&fmnr_core::Entry> = {
-                let all = match which {
-                    Pane::Left => &self.left_entries,
-                    Pane::Right => &self.right_entries,
-                };
-                let filter = match which {
-                    Pane::Left => &self.left_filter,
-                    Pane::Right => &self.right_filter,
-                };
-                if filter.is_empty() {
-                    all.iter().collect()
-                } else {
-                    let f = filter.to_lowercase();
-                    all.iter()
-                        .filter(|e| e.name.to_lowercase().contains(&f))
-                        .collect()
-                }
-            };
-
-            // 文件路径 -> 外置打开状态的索引（角标注入用）
-            let badges: Vec<Option<fmnr_core::ExternalOpen>> = entries
-                .iter()
-                .map(|e| {
-                    self.volume
-                        .external_opens()
-                        .get(base.join(&e.name).display().to_string())
-                })
-                .collect();
-
-            // 图标纹理预先解析（闭包内不能可变借用 self.icons）。
-            let ctx = ui.ctx().clone();
-            let icon_handles: Vec<Option<egui::TextureHandle>> = entries
-                .iter()
-                .map(|e| self.icons.get(&ctx, &e.icon_key))
-                .collect();
-
-            let selected = match which {
-                Pane::Left => &mut self.left_selected,
-                Pane::Right => &mut self.right_selected,
-            };
-
-            // 闭包内不借用 self（避免与 selected 冲突），事件收集到闭包外处理。
-            let mut clicked: Option<usize> = None;
-            let mut dbl: Option<usize> = None;
-            egui::ScrollArea::vertical().show_rows(ui, 24.0, entries.len(), |ui, row_range| {
-                for i in row_range {
-                    let e = entries[i];
-                    let badge = badges[i].as_ref();
-                    let icon = icon_handles[i].clone();
-                    ui.horizontal(|ui| {
-                        // 图标：自绘 SVG 纹理；缺失时退回字形占位
-                        match icon {
-                            Some(h) => {
-                                ui.add(egui::Image::new((h.id(), egui::vec2(16.0, 16.0))));
+        ui.push_id(which, |ui| {
+            ui.vertical(|ui| {
+                ui.set_width(width);
+                // 面包屑 + 行内过滤
+                ui.horizontal(|ui| {
+                    let crumbs = breadcrumbs(&path);
+                    for (i, c) in crumbs.iter().enumerate() {
+                        if ui.button(c).clicked() {
+                            let target = crumbs_to_path(&path, i);
+                            match which {
+                                Pane::Left => self.left_path = target,
+                                Pane::Right => self.right_path = target,
                             }
-                            None => {
-                                ui.label(if e.is_dir { "📁" } else { "📄" });
+                            self.refresh();
+                        }
+                        if i + 1 < crumbs.len() {
+                            ui.label("›");
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let filter = match which {
+                        Pane::Left => &mut self.left_filter,
+                        Pane::Right => &mut self.right_filter,
+                    };
+                    ui.label("🔍");
+                    ui.add(
+                        egui::TextEdit::singleline(filter)
+                            .hint_text("过滤…")
+                            .desired_width(width - 60.0),
+                    );
+                    if ui.button("✕").clicked() {
+                        filter.clear();
+                    }
+                });
+                ui.separator();
+
+                // 列视图
+                let base = match which {
+                    Pane::Left => self.left_path.clone(),
+                    Pane::Right => self.right_path.clone(),
+                };
+                let entries: Vec<&fmnr_core::Entry> = {
+                    let all = match which {
+                        Pane::Left => &self.left_entries,
+                        Pane::Right => &self.right_entries,
+                    };
+                    let filter = match which {
+                        Pane::Left => &self.left_filter,
+                        Pane::Right => &self.right_filter,
+                    };
+                    if filter.is_empty() {
+                        all.iter().collect()
+                    } else {
+                        let f = filter.to_lowercase();
+                        all.iter()
+                            .filter(|e| e.name.to_lowercase().contains(&f))
+                            .collect()
+                    }
+                };
+
+                // 文件路径 -> 外置打开状态的索引（角标注入用）
+                let badges: Vec<Option<fmnr_core::ExternalOpen>> = entries
+                    .iter()
+                    .map(|e| {
+                        self.volume
+                            .external_opens()
+                            .get(base.join(&e.name).display().to_string())
+                    })
+                    .collect();
+
+                // 图标纹理预先解析（闭包内不能可变借用 self.icons）。
+                let ctx = ui.ctx().clone();
+                let icon_handles: Vec<Option<egui::TextureHandle>> = entries
+                    .iter()
+                    .map(|e| self.icons.get(&ctx, &e.icon_key))
+                    .collect();
+
+                let selected = match which {
+                    Pane::Left => &mut self.left_selected,
+                    Pane::Right => &mut self.right_selected,
+                };
+
+                // 闭包内不借用 self（避免与 selected 冲突），事件收集到闭包外处理。
+                let mut clicked: Option<usize> = None;
+                let mut dbl: Option<usize> = None;
+                egui::ScrollArea::vertical().show_rows(ui, 24.0, entries.len(), |ui, row_range| {
+                    for i in row_range {
+                        let e = entries[i];
+                        let badge = badges[i].as_ref();
+                        let icon = icon_handles[i].clone();
+                        ui.horizontal(|ui| {
+                            // 图标：自绘 SVG 纹理；缺失时退回字形占位
+                            match icon {
+                                Some(h) => {
+                                    ui.add(egui::Image::new((h.id(), egui::vec2(16.0, 16.0))));
+                                }
+                                None => {
+                                    ui.label(if e.is_dir { "📁" } else { "📄" });
+                                }
                             }
-                        }
-                        // 角标：左侧圆点，仅在该进程仍存活时出现
-                        if let Some(o) = badge {
-                            ui.label(
-                                egui::RichText::new("●")
-                                    .size(10.0)
-                                    .color(color_for(&o.program)),
-                            );
-                        }
-                        let resp = ui.selectable_label(*selected == Some(i), &e.name);
-                        if let Some(o) = badge {
-                            resp.clone()
-                                .on_hover_text(format!("已在 {} 中打开", o.program));
-                        }
-                        if resp.clicked() {
-                            clicked = Some(i);
-                        }
-                        if resp.double_clicked() {
-                            dbl = Some(i);
-                        }
-                    });
+                            // 角标：左侧圆点，仅在该进程仍存活时出现
+                            if let Some(o) = badge {
+                                ui.label(
+                                    egui::RichText::new("●")
+                                        .size(10.0)
+                                        .color(color_for(&o.program)),
+                                );
+                            }
+                            let resp = ui.selectable_label(*selected == Some(i), &e.name);
+                            if let Some(o) = badge {
+                                resp.clone()
+                                    .on_hover_text(format!("已在 {} 中打开", o.program));
+                            }
+                            if resp.clicked() {
+                                clicked = Some(i);
+                            }
+                            if resp.double_clicked() {
+                                dbl = Some(i);
+                            }
+                        });
+                    }
+                });
+
+                if let Some(i) = clicked {
+                    match which {
+                        Pane::Left => self.left_selected = Some(i),
+                        Pane::Right => self.right_selected = Some(i),
+                    }
+                    self.active_pane = which;
+                }
+                if let Some(i) = dbl {
+                    if let Some(e) = entries.get(i) {
+                        let base = self.active_path().clone();
+                        self.enter(base.join(&e.name));
+                    }
                 }
             });
-
-            if let Some(i) = clicked {
-                match which {
-                    Pane::Left => self.left_selected = Some(i),
-                    Pane::Right => self.right_selected = Some(i),
-                }
-                self.active_pane = which;
-            }
-            if let Some(i) = dbl {
-                if let Some(e) = entries.get(i) {
-                    let base = self.active_path().clone();
-                    self.enter(base.join(&e.name));
-                }
-            }
         });
     }
 
