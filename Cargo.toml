@@ -35,7 +35,7 @@ eframe = { version = "0.31", default-features = false, features = [
     "wayland",
     "x11",
 ] }
-egui_extras = { version = "0.31", features = ["image"] }
+egui_extras = { version = "0.31", features = ["image", "svg"] }
 rayon = "1"
 
 [profile.release]

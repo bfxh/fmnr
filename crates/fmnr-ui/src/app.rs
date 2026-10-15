@@ -1,6 +1,7 @@
 use eframe::egui::{self, Color32, Key};
 use fmnr_core::{ListOpts, SortOrder, VPath, Volume};
 use fmnr_fs::LocalVolume;
+use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -45,6 +46,8 @@ pub struct App {
     right_filter: String,
     /// 状态栏消息
     status: String,
+    /// M3 统一预览面板状态
+    preview: Option<crate::preview::Preview>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -71,6 +74,7 @@ impl App {
             left_filter: String::new(),
             right_filter: String::new(),
             status: String::new(),
+            preview: None,
         };
         app.refresh();
         app
@@ -118,8 +122,7 @@ impl App {
         let route = route_open(&path);
         let program = match route {
             OpenRoute::Preview => {
-                // M3 预览面板尚未上线，先占位：状态栏提示预览能力已识别，但不外置。
-                self.status = format!("预览（{}）— M3 面板待接入", path.display());
+                self.open_preview(path);
                 return;
             }
             OpenRoute::External(p) => p,
@@ -155,6 +158,42 @@ impl App {
                 Pane::Right => self.right_path = p,
             }
             self.refresh();
+        }
+    }
+
+    /// M3 统一预览：读文件字节 → classify → 挂到 self.preview。
+    fn open_preview(&mut self, path: &PathBuf) {
+        let cap = crate::preview::cap_for(path);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let volume = self.volume.clone();
+        let vpath = VPath(path.clone().into());
+        let bytes = rt.block_on(async move {
+            let mut stream = volume.read_stream(&vpath).await?;
+            let mut buf: Vec<u8> = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                if buf.len() + chunk.len() > cap {
+                    buf.extend_from_slice(&chunk[..cap.saturating_sub(buf.len())]);
+                    break;
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok::<_, fmnr_core::Error>(buf)
+        });
+        match bytes {
+            Ok(buf) => {
+                let truncated = buf.len() >= cap;
+                let content = crate::preview::classify(path, &buf, truncated);
+                self.preview = Some(crate::preview::Preview {
+                    path: path.clone(),
+                    content,
+                    texture: None,
+                });
+                self.status = format!("预览 {}", path.display());
+            }
+            Err(e) => {
+                self.status = format!("预览失败 ({e})");
+            }
         }
     }
 }
@@ -194,6 +233,31 @@ impl eframe::App for App {
                 self.pane(ui, Pane::Right, half);
             });
         });
+
+        // M3 统一预览面板：浮动窗口，Esc 关闭。
+        if self.preview.is_some() {
+            let mut open = true;
+            let title = self
+                .preview
+                .as_ref()
+                .map(|p| p.path.display().to_string())
+                .unwrap_or_default();
+            egui::Window::new(title)
+                .id(egui::Id::new("preview"))
+                .open(&mut open)
+                .default_width(520.0)
+                .default_height(420.0)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    self.render_preview(ui, ctx);
+                });
+            if !open {
+                self.preview = None;
+            }
+            if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.preview = None;
+            }
+        }
     }
 }
 
@@ -367,6 +431,47 @@ impl App {
                 }
             }
         });
+    }
+
+    fn render_preview(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        use crate::preview::PreviewContent;
+        let Some(pv) = self.preview.as_mut() else {
+            return;
+        };
+        match &pv.content {
+            PreviewContent::Text { text, truncated } => {
+                if *truncated {
+                    ui.label(egui::RichText::new("⚠ 已截断（超过 1 MiB）").weak());
+                }
+                egui::ScrollArea::both().show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(text.as_str()).monospace())
+                            .wrap(),
+                    );
+                });
+            }
+            PreviewContent::Image(img) => {
+                let handle = pv.texture.get_or_insert_with(|| {
+                    ctx.load_texture("preview", img.clone(), egui::TextureOptions::LINEAR)
+                });
+                ui.add(egui::Image::new((handle.id(), handle.size_vec2())).fit_to_exact_size(
+                    {
+                        let s = ui.available_size();
+                        let scale = (s.x / handle.size_vec2().x)
+                            .min(s.y / handle.size_vec2().y)
+                            .min(1.0);
+                        handle.size_vec2() * scale
+                    },
+                ));
+            }
+            PreviewContent::Binary { size } => {
+                ui.label(format!("二进制文件（{size} 字节），无法文本预览"));
+                ui.label(egui::RichText::new("可用外部程序打开 →").weak());
+            }
+            PreviewContent::Failed(msg) => {
+                ui.label(egui::RichText::new(msg).color(Color32::from_rgb(220, 50, 50)));
+            }
+        }
     }
 }
 
