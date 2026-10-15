@@ -72,6 +72,22 @@ pub struct App {
     plugins: fmnr_plugins::registry::PluginSet,
     /// 插件加载警告（坏插件路径 + 原因），启动时填一次，状态栏可见
     plugin_warnings: Vec<fmnr_plugins::registry::LoadWarning>,
+    /// M6 空间白板（布局层，与双栏视图互斥显示）
+    board: fmnr_core::board::Board,
+    /// 当前视图：双栏 or 白板
+    view: ViewMode,
+    /// 白板相机（平移 + 缩放）。坐标变换全在 `board_view::Camera` 里。
+    board_cam: crate::board_view::Camera,
+    /// 白板上正在拖拽的节点下标
+    board_drag: Option<usize>,
+    /// 上一帧的画布区域。用于把「视图中心」换算成画布坐标（钉节点、适应全部）。
+    board_viewport: egui::Rect,
+}
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum ViewMode {
+    Panes,
+    Board,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -121,11 +137,21 @@ impl App {
             search_text: String::new(),
             plugins: fmnr_plugins::registry::PluginSet::new(),
             plugin_warnings: Vec::new(),
+            board: fmnr_core::board::Board::new("default"),
+            view: ViewMode::Panes,
+            board_cam: crate::board_view::Camera::default(),
+            board_drag: None,
+            board_viewport: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)),
         };
         // 插件目录不存在是正常状态（没装插件）；坏插件只记警告不阻塞启动。
         let (plugins, warnings) = fmnr_plugins::registry::PluginSet::load_dir(&plugins_dir());
         app.plugins = plugins;
         app.plugin_warnings = warnings;
+        // 白板：能读就恢复，读不到（首次运行/文件坏了）就用空板，不阻塞启动。
+        if let Ok(b) = fmnr_core::board::Board::load(&fmnr_core::board::Board::default_path("default"))
+        {
+            app.board = b;
+        }
         app.refresh();
         app
     }
@@ -601,6 +627,24 @@ impl eframe::App for App {
                 if ui.button("🔎 搜索").clicked() {
                     self.start_search();
                 }
+                // 视图切换：双栏 ↔ 白板
+                if ui
+                    .selectable_label(self.view == ViewMode::Board, "🗺 白板")
+                    .clicked()
+                {
+                    self.view = if self.view == ViewMode::Board {
+                        ViewMode::Panes
+                    } else {
+                        ViewMode::Board
+                    };
+                }
+                if ui.button("📌 钉到白板").clicked() {
+                    self.pin_selected_to_board();
+                }
+                // 只在白板视图里有意义：平移到看不见东西后靠它找回来。
+                if self.view == ViewMode::Board && ui.button("🔍 适应全部").clicked() {
+                    self.fit_board();
+                }
                 ui.checkbox(&mut self.show_hidden, "隐藏项");
                 egui::ComboBox::from_label("排序")
                     .selected_text(format!("{:?}", self.sort))
@@ -659,6 +703,10 @@ impl eframe::App for App {
         // 搜索框：激活时取代中央区
         if self.search.is_some() {
             self.render_search_panel(ctx);
+        } else if self.view == ViewMode::Board {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                self.render_board(ui);
+            });
         } else {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let avail = ui.available_size();
@@ -1025,6 +1073,214 @@ impl App {
         }
     }
 
+    /// 白板画布：自绘节点卡片 + 拖拽 + 平移缩放。
+    ///
+    /// 位置是用户数据（DESIGN §7.1 空间记忆），所以这里**不做任何自动排布**：
+    /// 新节点落在当前视图中心，之后只跟着鼠标走。
+    fn render_board(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.available_rect_before_wrap();
+        let origin = rect.min;
+        self.board_viewport = rect;
+
+        // 交互层：先占满整块画布，处理平移与缩放。
+        let bg = ui.interact(rect, egui::Id::new("board_bg"), egui::Sense::click_and_drag());
+
+        // 滚轮缩放（Ctrl 或直接滚轮都可，白板里滚轮没有别的用途）。
+        if bg.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll.abs() > 0.0 {
+                self.board_cam.zoom_by((scroll * 0.002).exp());
+            }
+        }
+
+        // 拖动空白处 = 平移画布。拖动节点时不平移。
+        if self.board_drag.is_none() && bg.dragged() {
+            self.board_cam.pan += bg.drag_delta();
+        }
+
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0, egui::Color32::from_rgb(246, 246, 248));
+
+        let cam = self.board_cam;
+        let card_font = egui::FontId::proportional(13.0);
+
+        // 连线先画，节点卡片后画——否则线会盖在卡片上。
+        for link in &self.board.links {
+            let (Some(a), Some(b)) = (
+                self.board.nodes.get(link.from),
+                self.board.nodes.get(link.to),
+            ) else {
+                continue;
+            };
+            let ra = crate::board_view::card_rect(a.pos);
+            let rb = crate::board_view::card_rect(b.pos);
+            let ca = cam.to_screen(fmnr_core::board::Pos::new(ra.center().x, ra.center().y), origin);
+            let cb = cam.to_screen(fmnr_core::board::Pos::new(rb.center().x, rb.center().y), origin);
+            painter.line_segment(
+                [ca, cb],
+                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(150, 160, 175)),
+            );
+        }
+
+        let mut drag_to: Option<(usize, fmnr_core::board::Pos)> = None;
+
+        for idx in 0..self.board.nodes.len() {
+            let node = self.board.nodes[idx].clone();
+            let r = crate::board_view::card_rect(node.pos);
+            let screen = egui::Rect::from_min_max(
+                cam.to_screen(fmnr_core::board::Pos::new(r.min.x, r.min.y), origin),
+                cam.to_screen(fmnr_core::board::Pos::new(r.max.x, r.max.y), origin),
+            );
+
+            // 节点卡片：缺文件的用红色描边区分，但**照样显示**（布局不能丢）。
+            let fill = if node.missing {
+                egui::Color32::from_rgb(255, 235, 235)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 235)
+            };
+            painter.rect_filled(screen, egui::CornerRadius::same(10), fill);
+            let stroke_color = if node.missing {
+                egui::Color32::from_rgb(220, 90, 90)
+            } else {
+                egui::Color32::from_rgb(200, 205, 215)
+            };
+            painter.rect_stroke(
+                screen,
+                egui::CornerRadius::same(10),
+                egui::Stroke::new(1.0_f32, stroke_color),
+                egui::StrokeKind::Inside,
+            );
+
+            // 标题。过长截断，免得溢出卡片。
+            let label = truncate_label(&node.label, 22);
+            painter.text(
+                screen.left_top() + egui::vec2(10.0, 10.0),
+                egui::Align2::LEFT_TOP,
+                label,
+                card_font.clone(),
+                egui::Color32::from_rgb(30, 30, 35),
+            );
+            if node.missing {
+                painter.text(
+                    screen.left_bottom() + egui::vec2(10.0, -10.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    "文件不在了",
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_rgb(200, 70, 70),
+                );
+            }
+
+            // 交互层叠在卡片上，处理拖拽与双击。
+            let resp = ui.interact(
+                screen,
+                egui::Id::new(("board_node", idx)),
+                egui::Sense::click_and_drag(),
+            );
+            if resp.drag_started() {
+                self.board_drag = Some(idx);
+            }
+            if resp.dragged() && self.board_drag == Some(idx) {
+                let d = cam.screen_delta_to_canvas(resp.drag_delta());
+                drag_to = Some((idx, fmnr_core::board::Pos::new(
+                    node.pos.x + d.x,
+                    node.pos.y + d.y,
+                )));
+            }
+            if resp.double_clicked() {
+                // 双击：交给既有的打开语义（预览或外置程序 + 角标）。
+                let p = node.path.clone();
+                self.enter(p);
+            }
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+        }
+
+        if let Some((idx, pos)) = drag_to {
+            self.board.move_node(idx, pos);
+        }
+        if ui.input(|i| i.pointer.any_released()) {
+            if self.board_drag.is_some() {
+                // 拖动结束：落盘。位置是用户数据，改了就存。
+                self.save_board();
+            }
+            self.board_drag = None;
+        }
+
+        // 空板提示。
+        if self.board.nodes.is_empty() {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "白板是空的：在双栏视图里选中文件，点「📌 钉到白板」",
+                egui::FontId::proportional(14.0),
+                egui::Color32::from_rgb(140, 145, 155),
+            );
+        }
+    }
+
+    /// 把当前活动栏选中的条目钉到白板，落在**视图中心**。
+    fn pin_selected_to_board(&mut self) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            self.status = "没有选中任何项".into();
+            return;
+        }
+        // 视图中心的画布坐标：走 to_canvas，这样缩放/平移后位置都算得对。
+        // 之前用 pan 当中心，一缩放就会钉到看不见的地方。
+        let vp_center = self.board_viewport.center();
+        let center = self
+            .board_cam
+            .to_canvas(vp_center, self.board_viewport.min);
+
+        let mut added = 0usize;
+        for p in paths.iter() {
+            // 已钉过的不重复添加（同路径只保留一个节点）。
+            if self.board.nodes.iter().any(|node| &node.path == p) {
+                continue;
+            }
+            // 落点稍微错开，避免完全重叠成一摞看不出有几个——但这只是**首次**
+            // 落点，之后绝不重排。错开量按已有节点数递增，让新钉的往外排。
+            let k = (self.board.nodes.len() + added) as f32;
+            let pos = fmnr_core::board::Pos::new(center.x + k * 24.0, center.y + k * 18.0);
+            self.board.add(p.clone(), pos);
+            added += 1;
+        }
+        self.board.refresh_missing();
+        self.save_board();
+        if added == 0 {
+            self.status = "选中的项都已在白板上".into();
+        } else {
+            self.status = format!("已钉到白板（{added} 项）");
+        }
+    }
+
+    /// 把所有节点收进视野。用户平移走远后，这是唯一的「找回我的东西」入口。
+    fn fit_board(&mut self) {
+        let positions: Vec<fmnr_core::board::Pos> =
+            self.board.nodes.iter().map(|n| n.pos).collect();
+        let Some(content) = crate::board_view::bounds(&positions) else {
+            self.status = "白板是空的".into();
+            return;
+        };
+        // bounds 给的是画布坐标，fit_camera 要的是画布坐标 + 视口 + origin。
+        match crate::board_view::fit_camera(content, self.board_viewport, self.board_viewport.min) {
+            Some(cam) => {
+                self.board_cam = cam;
+                self.status = format!("已适应全部 {} 个节点", self.board.nodes.len());
+            }
+            None => self.status = "视口太小，无法适应".into(),
+        }
+    }
+
+    /// 白板落盘。失败要报出来——静默失败会让用户以为布局存住了。
+    fn save_board(&mut self) {
+        let path = fmnr_core::board::Board::default_path(&self.board.name);
+        if let Err(e) = self.board.save(&path) {
+            self.status = format!("白板保存失败：{e}");
+        }
+    }
+
     fn pane(&mut self, ui: &mut egui::Ui, which: Pane, width: f32) {
         let path = match which {
             Pane::Left => self.left_path.clone(),
@@ -1287,8 +1543,16 @@ fn highlight_hit(hit: &crate::search::Hit, style: &egui::Style) -> egui::WidgetT
     egui::WidgetText::from(job)
 }
 
-fn dirs_home() -> PathBuf {
-    std::env::var("USERPROFILE")
+/// 卡片标题截断。按**字符**截而不是字节，否则中文会被切成半个字。
+fn truncate_label(s: &str, max_chars: usize) -> String {
+    let mut out: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
+fn dirs_home() -> PathBuf {    std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
