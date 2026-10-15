@@ -193,6 +193,22 @@ fn copy_file(src: &Path, dest: &Path, progress: &Progress) -> Result<()> {
     Ok(())
 }
 
+/// 目标目录是否**就是源、或在源的子树内**。
+///
+/// 这是拖放/移动必须挡住的一种输入：把 `A` 拷进 `A\sub`，`copy_tree` 会在
+/// 自己刚创建的目录里继续发现新内容——无限递归，直到路径超长或磁盘写满。
+/// 覆盖模式下还有个更隐蔽的变体：`dest == src` 时会先删源再拷。
+///
+/// 判定用 canonicalize 后的路径，避免 `A\sub\..\sub` 这类绕法。
+pub fn dest_inside_source(src: &Path, dest_dir: &Path) -> bool {
+    let (Ok(s), Ok(d)) = (std::fs::canonicalize(src), std::fs::canonicalize(dest_dir)) else {
+        // 规范化失败（路径不存在等）时**不在这里编造结论**：
+        // 后续 IO 自己会报错，比一个猜出来的布尔值可靠。
+        return false;
+    };
+    d == s || d.starts_with(&s)
+}
+
 /// 批量拷贝/移动的共享实现。`remove_src=true` 即移动。
 pub fn transfer(
     sources: &[PathBuf],
@@ -202,6 +218,17 @@ pub fn transfer(
     remove_src: bool,
 ) -> Result<OpReport> {
     std::fs::create_dir_all(dest_dir).map_err(Error::Io)?;
+
+    // 预检放在**任何写入之前**：把 A 拷进 A 的子树会无限递归，
+    // 等发现时可能已经拷了一半，回滚也回不干净。
+    for src in sources {
+        if dest_inside_source(src, dest_dir) {
+            return Err(Error::Other(format!(
+                "拒绝把 {} 放进它自己（或其子目录）里：会无限递归",
+                src.display()
+            )));
+        }
+    }
 
     // 先算总量，进度条才有意义的分母。
     let mut total_bytes = 0u64;
@@ -390,6 +417,89 @@ mod tests {
             resolve_dest(&a, ConflictPolicy::Rename),
             Some(d.join("x (2).txt"))
         );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 把目录拷进自己 / 自己的子目录，必须在动手前被拒。
+    /// 否则 `copy_tree` 会在刚建出的目录里发现新内容，无限递归。
+    #[test]
+    fn transfer_refuses_dest_inside_source() {
+        let d = tmpdir("selfnest");
+        let src = d.join("A");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("f.txt"), b"x").unwrap();
+
+        let progress = Progress::new();
+
+        // 放进自己
+        let e = transfer(
+            std::slice::from_ref(&src),
+            &src,
+            ConflictPolicy::Skip,
+            &progress,
+            false,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("无限递归"), "错误应说明原因：{e}");
+
+        // 放进自己的子目录
+        let e = transfer(
+            std::slice::from_ref(&src),
+            &src.join("sub"),
+            ConflictPolicy::Skip,
+            &progress,
+            false,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("无限递归"), "错误应说明原因：{e}");
+
+        // 原目录必须原封不动（预检在任何写入之前）
+        assert!(src.join("f.txt").is_file(), "被拒后不该动过源");
+        assert_eq!(
+            std::fs::read_dir(src.join("sub")).unwrap().count(),
+            0,
+            "子目录不该被写入任何东西"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 反证：**兄弟目录**不算「在里面」，必须放行。
+    /// 否则这条尺会把正常的同级拷贝也拦掉——过宽和过窄都是错的。
+    #[test]
+    fn transfer_allows_sibling_destination() {
+        let d = tmpdir("sibling");
+        let a = d.join("A");
+        let b = d.join("B");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("f.txt"), b"hi").unwrap();
+
+        let progress = Progress::new();
+        let report = transfer(
+            std::slice::from_ref(&a),
+            &b,
+            ConflictPolicy::Skip,
+            &progress,
+            false,
+        )
+        .expect("同级目录应放行");
+        assert_eq!(report.done, 1);
+        assert_eq!(std::fs::read(b.join("A/f.txt")).unwrap(), b"hi");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 纯函数层面把边界钉清楚：路径前缀相同但不同目录，不能误判为「在里面」。
+    /// 例：`C:\a\bc` 不以 `C:\a\b` 为父——必须按路径分量比，不能比字符串前缀。
+    #[test]
+    fn dest_inside_source_compares_path_components_not_strings() {
+        let d = tmpdir("prefix");
+        let b = d.join("b");
+        let bc = d.join("bc");
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::create_dir_all(&bc).unwrap();
+
+        assert!(!dest_inside_source(&b, &bc), "b 与 bc 是兄弟，不是父子");
+        assert!(dest_inside_source(&b, &b), "自己算在里面");
         std::fs::remove_dir_all(&d).ok();
     }
 

@@ -143,6 +143,43 @@ impl App {
         }
     }
 
+    /// 处理外部拖入的文件：拷进当前活动栏的目录。
+    ///
+    /// 与「复制/粘贴」走同一条 `start_op`，因此冲突弹窗、进度、取消全都自动一致——
+    /// 拖放只是**另一个触发入口**，不是第二套拷贝实现。
+    ///
+    /// 判定逻辑在 `plan_drop`（纯函数，可单测）；这里只负责取输入与执行。
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if dropped.is_empty() {
+            return;
+        }
+
+        let dest = self.active_path().clone();
+        match plan_drop(&dropped, &dest) {
+            DropPlan::Ignore(reason) => self.status = reason,
+            DropPlan::Copy(sources) => {
+                let n = sources.len();
+                let sources = sources.into_iter().map(VPath).collect();
+                self.start_op(
+                    crate::ops::OpKind::Copy,
+                    sources,
+                    Some(VPath(dest)),
+                    fmnr_core::ConflictPolicy::Skip,
+                );
+                if self.running.is_some() {
+                    self.status = format!("拖入拷贝（{n} 项）…");
+                }
+            }
+        }
+    }
+
     fn enter(&mut self, path: PathBuf) {
         if path.is_dir() {
             match self.active_pane {
@@ -508,6 +545,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_keys(ctx);
+        self.handle_dropped_files(ctx);
         self.poll_running();
         self.poll_search();
 
@@ -1131,6 +1169,46 @@ impl App {
     }
 }
 
+/// 一次拖放该怎么处理。
+///
+/// 拆成纯函数是为了能单测：`handle_dropped_files` 里全是 egui 上下文与
+/// 长操作副作用，判定规则混在里面就只能靠手点验证。规则本身跟 UI 无关。
+#[derive(Debug, PartialEq, Eq)]
+enum DropPlan {
+    /// 不动手，只给一句状态栏说明。
+    Ignore(String),
+    /// 拷这些源到目标目录。
+    Copy(Vec<PathBuf>),
+}
+
+/// 拖放判定：给定拖入的路径与目标目录，决定拷贝哪些、或为什么不拷。
+///
+/// 三条拒绝规则都对应**真实的坏输入**，不是防御性编程：
+/// - 路径不存在：拖放源可能来自已被删掉/移走的窗口；
+/// - 源已在目标目录里：会拷成 `a.txt` 和 `a (1).txt` 之类的重复；
+/// - 目标在源的子树内：`copy_tree` 会在自己刚建的目录里继续发现新内容，无限递归。
+fn plan_drop(dropped: &[PathBuf], dest: &Path) -> DropPlan {
+    let sources: Vec<PathBuf> = dropped.iter().filter(|p| p.exists()).cloned().collect();
+    if sources.is_empty() {
+        return DropPlan::Ignore("拖入的路径都不可用".to_string());
+    }
+
+    // 源已经躺在目标目录里：再拷一遍只会产出重复副本，不如直接说清楚。
+    if sources.iter().all(|s| s.parent() == Some(dest)) {
+        return DropPlan::Ignore("拖放目标与来源相同，未做任何改动".to_string());
+    }
+
+    // 把文件夹拖进它自己（或它的子目录）会无限递归，预检要挡在写入之前。
+    if sources
+        .iter()
+        .any(|s| fmnr_fs::ops::dest_inside_source(s, dest))
+    {
+        return DropPlan::Ignore("不能把文件夹拖进它自己（或其子目录）里".to_string());
+    }
+
+    DropPlan::Copy(sources)
+}
+
 /// 把命中片段染成强调色。范围越界（理论上不该发生）时退化为整名普通显示。
 fn highlight_hit(hit: &crate::search::Hit, style: &egui::Style) -> egui::WidgetText {
     let range = hit.range.clone();
@@ -1207,4 +1285,97 @@ fn crumbs_to_path(full: &Path, upto: usize) -> PathBuf {
         p.push(c.as_os_str());
     }
     p
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+
+    /// 每个用例一个独立目录树，避免并行测试互相看见对方的文件。
+    fn scratch(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("fmnr-drop-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn missing_paths_are_ignored_with_a_reason() {
+        let root = scratch("missing");
+        let ghost = root.join("not-here.txt");
+        match plan_drop(&[ghost], &root) {
+            DropPlan::Ignore(reason) => assert!(!reason.is_empty(), "拒绝要给出理由"),
+            other => panic!("不存在的路径不该进拷贝：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropping_into_the_same_directory_changes_nothing() {
+        let root = scratch("same");
+        let file = root.join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        match plan_drop(&[file], &root) {
+            DropPlan::Ignore(reason) => {
+                assert!(reason.contains("相同"), "理由应点明同目录：{reason}")
+            }
+            other => panic!("同目录拖放不该拷贝：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropping_a_folder_into_its_own_subdir_is_refused() {
+        let root = scratch("nested");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // root 拖进 root/sub：copy_tree 会在新建的 sub 里继续发现 root 的内容，无限递归。
+        match plan_drop(std::slice::from_ref(&root), &sub) {
+            DropPlan::Ignore(reason) => {
+                assert!(reason.contains("自己"), "理由应点明自嵌套：{reason}")
+            }
+            other => panic!("自嵌套必须被挡下：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropping_into_a_sibling_directory_copies() {
+        let root = scratch("sibling");
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let file = a.join("doc.txt");
+        std::fs::write(&file, b"hi").unwrap();
+
+        match plan_drop(std::slice::from_ref(&file), &b) {
+            DropPlan::Copy(sources) => assert_eq!(sources, vec![file]),
+            other => panic!("正常拖放应当拷贝：{other:?}"),
+        }
+    }
+
+    /// 混合输入：只保留存在的那部分，而不是整批作废。
+    #[test]
+    fn only_existing_paths_are_copied() {
+        let root = scratch("mixed");
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let real = root.join("real.txt");
+        std::fs::write(&real, b"x").unwrap();
+        let ghost = root.join("ghost.txt");
+
+        match plan_drop(&[real.clone(), ghost], &dest) {
+            DropPlan::Copy(sources) => assert_eq!(sources, vec![real]),
+            other => panic!("应只拷贝存在的那个：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_drop_is_ignored() {
+        let root = scratch("empty");
+        match plan_drop(&[], &root) {
+            DropPlan::Ignore(reason) => assert!(!reason.is_empty()),
+            other => panic!("空拖放不该拷贝：{other:?}"),
+        }
+    }
 }
