@@ -1,0 +1,15 @@
+[package]
+name = "fmnr-icons"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+fmnr-core = { path = "../fmnr-core" }
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+resvg.workspace = true
+usvg.workspace = true
+tiny-skia.workspace = true

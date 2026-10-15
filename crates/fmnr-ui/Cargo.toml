@@ -1,0 +1,18 @@
+[package]
+name = "fmnr-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+fmnr-core = { path = "../fmnr-core" }
+fmnr-fs = { path = "../fmnr-fs" }
+fmnr-icons = { path = "../fmnr-icons" }
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dirs = "7.0.0"

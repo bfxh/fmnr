@@ -1,0 +1,9 @@
+# Rust 构建产物
+/target/
+**/*.rs.bk
+
+# 图标覆盖（可选，默认放 assets/icons/）
+/icons/overrides/*
+
+# 临时
+*.tmp

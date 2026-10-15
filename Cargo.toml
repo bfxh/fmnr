@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fmnr-core",
+    "crates/fmnr-fs",
+    "crates/fmnr-icons",
+    "crates/fmnr-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+license = "MIT"
+repository = "https://github.com/bfxh/fmnr"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+jwalk = "0.9"
+notify = "=9.0.0-rc.5"
+resvg = "0.45"
+usvg = "0.45"
+tiny-skia = "0.11"
+image = "0.25"
+egui = "0.31"
+eframe = { version = "0.31", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui_extras = { version = "0.31", features = ["image"] }
+rayon = "1"
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+strip = true

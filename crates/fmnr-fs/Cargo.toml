@@ -1,0 +1,15 @@
+[package]
+name = "fmnr-fs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+fmnr-core = { path = "../fmnr-core" }
+tokio = { version = "1", features = ["full"] }
+thiserror.workspace = true
+tracing.workspace = true
+jwalk.workspace = true
+async-trait = "0.1"
+futures = "0.3"
