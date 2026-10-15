@@ -358,7 +358,8 @@ egui immediate-mode **无原生 backdrop blur**。方案：
 | M5 插件 | WASM 宿主 + 图标/预览插件契约 | 装一个自定义预览插件并生效 |
 | M6 白板 | Board 布局 + 空间记忆模式 | 布置+持久化+恢复 |
 | M7 远程+WSL | SSH/SFTP 卷 + WSL UNC 识别 + wslpath | ⚠️ **部分达成，出口判据未满足**：WSL 已本机实测通过（`wsl_live.rs`，真 distro 可浏览）；SSH/SFTP 只有接口 + 纯逻辑测试（端点解析、host key 决策、状态码分类），**未连过任何真实主机**，`ssh_live.rs` 无夹具时自动跳过。归档卷 `fmnr-archive` 已交付并实测（zip/tar/tgz） |
-| CI | — | 未做 |
+| **M8 卷接线** | 卷注册表 + 挂载入口：让 UI/CLI 真能打开归档、切 WSL、连 SSH | 🔴 **未做。** 实测：`fmnr-ui` 没依赖 `fmnr-archive`/`fmnr-remote`；`ArchiveVolume::open` 除自身 crate 外零调用点；`SshVolume::new` 只在测试里；CLI/AI 的 `volumes` 返回**单个硬编码 `LocalVolume`**。⇒ **M7 交付的是库能力，不是用户能力** |
+| CI | 五道门禁：lint(fmt+clippy `-D warnings`) / 双平台 build+test / 插件**行为** / 插件**字节可复现**(钉工具链) / 外部客户端契约 | ✅ **全绿**（run 38785759384，6 job 全 success，2026-10-16 观察） |
 
 ---
 
