@@ -97,14 +97,23 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
 | M4 | MCP / HTTP / CLI / `fmnr://` / 拖放 | ✅ |
 | M5 | WASM 插件宿主 + 真插件验收 | ✅ |
 | M6 | 白板布局 + 持久化 + 恢复 | ✅ |
-| M7a | 归档只读卷（zip/tar/tgz）+ WSL UNC 识别 + wslpath | ✅ **真机实测** |
-| M7b | SSH/SFTP 卷 | ⚠️ 只有接口与纯逻辑测试，**未连过真实主机** |
-| CI | 四道门禁（lint / 双平台测试 / 插件产物同源 / 客户端契约） | ⬜ 待首跑结果 |
+| M7a | 归档只读卷（zip/tar/tgz）+ WSL UNC 识别 + wslpath | ✅ 内核层**真机实测**；🔴 **未接进 UI/CLI** |
+| M7b | SSH/SFTP 卷 | ⚠️ 只有接口与纯逻辑测试，**未连过真实主机**；🔴 **未接进 UI/CLI** |
+| M8 | 卷注册表 + 挂载入口（让用户真的能打开 zip / 切到 WSL / 连 SSH） | ⬜ **未做** |
+| CI | 五道门禁（lint / 双平台测试 / 插件行为 / 插件字节可复现 / 客户端契约） | ⬜ 待跑通 |
 
 ## 已知边界
 
 写在这里的是**判据边界**，不是谦虚：
 
+- 🔴 **归档卷和远程卷目前只是库，用户够不到。** `fmnr-ui` 没有依赖
+  `fmnr-archive` / `fmnr-remote`；`ArchiveVolume::open` 在本仓除自身 crate 外**零调用点**，
+  `SshVolume::new` 只出现在测试里；`fmnr-cli` / `fmnr-ai` 同样从不构造它们，
+  `volumes` 命令返回的是**单个硬编码的 `LocalVolume`**。
+  即：内核抽象已统一（`Volume` trait 三个实现都在、各自测过），
+  但**「挂载一个 zip」「切到 WSL」「连一台 SSH」在界面里还做不到**——那是 M8 的活，别当已完成。
+  今天唯一**真能走通**的 WSL 路径是：在本地卷地址栏直接输 `\\wsl.localhost\<distro>\…`，
+  因为 WSL 的 UNC 本来就是可 `read_dir` 的普通目录。
 - **SSH/SFTP 卷没有真实验证过。** 端点解析、host key 决策（fail-closed）、
   SFTP 状态码→错误分类这三块有单测；握手、认证成功率、流式读、断连恢复**没有**。
   `ssh_live.rs` 在没有 `FMNR_SSH_TEST_HOST` 时打印跳过并通过——
