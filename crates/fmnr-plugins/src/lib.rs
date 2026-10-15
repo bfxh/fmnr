@@ -20,6 +20,7 @@
 //! 另外给每次调用装燃料表，死循环会耗尽燃料而不是挂住 UI 线程。
 
 pub mod host;
+pub mod registry;
 
 use serde::{Deserialize, Serialize};
 
