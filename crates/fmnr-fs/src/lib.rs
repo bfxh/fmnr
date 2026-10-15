@@ -51,11 +51,19 @@ impl Volume for LocalVolume {
 
     async fn list(&self, path: &VPath, opts: &ListOpts) -> Result<Vec<Entry>> {
         let dir = self.resolve(path);
+        // 「路径不存在」是调用方给错了，不是本机的 IO 故障——要报 NotFound
+        // 而不是 Io。否则 MCP/HTTP 会把它当服务端错误（500），
+        // 客户端也就分不清「我路径写错了」和「服务炸了」。
+        // 同文件的 `search` 早已这么做，这里对齐。
         let read_dir = std::fs::read_dir(&dir).map_err(|e| {
-            Error::Io(std::io::Error::new(
-                e.kind(),
-                format!("{}: {e}", dir.display()),
-            ))
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::NotFound(dir.display().to_string())
+            } else {
+                Error::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("{}: {e}", dir.display()),
+                ))
+            }
         })?;
 
         let mut entries = Vec::new();

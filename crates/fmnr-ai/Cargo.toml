@@ -11,6 +11,7 @@ name = "fmnr-ai"
 path = "src/main.rs"
 
 [dependencies]
+axum = "0.8.9"
 fmnr-core = { path = "../fmnr-core" }
 fmnr-fs = { path = "../fmnr-fs" }
 serde.workspace = true

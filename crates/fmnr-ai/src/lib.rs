@@ -2,6 +2,7 @@
 //!
 //! 与 UI 共享同一套内核（`fmnr_core::Volume`），不是第二套文件系统实现。
 
+pub mod http;
 pub mod protocol;
 pub mod server;
 pub mod tools;

@@ -571,6 +571,14 @@ fn listing_a_missing_directory_is_an_error() {
         }),
     );
     assert!(resp["error"].is_object(), "列不存在的目录必须报错：{resp}");
+    // 路径不存在是**调用方给错了**，不是服务端故障：必须是 -32602 而不是 -32603。
+    // 只断言「报错了」会漏掉这个分类——曾经 list 把 NotFound 映射成 Io，
+    // 客户端于是分不清「我路径写错」和「服务炸了」。
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32602),
+        "不存在的路径应归为 invalid params：{resp}"
+    );
     mcp.finish();
 }
 
