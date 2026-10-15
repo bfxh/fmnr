@@ -1,30 +1,33 @@
-use eframe::egui::{self, Color32, Key};
+use eframe::egui::{self, Color32, Key, Modifiers};
 use fmnr_core::{ListOpts, SortOrder, VPath, Volume};
 use fmnr_fs::LocalVolume;
 use futures::StreamExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-fn color_for(exp: Option<&fmnr_core::ExternalOpen>) -> Color32 {
-    if let Some(o) = exp {
-        if o.is_expired() {
-            return Color32::from_rgba_unmultiplied(255, 0, 0, 90);
+/// 外置打开角标的颜色：按程序名归类着色。
+/// 条目出现在这个函数里，就说明**那个进程此刻确实还活着**——进程退出后
+/// 看门狗线程已把它从登记表摘掉，所以这里不需要（也不该）有任何「过期」分支。
+fn color_for(program: &str) -> Color32 {
+    match program.to_lowercase().as_str() {
+        p if p.contains("chrome")
+            | p.contains("edge")
+            | p.contains("firefox")
+            | p.contains("brave") =>
+        {
+            Color32::from_rgb(0, 122, 255)
         }
-        // 已摄入 UI：用 program 前缀做主题色
-        match o.program.to_lowercase().as_str() {
-            p if p.contains("chrome") | p.contains("edge") | p.contains("firefox") | p.contains("brave") => {
-                Color32::from_rgb(0, 122, 255)
-            }
-            p if p.contains("code") | p.contains("vscode") | p.contains("cursor") => {
-                Color32::from_rgb(230, 191, 0)
-            }
-            p if p.contains("notepad") | p.contains("word") | p.contains("excel") | p.contains("powerpoint") => {
-                Color32::from_rgb(230, 89, 38)
-            }
-            _ => Color32::from_rgb(0, 128, 255),
+        p if p.contains("code") | p.contains("vscode") | p.contains("cursor") => {
+            Color32::from_rgb(230, 191, 0)
         }
-    } else {
-        Color32::TRANSPARENT
+        p if p.contains("notepad")
+            | p.contains("word")
+            | p.contains("excel")
+            | p.contains("powerpoint") =>
+        {
+            Color32::from_rgb(230, 89, 38)
+        }
+        _ => Color32::from_rgb(0, 128, 255),
     }
 }
 
@@ -50,12 +53,35 @@ pub struct App {
     preview: Option<crate::preview::Preview>,
     /// M1 图标纹理缓存（IconKey → 纹理）
     icons: crate::icons::IconCache,
+    /// M2 剪贴板（复制/剪切）
+    clipboard: crate::ops::Clipboard,
+    /// M2 正在跑的长操作（拷贝/移动/删除）
+    running: Option<crate::ops::RunningOp>,
+    /// M2 冲突策略弹窗：None = 不在弹窗中
+    conflict: Option<ConflictPrompt>,
+    /// M2 重命名弹窗输入框
+    renaming: Option<String>,
+    /// M2 新建目录名输入框
+    new_dir_name: Option<String>,
+    /// M2 子树搜索（None = 搜索框未激活）
+    search: Option<crate::search::SearchState>,
+    /// 搜索框文本
+    search_text: String,
 }
 
 #[derive(PartialEq, Clone, Copy)]
 enum Pane {
     Left,
     Right,
+}
+
+/// 冲突弹窗：已把请求暂存，等用户选策略。
+struct ConflictPrompt {
+    kind: crate::ops::OpKind,
+    sources: Vec<VPath>,
+    dest_dir: Option<VPath>,
+    conflicting: Vec<String>,
+    choice: fmnr_core::ConflictPolicy,
 }
 
 impl App {
@@ -81,6 +107,13 @@ impl App {
                 overrides_dir(),
                 crate::icons::IconCache::builtin_dir(),
             ),
+            clipboard: crate::ops::Clipboard::default(),
+            running: None,
+            conflict: None,
+            renaming: None,
+            new_dir_name: None,
+            search: None,
+            search_text: String::new(),
         };
         app.refresh();
         app
@@ -124,8 +157,8 @@ impl App {
         }
     }
 
-    fn spawn_external(&mut self, path: &PathBuf) {
-        let route = route_open(&path);
+    fn spawn_external(&mut self, path: &Path) {
+        let route = route_open(path);
         let program = match route {
             OpenRoute::Preview => {
                 self.open_preview(path);
@@ -136,18 +169,17 @@ impl App {
         let program_for_status = program.clone();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let volume = self.volume.clone();
-        let path = path.clone();
-        let result = rt.block_on(async move {
-            volume
-                .spawn_external_open(&fmnr_core::VPath(path.clone().into()), &program)
-                .await
-        });
+        let vpath = VPath(path.to_path_buf());
+        let result = rt.block_on(async move { volume.spawn_external_open(&vpath, &program).await });
         match result {
             Ok(open) => {
-                let pid = open.handle.as_deref().unwrap_or("?");
-                self.active_pane = Pane::Left;
-                self.status = format!("已在 {} 中打开（pid {}）", program_for_status, pid);
-                // 给 UI 挂状态；实际角标以 volume.external_opens() 驱动
+                // 登记进角标表：看门狗线程会在该进程退出时自动摘掉。
+                let key = path.display().to_string();
+                self.volume.external_opens().insert(key, open);
+                self.status = format!(
+                    "已在 {} 中打开，关闭该程序后角标自动消失",
+                    program_for_status
+                );
                 self.refresh();
             }
             Err(e) => {
@@ -168,11 +200,11 @@ impl App {
     }
 
     /// M3 统一预览：读文件字节 → classify → 挂到 self.preview。
-    fn open_preview(&mut self, path: &PathBuf) {
+    fn open_preview(&mut self, path: &Path) {
         let cap = crate::preview::cap_for(path);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let volume = self.volume.clone();
-        let vpath = VPath(path.clone().into());
+        let vpath = VPath(path.to_path_buf());
         let bytes = rt.block_on(async move {
             let mut stream = volume.read_stream(&vpath).await?;
             let mut buf: Vec<u8> = Vec::new();
@@ -191,7 +223,7 @@ impl App {
                 let truncated = buf.len() >= cap;
                 let content = crate::preview::classify(path, &buf, truncated);
                 self.preview = Some(crate::preview::Preview {
-                    path: path.clone(),
+                    path: path.to_path_buf(),
                     content,
                     texture: None,
                 });
@@ -202,11 +234,276 @@ impl App {
             }
         }
     }
+
+    // ---- M2 文件操作 ----
+
+    /// 当前栏选中的条目名（可能多选，预留）。
+    fn selected_names(&self) -> Vec<String> {
+        let (entries, sel) = match self.active_pane {
+            Pane::Left => (&self.left_entries, self.left_selected),
+            Pane::Right => (&self.right_entries, self.right_selected),
+        };
+        sel.and_then(|i| entries.get(i))
+            .map(|e| vec![e.name.clone()])
+            .unwrap_or_default()
+    }
+
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        let base = self.active_path().clone();
+        self.selected_names()
+            .into_iter()
+            .map(|n| base.join(&n))
+            .collect()
+    }
+
+    fn put_clipboard(&mut self, mode: crate::ops::ClipMode) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            self.status = "没有选中任何项".into();
+            return;
+        }
+        self.clipboard.put(mode, paths);
+        self.status = self.clipboard.summary();
+    }
+
+    /// 粘贴：跨栏则目标是对栏当前目录。
+    fn paste(&mut self) {
+        if !self.clipboard.still_valid() {
+            self.status = "剪贴板为空或源已不存在".into();
+            self.clipboard.clear();
+            return;
+        }
+        let cut = self.clipboard.mode == Some(crate::ops::ClipMode::Cut);
+        let kind = if cut {
+            crate::ops::OpKind::Move
+        } else {
+            crate::ops::OpKind::Copy
+        };
+        let sources: Vec<VPath> = self
+            .clipboard
+            .paths
+            .iter()
+            .map(|p| VPath(p.clone()))
+            .collect();
+
+        // 目标 = 非活动栏的当前目录；单栏时就是活动栏自己。
+        let dest_pane = match self.active_pane {
+            Pane::Left => Pane::Right,
+            Pane::Right => Pane::Left,
+        };
+        let dest = match dest_pane {
+            Pane::Left => self.left_path.clone(),
+            Pane::Right => self.right_path.clone(),
+        };
+        // 同栏粘贴到自身目录等于原地复制，无意义 —— 直接拒绝。
+        if dest == *self.active_path() {
+            self.status = "源与目标同目录，无需粘贴".into();
+            return;
+        }
+
+        let conflicts = self.find_conflicts(&sources, &dest);
+        if !conflicts.is_empty() {
+            self.conflict = Some(ConflictPrompt {
+                kind,
+                sources,
+                dest_dir: Some(VPath(dest)),
+                conflicting: conflicts,
+                choice: fmnr_core::ConflictPolicy::Rename,
+            });
+            return;
+        }
+        self.start_op(kind, sources, Some(VPath(dest)), fmnr_core::ConflictPolicy::Skip);
+    }
+
+    /// 列出「源名在目标目录已存在」的条目名。
+    fn find_conflicts(&self, sources: &[VPath], dest: &Path) -> Vec<String> {
+        sources
+            .iter()
+            .filter_map(|s| {
+                let name = s.as_path().file_name()?;
+                if dest.join(name).exists() {
+                    Some(name.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn start_op(
+        &mut self,
+        kind: crate::ops::OpKind,
+        sources: Vec<VPath>,
+        dest_dir: Option<VPath>,
+        policy: fmnr_core::ConflictPolicy,
+    ) {
+        if self.running.is_some() {
+            self.status = "已有操作在进行中".into();
+            return;
+        }
+        let req = crate::ops::OpRequest {
+            kind,
+            sources,
+            dest_dir,
+            policy,
+        };
+        match crate::ops::spawn_op(self.volume.clone(), req) {
+            Ok(running) => {
+                self.status = running.label.clone();
+                self.running = Some(running);
+            }
+            Err(e) => self.status = format!("无法启动操作：{e}"),
+        }
+    }
+
+    /// 每帧轮询长操作。完成后刷新两栏。
+    fn poll_running(&mut self) {
+        let Some(running) = self.running.as_ref() else {
+            return;
+        };
+        let Some(outcome) = running.poll() else {
+            return;
+        };
+        let label = running.label.clone();
+        let cancelled = running.snapshot().cancelled;
+        self.running = None;
+
+        match outcome {
+            crate::ops::OpOutcome::Done(kind, report) => {
+                self.status = if cancelled {
+                    format!("{label}：已取消（完成 {} 项）", report.done)
+                } else if report.skipped > 0 {
+                    format!(
+                        "{label}：完成 {} 项，跳过 {} 项冲突",
+                        report.done, report.skipped
+                    )
+                } else {
+                    format!("{label}：完成 {} 项", report.done)
+                };
+                // 剪切成功后清空剪贴板（剪掉的东西不该还能再贴一次）
+                if kind == crate::ops::OpKind::Move {
+                    self.clipboard.clear();
+                }
+            }
+            crate::ops::OpOutcome::Failed(kind, msg) => {
+                self.status = format!("操作失败（{kind:?}）：{msg}");
+            }
+        }
+        self.refresh();
+    }
+
+    fn delete_selected(&mut self) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            self.status = "没有选中任何项".into();
+            return;
+        }
+        let n = paths.len();
+        self.start_op(
+            crate::ops::OpKind::Delete,
+            paths.into_iter().map(VPath).collect(),
+            None,
+            fmnr_core::ConflictPolicy::Skip,
+        );
+        self.status = format!("送入回收站（{n} 项，可恢复）…");
+    }
+
+    fn begin_rename(&mut self) {
+        let Some(old) = self.selected_names().first().cloned() else {
+            self.status = "没有选中任何项".into();
+            return;
+        };
+        // 去掉扩展名，编辑 stem（与主流文件管理器一致）
+        let stem = PathBuf::from(&old)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or(old);
+        self.renaming = Some(stem);
+    }
+
+    fn commit_rename(&mut self) {
+        let Some(input) = self.renaming.take() else {
+            return;
+        };
+        let name = input.trim();
+        let Some(old) = self.selected_names().first().cloned() else {
+            return;
+        };
+        if name.is_empty() {
+            return;
+        }
+        let base = self.active_path().clone();
+        let from = VPath(base.join(&old));
+        let to = VPath(base.join(name));
+        if from == to {
+            return;
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        match rt.block_on(self.volume.rename(&from, &to)) {
+            Ok(()) => {
+                self.status = format!("已重命名为 {name}");
+                self.refresh();
+            }
+            Err(e) => self.status = format!("重命名失败：{e}"),
+        }
+    }
+
+    fn begin_new_dir(&mut self) {
+        self.new_dir_name = Some("新建文件夹".into());
+    }
+
+    fn commit_new_dir(&mut self) {
+        let Some(input) = self.new_dir_name.take() else {
+            return;
+        };
+        let name = input.trim();
+        if name.is_empty() {
+            return;
+        }
+        let target = VPath(self.active_path().join(name));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        match rt.block_on(self.volume.create_dir(&target)) {
+            Ok(()) => {
+                self.status = format!("已新建 {name}");
+                self.refresh();
+            }
+            Err(e) => self.status = format!("新建失败：{e}"),
+        }
+    }
+
+    // ---- M2 即时搜索 ----
+
+    fn start_search(&mut self) {
+        let text = self.search_text.trim().to_string();
+        if text.is_empty() {
+            self.search = None;
+            return;
+        }
+        self.search = Some(crate::search::spawn_search(crate::search::Query {
+            text,
+            root: self.active_path().clone(),
+            case_sensitive: false,
+        }));
+    }
+
+    fn stop_search(&mut self) {
+        self.search = None;
+        self.search_text.clear();
+    }
+
+    /// 每帧拉一次搜索增量。
+    fn poll_search(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.drain();
+        }
+    }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_keys(ctx);
+        self.poll_running();
+        self.poll_search();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -214,6 +511,29 @@ impl eframe::App for App {
                 ui.separator();
                 if ui.button("⬅ 上级").clicked() {
                     self.go_up();
+                }
+                ui.separator();
+                if ui.button("📋 复制").clicked() {
+                    self.put_clipboard(crate::ops::ClipMode::Copy);
+                }
+                if ui.button("✂ 剪切").clicked() {
+                    self.put_clipboard(crate::ops::ClipMode::Cut);
+                }
+                if ui.button("📥 粘贴").clicked() {
+                    self.paste();
+                }
+                if ui.button("🗑 删除").clicked() {
+                    self.delete_selected();
+                }
+                if ui.button("✎ 重命名").clicked() {
+                    self.begin_rename();
+                }
+                if ui.button("＋ 新建目录").clicked() {
+                    self.begin_new_dir();
+                }
+                ui.separator();
+                if ui.button("🔎 搜索").clicked() {
+                    self.start_search();
                 }
                 ui.checkbox(&mut self.show_hidden, "隐藏项");
                 egui::ComboBox::from_label("排序")
@@ -228,17 +548,43 @@ impl eframe::App for App {
         });
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.label(&self.status);
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let avail = ui.available_size();
-            let half = avail.x / 2.0;
-            ui.horizontal_top(|ui| {
-                self.pane(ui, Pane::Left, half);
-                self.pane(ui, Pane::Right, half);
+            ui.horizontal(|ui| {
+                // 进度优先占位：操作进行中状态栏显示进度而不是静态文案
+                if let Some(r) = self.running.as_ref() {
+                    let snap = r.snapshot();
+                    ui.add(
+                        egui::ProgressBar::new(snap.fraction())
+                            .desired_width(ui.available_width() - 340.0)
+                            .animate(true),
+                    );
+                    ui.label(r.bar_text(snap));
+                    if ui.button("中止").clicked() {
+                        r.cancel();
+                    }
+                } else {
+                    ui.label(&self.status);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(self.clipboard.summary());
+                });
             });
         });
+
+        // 搜索框：激活时取代中央区
+        if self.search.is_some() {
+            self.render_search_panel(ctx);
+        } else {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let avail = ui.available_size();
+                let half = avail.x / 2.0;
+                ui.horizontal_top(|ui| {
+                    self.pane(ui, Pane::Left, half);
+                    self.pane(ui, Pane::Right, half);
+                });
+            });
+        }
+
+        self.render_modals(ctx);
 
         // M3 统一预览面板：浮动窗口，Esc 关闭。
         if self.preview.is_some() {
@@ -268,7 +614,234 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// 冲突策略弹窗：让用户显式选，不静默覆盖。
+    ///
+    /// 三段式（取出 → 画 → 写回）是为了避开 egui 闭包对 `self` 的独占捕获，
+    /// 否则闭包里没法同时读状态和改状态。
+    fn render_modals(&mut self, ctx: &egui::Context) {
+        if let Some(mut prompt) = self.conflict.take() {
+            let mut open = true;
+            egui::Window::new("目标已存在")
+                .id(egui::Id::new("conflict"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("{} 项与目标同名：", prompt.conflicting.len()));
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            for name in prompt.conflicting.iter().take(20) {
+                                ui.label(format!("  · {name}"));
+                            }
+                            if prompt.conflicting.len() > 20 {
+                                ui.label(format!("  … 另有 {} 项", prompt.conflicting.len() - 20));
+                            }
+                        });
+                    ui.add_space(8.0);
+                    ui.label("如何处理？");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut prompt.choice,
+                            fmnr_core::ConflictPolicy::Rename,
+                            "自动改名（推荐）",
+                        );
+                        ui.selectable_value(
+                            &mut prompt.choice,
+                            fmnr_core::ConflictPolicy::Skip,
+                            "跳过",
+                        );
+                        ui.selectable_value(
+                            &mut prompt.choice,
+                            fmnr_core::ConflictPolicy::Overwrite,
+                            "覆盖",
+                        );
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("确定").clicked() {
+                            open = false;
+                        }
+                        if ui.button("取消").clicked() {
+                            open = false;
+                            prompt.choice = fmnr_core::ConflictPolicy::Skip;
+                            prompt.sources.clear(); // 空源 = 不执行
+                        }
+                    });
+                });
+            if open {
+                self.conflict = Some(prompt);
+            } else if prompt.sources.is_empty() {
+                self.status = "已取消操作".into();
+            } else {
+                self.start_op(prompt.kind, prompt.sources, prompt.dest_dir, prompt.choice);
+            }
+        }
+
+        if let Some(mut text) = self.renaming.take() {
+            let mut submit = false;
+            let mut cancel = false;
+            egui::Window::new("重命名")
+                .id(egui::Id::new("rename"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut text)
+                            .desired_width(260.0)
+                            .hint_text("新名称"),
+                    );
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        submit = true;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("确定").clicked() {
+                            submit = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if submit {
+                self.renaming = Some(text);
+                self.commit_rename();
+            } else if cancel {
+                self.renaming = None;
+            } else {
+                self.renaming = Some(text);
+            }
+        }
+
+        if let Some(mut text) = self.new_dir_name.take() {
+            let mut submit = false;
+            let mut cancel = false;
+            egui::Window::new("新建目录")
+                .id(egui::Id::new("newdir"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut text)
+                            .desired_width(260.0)
+                            .hint_text("目录名"),
+                    );
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        submit = true;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("确定").clicked() {
+                            submit = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if submit {
+                self.new_dir_name = Some(text);
+                self.commit_new_dir();
+            } else if cancel {
+                self.new_dir_name = None;
+            } else {
+                self.new_dir_name = Some(text);
+            }
+        }
+    }
+
+    /// 搜索面板：输入框 + 增量结果。
+    fn render_search_panel(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("searchbar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("🔎");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.search_text)
+                        .hint_text("在当前子树搜索…")
+                        .desired_width(300.0),
+                );
+                // 逐字符触发增量搜索：不等回车
+                if resp.changed() {
+                    self.start_search();
+                }
+                if ui.button("关闭").clicked() {
+                    self.stop_search();
+                }
+            });
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // 摘出渲染所需字段：双击要调 self.enter，闭包不能借用 self
+            let Some(hits) = self.search.as_ref().map(|s| s.hits.clone()) else {
+                return;
+            };
+            let (n, total, done, ms) = match self.search.as_ref() {
+                Some(s) => (s.hits.len(), s.total, s.done, s.elapsed_ms),
+                None => return,
+            };
+            ui.horizontal(|ui| {
+                if done {
+                    ui.label(format!("{total} 个结果 · {ms} ms"));
+                } else {
+                    ui.label(format!("搜索中… 已找到 {n} 个"));
+                }
+            });
+            ui.separator();
+
+            let mut jump: Option<(PathBuf, bool)> = None;
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for hit in &hits {
+                    // 命中片段高亮：命中段用强调色，其余普通
+                    let label = highlight_hit(hit, ui.style());
+                    let icon = if hit.is_dir { "📁" } else { "📄" };
+                    let size = if hit.is_dir {
+                        egui::RichText::new("")
+                    } else {
+                        egui::RichText::new(format!("{} B", hit.size)).weak()
+                    };
+                    let resp = ui.horizontal(|ui| {
+                        ui.label(icon);
+                        ui.label(label);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(size);
+                        });
+                    }).response;
+                    if resp.double_clicked() {
+                        jump = Some((hit.path.clone(), hit.is_dir));
+                        break;
+                    }
+                }
+            });
+            if let Some((path, is_dir)) = jump {
+                if is_dir {
+                    self.enter(path);
+                } else {
+                    self.spawn_external(&path);
+                }
+                self.stop_search();
+            }
+        });
+    }
+}
+
+impl App {
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        // 弹窗打开时，键盘全归弹窗（否则 Backspace 会同时删输入和跳目录）
+        if self.conflict.is_some() || self.renaming.is_some() || self.new_dir_name.is_some() {
+            if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.conflict = None;
+                self.renaming = None;
+                self.new_dir_name = None;
+            }
+            return;
+        }
+
+        // Ctrl+F 开搜索；搜索中任意按键喂给搜索框
+        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::F)) {
+            self.status = "输入搜索词（Esc 退出）".into();
+        }
+
         ctx.input(|i| {
             if i.key_pressed(Key::Tab) {
                 self.active_pane = match self.active_pane {
@@ -296,12 +869,72 @@ impl App {
                 }
             }
         });
+
+        // 组合键：文本复制/剪切/粘贴
+        ctx.input_mut(|i| {
+            let ctrl = i.modifiers.ctrl;
+            if ctrl && i.key_pressed(Key::C) {
+                self.put_clipboard(crate::ops::ClipMode::Copy);
+            }
+            if ctrl && i.key_pressed(Key::X) {
+                self.put_clipboard(crate::ops::ClipMode::Cut);
+            }
+            if ctrl && i.key_pressed(Key::V) {
+                self.paste();
+            }
+        });
+
+        // 功能键
+        ctx.input(|i| {
+            if i.key_pressed(Key::F5) {
+                let dest = self.other_pane_path();
+                let paths = self.selected_paths();
+                if paths.is_empty() {
+                    self.status = "没有选中任何项".into();
+                } else if paths.len() == 1 {
+                    // F5 = 复制到对栏当前目录
+                    self.start_op(
+                        crate::ops::OpKind::Copy,
+                        paths.into_iter().map(VPath).collect(),
+                        Some(VPath(dest)),
+                        fmnr_core::ConflictPolicy::Rename,
+                    );
+                } else {
+                    self.status = "多选未实现，先用 Ctrl+C → 对栏 Ctrl+V".into();
+                }
+            }
+            if i.key_pressed(Key::F6) {
+                let dest = self.other_pane_path();
+                let paths = self.selected_paths();
+                if !paths.is_empty() {
+                    self.start_op(
+                        crate::ops::OpKind::Move,
+                        paths.into_iter().map(VPath).collect(),
+                        Some(VPath(dest)),
+                        fmnr_core::ConflictPolicy::Rename,
+                    );
+                }
+            }
+            if i.key_pressed(Key::Delete) {
+                self.delete_selected();
+            }
+            if i.key_pressed(Key::F2) {
+                self.begin_rename();
+            }
+            if i.key_pressed(Key::F7) {
+                self.begin_new_dir();
+            }
+        });
+    }
+
+    fn other_pane_path(&self) -> PathBuf {
+        match self.active_pane {
+            Pane::Left => self.right_path.clone(),
+            Pane::Right => self.left_path.clone(),
+        }
     }
 
     fn pane(&mut self, ui: &mut egui::Ui, which: Pane, width: f32) {
-        // 每帧清理一次（≤60次/秒），在 UI 线程里做，不阻塞 IO 线程池。
-        self.volume.clear_expired();
-
         let path = match which {
             Pane::Left => self.left_path.clone(),
             Pane::Right => self.right_path.clone(),
@@ -371,7 +1004,7 @@ impl App {
                 .map(|e| {
                     self.volume
                         .external_opens()
-                        .get(&(base.join(&e.name).display().to_string()))
+                        .get(base.join(&e.name).display().to_string())
                 })
                 .collect();
 
@@ -409,16 +1042,13 @@ impl App {
                                     ui.label(if e.is_dir { "📁" } else { "📄" });
                                 }
                             }
-                            // 角标：左侧圆点，指示外部打开状态
+                            // 角标：左侧圆点，仅在该进程仍存活时出现
                             if let Some(o) = badge {
-                                let dot = egui::RichText::new("●").size(10.0).color(if o.is_expired() {
-                                    // 失活：红色，半透明
-                                    Color32::from_rgba_unmultiplied(255, 0, 0, 102)
-                                } else {
-                                    // 活跃：按程序命色
-                                    color_for(badge)
-                                });
-                                ui.label(dot);
+                                ui.label(
+                                    egui::RichText::new("●")
+                                        .size(10.0)
+                                        .color(color_for(&o.program)),
+                                );
                             }
                             let resp = ui.selectable_label(*selected == Some(i), &e.name);
                             if let Some(o) = badge {
@@ -493,6 +1123,42 @@ impl App {
     }
 }
 
+/// 把命中片段染成强调色。范围越界（理论上不该发生）时退化为整名普通显示。
+fn highlight_hit(hit: &crate::search::Hit, style: &egui::Style) -> egui::WidgetText {
+    let range = hit.range.clone();
+    if range.start >= range.end || range.end > hit.name.len() {
+        return egui::RichText::new(&hit.name).into();
+    }
+    let (before, rest) = hit.name.split_at(range.end);
+    let (matched, after) = rest.split_at(range.end - range.start);
+
+    // append_to 走 style 解析，字体/字号跟随主题，不写死 FontId。
+    let mut job = egui::text::LayoutJob::default();
+    egui::RichText::new(before).append_to(
+        &mut job,
+        style,
+        egui::FontSelection::default(),
+        egui::Align::Center,
+    );
+    egui::RichText::new(matched)
+        .color(Color32::from_rgb(0, 122, 255))
+        .strong()
+        .append_to(
+            &mut job,
+            style,
+            egui::FontSelection::default(),
+            egui::Align::Center,
+        );
+    egui::RichText::new(after).append_to(
+        &mut job,
+        style,
+        egui::FontSelection::default(),
+        egui::Align::Center,
+    );
+    job.wrap.max_width = f32::INFINITY;
+    egui::WidgetText::from(job)
+}
+
 fn dirs_home() -> PathBuf {
     std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
@@ -508,13 +1174,13 @@ fn overrides_dir() -> PathBuf {
         .join("icons")
 }
 
-fn breadcrumbs(path: &PathBuf) -> Vec<String> {
+fn breadcrumbs(path: &Path) -> Vec<String> {
     let mut parts = Vec::new();
-    let mut cur = path.as_path();
+    let mut cur = path;
     while let Some(name) = cur.file_name() {
         parts.push(name.to_string_lossy().to_string());
         cur = cur.parent().unwrap_or(cur);
-        if cur == path.as_path() {
+        if cur == path {
             break;
         }
     }
@@ -525,7 +1191,7 @@ fn breadcrumbs(path: &PathBuf) -> Vec<String> {
     parts
 }
 
-fn crumbs_to_path(full: &PathBuf, upto: usize) -> PathBuf {
+fn crumbs_to_path(full: &Path, upto: usize) -> PathBuf {
     // 简化：按组件重建到第 upto 层
     let comps: Vec<_> = full.components().collect();
     let mut p = PathBuf::new();
@@ -544,7 +1210,7 @@ enum OpenRoute {
 }
 
 /// 可预览扩展名（M3 覆盖文本/代码/图片；音视频仍走外置，不内嵌 FFmpeg）。
-fn is_previewable(path: &PathBuf) -> bool {
+fn is_previewable(path: &Path) -> bool {
     match path.extension().map(|e| e.to_string_lossy().to_lowercase()) {
         Some(ext) => matches!(
             ext.as_str(),
@@ -556,7 +1222,7 @@ fn is_previewable(path: &PathBuf) -> bool {
 }
 
 /// 默认外部程序：未知类型交给系统默认（以扩展名匹配），已知文本类型先走内置预览。
-fn route_open(path: &PathBuf) -> OpenRoute {
+fn route_open(path: &Path) -> OpenRoute {
     if is_previewable(path) {
         OpenRoute::Preview
     } else {

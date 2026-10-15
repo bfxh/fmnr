@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -77,31 +78,22 @@ pub enum IconKey {
 }
 
 /// 「已被外部程序打开」的状态。UI 角标 + MCP 快照都用这个。
-/// 外部进程状态的存活上限（毫秒）。过期后 UI 自动熄灭角标，必要时移除。
-const EXTERNAL_OPEN_TTL_MS: u64 = 30_000;
-
+///
+/// 存活判定不在这里做：真正的判据是**外部进程是否已退出**（见
+/// `Volume::spawn_external_open` 的实现与 `ExternalOpens::remove_by_handle`）。
+/// 本类型只承载可序列化的数据，不含句柄（句柄不跨进程、也不该进 MCP 快照）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalOpen {
     /// 哪个应用打开了它（例如 "notepad.exe"）
     pub program: String,
-    /// 启动时的进程句柄/PID。Windows: CreateProcess HANDLE 包装；Unix: PID。
+    /// 启动时的进程句柄/PID。Windows: CreateProcess HANDLE 的十六进制串；Unix: PID。
     /// `None` 时只保存程序名（最少信息，隐私优先）。
     pub handle: Option<String>,
-    /// 启动时间戳（毫秒），用于心跳超时熄灭。
+    /// 启动时间戳（毫秒），仅用于展示「何时打开」，不参与存活判定。
     pub started_at_ms: u64,
 }
 
-impl ExternalOpen {
-    /// 是否已过超时上限（未刷新即失活）。
-    pub fn is_expired(&self) -> bool {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|now| now.as_millis() as u64)
-            .unwrap_or(0)
-            > self.started_at_ms + EXTERNAL_OPEN_TTL_MS
-    }
-}
-
+/// 外部打开状态登记表：文件名 → ExternalOpen。
 #[derive(Debug, Default)]
 pub struct ExternalOpens {
     map: std::sync::Mutex<Vec<(String, ExternalOpen)>>,
@@ -112,11 +104,15 @@ impl ExternalOpens {
         Self { map: std::sync::Mutex::new(Vec::new()) }
     }
 
-    /// 注册一个文件的外置打开（ID 不可与现有重复）。
+    /// 注册一个文件的外置打开。
+    ///
+    /// 同一文件重复打开只保留最新一条；不同文件可同时被同一程序打开，
+    /// 不能按 `program` 去重（否则第二个文件的角标会被抹掉）。
     pub fn insert<N: Into<String>>(&self, file_id: N, open: ExternalOpen) {
+        let id = file_id.into();
         let mut map = self.map.lock().unwrap();
-        map.retain(|(_, existing)| existing.handle != open.handle && existing.program != open.program);
-        map.push((file_id.into(), open));
+        map.retain(|(existing_id, _)| existing_id != &id);
+        map.push((id, open));
     }
 
     /// 按文件 ID 取状态。
@@ -126,11 +122,21 @@ impl ExternalOpens {
             .find_map(|(id, o)| if id == file_id.as_ref() { Some(o.clone()) } else { None })
     }
 
-    /// 按 PID 移除（进程退出）。返回被移除的条目。
-    pub fn remove_by_handle(&self, handle: &str) -> Option<(String, ExternalOpen)> {
+    /// 进程退出时移除它对应的所有条目。
+    /// 返回被移除的 (文件 ID, 状态)。
+    pub fn remove_by_handle(&self, handle: &str) -> Vec<(String, ExternalOpen)> {
         let mut map = self.map.lock().unwrap();
-        let idx = map.iter().position(|(_, o)| o.handle.as_deref() == Some(handle));
-        idx.map(|i| map.remove(i))
+        let mut gone = Vec::new();
+        let mut kept = Vec::with_capacity(map.len());
+        for (id, o) in map.drain(..) {
+            if o.handle.as_deref() == Some(handle) {
+                gone.push((id, o));
+            } else {
+                kept.push((id, o));
+            }
+        }
+        *map = kept;
+        gone
     }
 
     pub fn is_empty(&self) -> bool {
@@ -139,14 +145,6 @@ impl ExternalOpens {
 
     pub fn len(&self) -> usize {
         self.map.lock().unwrap().len()
-    }
-
-    /// 移除超时失活的条目。返回被移除的 ID 与状态。
-    pub fn clear_expired(&self) -> Vec<(String, ExternalOpen)> {
-        let mut map = self.map.lock().unwrap();
-        let (expired, kept): (Vec<_>, Vec<_>) = map.drain(..).partition(|(_, o)| o.is_expired());
-        *map = kept;
-        expired
     }
 
     pub fn iter(&self) -> Vec<(String, ExternalOpen)> {
@@ -158,6 +156,106 @@ impl ExternalOpens {
 pub struct ListOpts {
     pub show_hidden: bool,
     pub sort: SortOrder,
+}
+
+/// 目标已存在同名条目时的处理策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConflictPolicy {
+    /// 覆盖目标
+    Overwrite,
+    /// 跳过该条目（默认：不静默毁数据）
+    #[default]
+    Skip,
+    /// 自动改名：`a.txt` → `a (2).txt`
+    Rename,
+}
+
+/// 长操作（拷贝/移动）的进度计数。
+/// 原子递增，UI 线程可无锁轮询；工作线程只写，UI 只读。
+#[derive(Debug, Default)]
+pub struct Progress {
+    bytes_done: std::sync::atomic::AtomicU64,
+    bytes_total: std::sync::atomic::AtomicU64,
+    files_done: std::sync::atomic::AtomicU64,
+    files_total: std::sync::atomic::AtomicU64,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+/// 进度快照，供 UI 单帧读取（避免多次原子读出现撕裂）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProgressSnapshot {
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub files_done: u64,
+    pub files_total: u64,
+    pub cancelled: bool,
+}
+
+impl ProgressSnapshot {
+    /// 完成比例 0.0..=1.0；总量未知（0）时返回 0.0。
+    pub fn fraction(&self) -> f32 {
+        if self.bytes_total == 0 {
+            0.0
+        } else {
+            (self.bytes_done as f64 / self.bytes_total as f64).clamp(0.0, 1.0) as f32
+        }
+    }
+}
+
+impl Progress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 预声明总量（文件数与字节数），用于进度条分母。
+    pub fn set_totals(&self, bytes: u64, files: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.bytes_total.store(bytes, Relaxed);
+        self.files_total.store(files, Relaxed);
+    }
+
+    pub fn add_bytes(&self, n: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.bytes_done.fetch_add(n, Relaxed);
+    }
+
+    pub fn add_file(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.files_done.fetch_add(1, Relaxed);
+    }
+
+    /// 请求取消：工作线程在分块循环里轮询 `is_cancelled()`。
+    pub fn cancel(&self) {
+        self.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn snapshot(&self) -> ProgressSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        ProgressSnapshot {
+            bytes_done: self.bytes_done.load(Relaxed),
+            bytes_total: self.bytes_total.load(Relaxed),
+            files_done: self.files_done.load(Relaxed),
+            files_total: self.files_total.load(Relaxed),
+            cancelled: self.cancelled.load(Relaxed),
+        }
+    }
+}
+
+/// 一次批量操作的结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OpReport {
+    /// 成功处理的条目数
+    pub done: usize,
+    /// 因冲突策略跳过的条目数
+    pub skipped: usize,
+    /// 因用户取消而未处理的条目数
+    pub aborted: usize,
+    /// 实际搬运的字节数
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -201,9 +299,36 @@ pub trait Volume: Send + Sync {
         program: &str,
     ) -> Result<ExternalOpen>;
 
-    /// 外部打开状态登记表（角标注入与心跳清理所用）。
+    /// 外部打开状态登记表（角标注入与退出清理所用）。
     fn external_opens(&self) -> &ExternalOpens;
 
-    /// 移除超时失活的外部打开条目；返回被移除的记录数。
-    fn clear_expired(&self) -> usize;
+    // ---- M2 文件操作：全部走卷抽象，UI 不直接碰 std::fs ----
+
+    /// 拷贝一组条目到目标目录。只读卷返回 Unsupported。
+    /// 进度写入 `progress`；操作在工作线程上跑，调用方可 `Arc::clone` 后另起线程轮询。
+    async fn copy(
+        &self,
+        sources: &[VPath],
+        dest_dir: &VPath,
+        policy: ConflictPolicy,
+        progress: Arc<Progress>,
+    ) -> Result<OpReport>;
+
+    /// 移动一组条目到目标目录。跨卷时退化为「拷贝 + 删除源」。
+    async fn move_entries(
+        &self,
+        sources: &[VPath],
+        dest_dir: &VPath,
+        policy: ConflictPolicy,
+        progress: Arc<Progress>,
+    ) -> Result<OpReport>;
+
+    /// 删除一组条目。本地卷必须走回收站（可恢复），不可直接 unlink。
+    async fn delete(&self, targets: &[VPath], progress: Arc<Progress>) -> Result<OpReport>;
+
+    /// 重命名/原地移动单个条目（目标为完整新路径，含文件名）。
+    async fn rename(&self, from: &VPath, to: &VPath) -> Result<()>;
+
+    /// 新建目录。
+    async fn create_dir(&self, path: &VPath) -> Result<()>;
 }

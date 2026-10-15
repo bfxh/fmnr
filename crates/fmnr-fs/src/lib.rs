@@ -1,15 +1,18 @@
 use fmnr_core::{
-    Attr, Entry, Error, ExternalOpen, ExternalOpens, ListOpts, Result, SortOrder, VPath, Volume,
-    VolumeId, VolumeKind,
+    Attr, ConflictPolicy, Entry, Error, ExternalOpen, ExternalOpens, ListOpts, OpReport, Progress,
+    Result, SortOrder, VPath, Volume, VolumeId, VolumeKind,
 };
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+pub mod ops;
 
 /// 本地文件系统卷：一个盘符/挂载点。核心枚举在进程内完成，不 shell out。
 pub struct LocalVolume {
     id: VolumeId,
     root: PathBuf,
-    /// 外部打开状态登记表（UI 角标 + 心跳移除共用）
-    external_opens: ExternalOpens,
+    /// 外部打开状态登记表（UI 角标读取；看门狗线程在进程退出时写入）
+    external_opens: Arc<ExternalOpens>,
 }
 
 impl LocalVolume {
@@ -19,7 +22,7 @@ impl LocalVolume {
         Self {
             id,
             root,
-            external_opens: ExternalOpens::new(),
+            external_opens: Arc::new(ExternalOpens::new()),
         }
     }
 
@@ -33,10 +36,6 @@ impl LocalVolume {
 
     pub fn external_opens(&self) -> &ExternalOpens {
         &self.external_opens
-    }
-
-    pub fn external_opens_mut(&mut self) -> &mut ExternalOpens {
-        &mut self.external_opens
     }
 }
 
@@ -157,12 +156,6 @@ impl Volume for LocalVolume {
         &self.external_opens
     }
 
-    fn clear_expired(&self) -> usize {
-        let before = self.external_opens.len();
-        self.external_opens.clear_expired();
-        before - self.external_opens.len()
-    }
-
     /// 让外部程序打开指定文件，记录进程句柄/程序名、启动时间。
     /// Windows: 走 CreateProcessW，不走 ShellExecute；派生外部窗口可见状态。
     /// 只读卷（归档/远程）返回 Unsupported。
@@ -178,27 +171,41 @@ impl Volume for LocalVolume {
 
         #[cfg(windows)]
         {
+            use std::os::windows::ffi::OsStrExt;
             use windows::Win32::Foundation::GetLastError;
             use windows::Win32::System::Threading::{
                 CreateProcessW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
             };
 
-            let prog = program
-                .find(' ')
-                .map(|i| &program[..i])
-                .unwrap_or(program);
-            let cmdline = format!("\"{}\" \"{}\"", prog, full.display());
+            // `CreateProcessW` 的 lpApplicationName **不搜索 PATH**：传 "cmd.exe"
+            // 会直接 ERROR_FILE_NOT_FOUND。必须先自己解析成绝对路径。
+            let (prog_raw, args) = split_program(program);
+            let exe = resolve_program(&prog_raw).ok_or_else(|| {
+                Error::NotFound(format!("找不到可执行文件：{prog_raw}"))
+            })?;
 
-            let prog_wide: Vec<u16> = prog.encode_utf16().chain(std::iter::once(0)).collect();
+            let cmdline = if args.is_empty() {
+                format!("\"{}\" \"{}\"", exe.display(), full.display())
+            } else {
+                format!("\"{}\" {} \"{}\"", exe.display(), args, full.display())
+            };
+
+            let exe_wide: Vec<u16> = exe
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
             let cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
 
-            let mut si = STARTUPINFOW::default();
-            si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+            let si = STARTUPINFOW {
+                cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+                ..Default::default()
+            };
             let mut pi = PROCESS_INFORMATION::default();
 
             let ok = unsafe {
                 CreateProcessW(
-                    windows::core::PCWSTR(prog_wide.as_ptr()),
+                    windows::core::PCWSTR(exe_wide.as_ptr()),
                     Some(windows::core::PWSTR(cmdline_wide.as_ptr() as *mut _)),
                     None,
                     None,
@@ -216,15 +223,38 @@ impl Volume for LocalVolume {
                 return Err(Error::Other(format!("CreateProcess failed: {:?}", err)));
             }
 
-            // HANDLE 转字符串，供日志/状态可见
-            let handle = format!("0x{:x}", pi.hProcess.0 as usize);
+            // CreateProcess 给了两个句柄：主线程留一个，看门狗线程留一个。
+            // 谁都不 CloseHandle 就是每次外置打开泄 2 个内核句柄。
+            let process_handle = pi.hProcess;
+            let thread_handle = pi.hThread;
+            let key = format!("{:x}", process_handle.0 as usize);
             let started_at_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
+
+            // 线程句柄本线程用不上，立刻回收；进程句柄交给看门狗。
+            unsafe { windows::Win32::Foundation::CloseHandle(thread_handle) }.ok();
+
+            let opens = Arc::clone(&self.external_opens);
+            let watch_key = key.clone();
+            let owned = OwnedHandle(process_handle);
+            if let Err(e) = std::thread::Builder::new()
+                .name("fmnr-proc-watch".into())
+                .spawn(move || watch_process(owned, watch_key, &opens))
+            {
+                // 线程没起来就没人 CloseHandle，句柄得就地回收。
+                unsafe { windows::Win32::Foundation::CloseHandle(process_handle) }.ok();
+                return Err(Error::Other(format!("watchdog 线程启动失败：{e}")));
+            }
+
             Ok(ExternalOpen {
-                program: prog.to_string(),
-                handle: Some(handle),
+                // 展示用文件名（不含路径），角标文案更干净
+                program: exe
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| exe.display().to_string()),
+                handle: Some(key),
                 started_at_ms,
             })
         }
@@ -237,6 +267,175 @@ impl Volume for LocalVolume {
             ))
         }
     }
+
+    async fn copy(
+        &self,
+        sources: &[VPath],
+        dest_dir: &VPath,
+        policy: ConflictPolicy,
+        progress: std::sync::Arc<Progress>,
+    ) -> Result<OpReport> {
+        let srcs = self.resolve_all(sources);
+        let dest = self.resolve(dest_dir);
+        spawn_blocking(move || ops::transfer(&srcs, &dest, policy, &progress, false)).await
+    }
+
+    async fn move_entries(
+        &self,
+        sources: &[VPath],
+        dest_dir: &VPath,
+        policy: ConflictPolicy,
+        progress: std::sync::Arc<Progress>,
+    ) -> Result<OpReport> {
+        let srcs = self.resolve_all(sources);
+        let dest = self.resolve(dest_dir);
+        spawn_blocking(move || ops::transfer(&srcs, &dest, policy, &progress, true)).await
+    }
+
+    async fn delete(&self, targets: &[VPath], progress: std::sync::Arc<Progress>) -> Result<OpReport> {
+        let paths = self.resolve_all(targets);
+        let (bytes, files) = paths.iter().fold((0u64, 0u64), |acc, p| {
+            let (b, f) = ops::dir_stats(p);
+            (acc.0 + b, acc.1 + f)
+        });
+        progress.set_totals(bytes, files);
+
+        let done = spawn_blocking(move || ops::delete_to_recycle_bin(&paths)).await?;
+        // 删除是原子的：要么整批进回收站，要么报错，不存在部分完成。
+        progress.add_bytes(bytes);
+        for _ in 0..files {
+            progress.add_file();
+        }
+        Ok(OpReport {
+            done,
+            skipped: 0,
+            aborted: 0,
+            bytes,
+        })
+    }
+
+    async fn rename(&self, from: &VPath, to: &VPath) -> Result<()> {
+        let src = self.resolve(from);
+        let dst = self.resolve(to);
+        spawn_blocking(move || std::fs::rename(&src, &dst).map_err(Error::Io)).await
+    }
+
+    async fn create_dir(&self, path: &VPath) -> Result<()> {
+        let full = self.resolve(path);
+        spawn_blocking(move || std::fs::create_dir(&full).map_err(Error::Io)).await
+    }
+}
+
+impl LocalVolume {
+    fn resolve_all(&self, paths: &[VPath]) -> Vec<PathBuf> {
+        paths.iter().map(|p| self.resolve(p)).collect()
+    }
+}
+
+/// 把「程序 + 可选参数」拆开。参数是程序自带时（如 `cmd.exe /c exit`）要保留，
+/// 不能像早先那样在第一个空格处一刀切掉。
+#[cfg(windows)]
+fn split_program(program: &str) -> (String, String) {
+    let p = program.trim();
+    if let Some(rest) = p.strip_prefix('"') {
+        // 引号形式："C:\Program Files\x\y.exe" args
+        if let Some(end) = rest.find('"') {
+            let exe = rest[..end].to_string();
+            let args = rest[end + 1..].trim().to_string();
+            return (exe, args);
+        }
+    }
+    match p.split_once(' ') {
+        Some((exe, args)) => (exe.to_string(), args.trim().to_string()),
+        None => (p.to_string(), String::new()),
+    }
+}
+
+/// 把程序名解析成绝对路径。
+///
+/// 搜索顺序刻意**不含当前目录**：`CreateProcessW` 的默认搜索会包含 CWD，
+/// 那意味着在「下载目录」里放一个同名 `cmd.exe` 就能被优先执行——典型劫持面。
+/// 这里只认「已是绝对路径且存在」与「PATH 中命中」。
+#[cfg(windows)]
+fn resolve_program(program: &str) -> Option<PathBuf> {
+    let p = Path::new(program);
+    if p.is_absolute() {
+        return p.exists().then(|| p.to_path_buf());
+    }
+
+    // 带路径分隔符但不是绝对路径（如 .\x.exe）：显式拒绝，避免相对路径歧义。
+    if program.contains(['/', '\\']) {
+        return None;
+    }
+
+    let path_var = std::env::var_os("PATH")?;
+    // PATHEXT 决定无扩展名时补哪些后缀，默认取 .EXE
+    let exts: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect();
+
+    let has_ext = p.extension().is_some();
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        if has_ext {
+            let cand = dir.join(program);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        } else {
+            for ext in &exts {
+                let cand = dir.join(format!("{program}{ext}"));
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 看门狗：阻塞在 `WaitForSingleObject` 上，进程一退出就摘角标并回收句柄。
+///
+/// 用 INFINITE 而不是轮询：没人需要知道「还活着」，只需要知道「什么时候不再活着」。
+/// 无论等待成功还是失败，都必须走到 `CloseHandle`——句柄泄漏是静默的，
+/// 只有在进程句柄耗尽时才会以「无法启动外部程序」的形式暴露出来。
+#[cfg(windows)]
+fn watch_process(handle: OwnedHandle, key: String, opens: &ExternalOpens) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    // INFINITE = u32::MAX：不超时，直到进程结束才返回。
+    unsafe { WaitForSingleObject(handle.0, u32::MAX) };
+    unsafe { CloseHandle(handle.0) }.ok();
+    opens.remove_by_handle(&key);
+}
+
+/// 已被移交给看门狗线程的进程句柄。
+///
+/// `HANDLE` 是裸 `*mut c_void`，不实现 `Send`。这里显式断言它可跨线程：
+/// 它只是内核句柄表里的一个整数，**唯一性由进程保证**；移交后原线程不再触碰，
+/// 由 `watch_process` 独占并在退出时 `CloseHandle`，不存在双重拥有。
+#[cfg(windows)]
+struct OwnedHandle(windows::Win32::Foundation::HANDLE);
+
+// SAFETY: 见类型注释——单一所有者、无并发访问、仅作为整数传给 Win32 API。
+#[cfg(windows)]
+unsafe impl Send for OwnedHandle {}
+
+/// 把同步 IO 丢到阻塞线程池，避免拖住 async 执行器。
+async fn spawn_blocking<T, F>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| Error::Other(e.to_string()))?
 }
 
 fn sort_entries(entries: &mut [Entry], order: SortOrder) {
@@ -286,4 +485,152 @@ pub fn search(
         }
     }
     hits
+}
+
+#[cfg(all(test, windows))]
+mod watch_tests {
+    use super::*;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+
+    /// 本进程当前的内核句柄数。
+    fn handle_count() -> u32 {
+        let mut n = 0u32;
+        unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) }.expect("GetProcessHandleCount");
+        n
+    }
+
+    fn wait_until(mut cond: impl FnMut() -> bool, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cond()
+    }
+
+    fn temp_file(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "fmnr-watch-{tag}-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&p, b"x").unwrap();
+        p
+    }
+
+    /// 判据：外部进程**真实退出**后，登记表里的条目自动消失。
+    ///
+    /// 这里用 `cmd /c exit` 造一个立刻结束的进程——它不是「过一会儿超时」，
+    /// 而是真死。若实现退回 TTL，本测试会因为等不到 30s 而失败（测试超时窗口设 5s）。
+    #[test]
+    fn badge_clears_when_real_process_exits() {
+        let vol = LocalVolume::new(std::env::temp_dir());
+        let file = temp_file("exit");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let open = rt
+            .block_on(vol.spawn_external_open(&VPath(file.clone()), "cmd.exe /c exit"))
+            .expect("spawn");
+        let key = file.display().to_string();
+        vol.external_opens().insert(key.clone(), open);
+        assert_eq!(vol.external_opens().len(), 1, "打开后应有角标");
+
+        // cmd /c exit 几乎立刻退出；给 5s 余量（远小于旧实现的 30s TTL）。
+        let cleared = wait_until(
+            || vol.external_opens().get(&key).is_none(),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            cleared,
+            "进程已退出但角标仍在——存活判定没有跟随真实进程"
+        );
+        assert_eq!(vol.external_opens().len(), 0);
+        std::fs::remove_file(&file).ok();
+    }
+
+    /// 反证：进程**还在跑**时角标必须留着。
+    /// 没有这条，一个「永远立刻返回」的实现也能过上面那条。
+    ///
+    /// 命令要满足两点：真的活 ~2 秒；且能把尾部追加的文件参数无害吞掉。
+    /// 实测 `ping -n 3 127.0.0.1 <file>` 会因多一个目标而 25ms 就退出（ExitStatus 1），
+    /// 所以用 `& rem <file>` 把文件参数降级成注释。裸 `ping` 是 2.05s。
+    #[test]
+    fn badge_stays_while_process_is_alive() {
+        let vol = LocalVolume::new(std::env::temp_dir());
+        let file = temp_file("alive");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let open = rt
+            .block_on(vol.spawn_external_open(
+                &VPath(file.clone()),
+                "cmd.exe /c ping -n 3 127.0.0.1 > nul & rem",
+            ))
+            .expect("spawn");
+        let key = file.display().to_string();
+        vol.external_opens().insert(key.clone(), open);
+
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            vol.external_opens().get(&key).is_some(),
+            "进程仍存活，角标不应消失"
+        );
+
+        // 收尾：等它自己结束，确认最终会消失（否则残留看门狗线程/句柄）
+        let cleared = wait_until(
+            || vol.external_opens().get(&key).is_none(),
+            std::time::Duration::from_secs(10),
+        );
+        assert!(cleared, "进程结束后角标仍未消失");
+        std::fs::remove_file(&file).ok();
+    }
+
+    /// 句柄泄漏判据：反复外置打开不应让本进程句柄数单调上涨。
+    ///
+    /// 旧实现每次 `CreateProcessW` 都漏掉 hProcess/hThread 两个句柄，
+    /// 20 次就是 40 个。这里给 8 个的余量吸收噪声（测试框架自身会开句柄）。
+    #[test]
+    fn repeated_spawn_does_not_leak_handles() {
+        let vol = LocalVolume::new(std::env::temp_dir());
+        let file = temp_file("leak");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // 预热：让首次的运行时/线程池开销先落定
+        for _ in 0..3 {
+            let _ = rt.block_on(vol.spawn_external_open(
+                &VPath(file.clone()),
+                "cmd.exe /c exit",
+            ));
+        }
+        // 等预热批次全部回收
+        std::thread::sleep(std::time::Duration::from_millis(600));
+
+        let before = handle_count();
+        for _ in 0..20 {
+            let open = rt
+                .block_on(vol.spawn_external_open(&VPath(file.clone()), "cmd.exe /c exit"))
+                .expect("spawn");
+            vol.external_opens()
+                .insert(format!("k{}", open.started_at_ms), open);
+        }
+        // 等 20 个看门狗线程全部 CloseHandle
+        let settled = wait_until(
+            || vol.external_opens().is_empty(),
+            std::time::Duration::from_secs(15),
+        );
+        assert!(settled, "看门狗未全部回收条目");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let after = handle_count();
+
+        let growth = after.saturating_sub(before);
+        assert!(
+            growth <= 8,
+            "句柄数增长 {growth}（{before} → {after}），疑似泄漏"
+        );
+        std::fs::remove_file(&file).ok();
+    }
 }

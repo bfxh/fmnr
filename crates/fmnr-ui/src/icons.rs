@@ -101,7 +101,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("光栅化 {key:?} 失败：{e}"));
             assert_eq!(rgba.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
             // 全透明 = 画了个空白，等于没图标。
-            let opaque = rgba.chunks_exact(4).any(|px| px[3] > 0);
+            let opaque = rgba.as_chunks::<4>().0.iter().any(|px| px[3] > 0);
             assert!(opaque, "{key:?} 光栅化结果全透明");
         }
     }

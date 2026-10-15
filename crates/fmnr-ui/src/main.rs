@@ -2,7 +2,9 @@ use eframe::egui;
 
 mod app;
 mod icons;
+mod ops;
 mod preview;
+mod search;
 mod theme;
 
 fn main() -> eframe::Result<()> {
