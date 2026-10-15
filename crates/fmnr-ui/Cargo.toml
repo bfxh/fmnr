@@ -9,6 +9,7 @@ license.workspace = true
 fmnr-core = { path = "../fmnr-core" }
 fmnr-fs = { path = "../fmnr-fs" }
 fmnr-icons = { path = "../fmnr-icons" }
+fmnr-plugins = { path = "../fmnr-plugins" }
 eframe.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
@@ -18,3 +19,6 @@ tracing-subscriber.workspace = true
 futures = "0.3"
 dirs = "7.0.0"
 jwalk.workspace = true
+
+[dev-dependencies]
+wat = "1"

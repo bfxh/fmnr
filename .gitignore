@@ -1,6 +1,9 @@
 # Rust 构建产物
 /target/
 **/*.rs.bk
+# 插件的构建目录（各自是独立 crate，target 不在根 /target 下）。
+# 但编译出的 .wasm 要提交：那是可安装的分发件，用户不必自己编。
+plugins/*/target/
 
 # 图标覆盖（可选，默认放 assets/icons/）
 /icons/overrides/*

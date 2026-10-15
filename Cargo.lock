@@ -1189,11 +1189,13 @@ dependencies = [
  "fmnr-core",
  "fmnr-fs",
  "fmnr-icons",
+ "fmnr-plugins",
  "futures",
  "jwalk",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wat",
 ]
 
 [[package]]

@@ -1,0 +1,17 @@
+[package]
+name = "md-outline"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+
+# 这是**插件**，不是宿主的一部分：编到 wasm32-unknown-unknown，
+# 不进 workspace（宿主是原生目标，两者编译目标不同）。
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

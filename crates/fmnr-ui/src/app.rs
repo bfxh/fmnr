@@ -68,6 +68,10 @@ pub struct App {
     search: Option<crate::search::SearchState>,
     /// 搜索框文本
     search_text: String,
+    /// M5 插件宿主：按扩展名路由预览渲染器
+    plugins: fmnr_plugins::registry::PluginSet,
+    /// 插件加载警告（坏插件路径 + 原因），启动时填一次，状态栏可见
+    plugin_warnings: Vec<fmnr_plugins::registry::LoadWarning>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -115,7 +119,13 @@ impl App {
             new_dir_name: None,
             search: None,
             search_text: String::new(),
+            plugins: fmnr_plugins::registry::PluginSet::new(),
+            plugin_warnings: Vec::new(),
         };
+        // 插件目录不存在是正常状态（没装插件）；坏插件只记警告不阻塞启动。
+        let (plugins, warnings) = fmnr_plugins::registry::PluginSet::load_dir(&plugins_dir());
+        app.plugins = plugins;
+        app.plugin_warnings = warnings;
         app.refresh();
         app
     }
@@ -259,7 +269,7 @@ impl App {
         match bytes {
             Ok(buf) => {
                 let truncated = buf.len() >= cap;
-                let content = crate::preview::classify(path, &buf, truncated);
+                let content = self.preview_content_for(path, &buf, truncated);
                 self.preview = Some(crate::preview::Preview {
                     path: path.to_path_buf(),
                     content,
@@ -271,6 +281,18 @@ impl App {
                 self.status = format!("预览失败 ({e})");
             }
         }
+    }
+
+    /// 决定预览内容：插件先认领，没人认领才回落内置分类。
+    ///
+    /// 判定在 `preview::route`（纯函数，可单测）；这里只负责取输入。
+    fn preview_content_for(
+        &mut self,
+        path: &Path,
+        buf: &[u8],
+        truncated: bool,
+    ) -> crate::preview::PreviewContent {
+        crate::preview::route(&mut self.plugins, path, buf, truncated)
     }
 
     // ---- M2 文件操作 ----
@@ -610,6 +632,26 @@ impl eframe::App for App {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(self.clipboard.summary());
+                    // 插件状态要**可见**：坏插件静默失败的话，用户看到的现象是
+                    // 「插件装上了但不生效」，没有线索可查。
+                    if !self.plugin_warnings.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} 个插件加载失败",
+                                self.plugin_warnings.len()
+                            ))
+                            .color(Color32::from_rgb(220, 50, 50)),
+                        )
+                        .on_hover_text(
+                            self.plugin_warnings
+                                .iter()
+                                .map(|w| format!("{}：{}", w.path.display(), w.error))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        );
+                    } else if !self.plugins.is_empty() {
+                        ui.label(format!("插件 {}", self.plugins.len()));
+                    }
                 });
             });
         });
@@ -1258,6 +1300,15 @@ fn overrides_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("fmnr")
         .join("icons")
+}
+
+/// 插件目录（`<config>/fmnr/plugins`），放 `*.wasm`。
+/// 目录不存在 = 没装插件，是正常状态。
+fn plugins_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("fmnr")
+        .join("plugins")
 }
 
 fn breadcrumbs(path: &Path) -> Vec<String> {
