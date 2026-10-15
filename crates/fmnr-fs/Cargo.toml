@@ -13,6 +13,12 @@ tracing.workspace = true
 jwalk.workspace = true
 async-trait = "0.1"
 futures = "0.3"
+
+# windows 必须按目标平台门控：写成无条件依赖时，Linux 上也会去编
+# `windows` → `windows-future`，后者在非 Windows 目标下编译失败
+# （CI 首跑就是这么红的；本地只在 Windows 跑 clippy 所以看不出来）。
+# 代码侧本来就全是 `#[cfg(windows)]`，所以门控后不需要改任何 Rust 源码。
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_System_Threading",

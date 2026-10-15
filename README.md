@@ -69,8 +69,10 @@ MCP：`cargo run -p fmnr-ai` 走 stdio；加 `--serve 127.0.0.1:PORT` 走 HTTP�
 ## 工作区结构
 
 ```
-crates/fmnr-core     核心模型：Volume trait / Entry / 打开决策 / 进度 / Board
+crates/fmnr-core     核心模型：Volume trait / Entry / 打开决策 / 进度 / Board / WSL 路径
 crates/fmnr-fs       本地卷实现：ops（复制移动删除）、assoc（默认程序注册与回滚）
+crates/fmnr-archive  归档只读卷：zip / tar / tar.gz，懒加载挂载
+crates/fmnr-remote   SSH/SFTP 卷（接口层，未真机验证）
 crates/fmnr-icons    图标管线：内置 SVG 集 → 光栅化 → egui 纹理，自绘
 crates/fmnr-plugins  WASM 宿主（wasmi）+ 插件注册表，可以做预览和图标插件
 crates/fmnr-ui       eframe/egui：列表 / 预览 / 白板 / 主题
@@ -95,14 +97,27 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
 | M4 | MCP / HTTP / CLI / `fmnr://` / 拖放 | ✅ |
 | M5 | WASM 插件宿主 + 真插件验收 | ✅ |
 | M6 | 白板布局 + 持久化 + 恢复 | ✅ |
-| M7 | SSH/SFTP 卷 + WSL UNC 识别 + wslpath | ⬜ |
+| M7a | 归档只读卷（zip/tar/tgz）+ WSL UNC 识别 + wslpath | ✅ **真机实测** |
+| M7b | SSH/SFTP 卷 | ⚠️ 只有接口与纯逻辑测试，**未连过真实主机** |
+| CI | 四道门禁（lint / 双平台测试 / 插件产物同源 / 客户端契约） | ⬜ 待首跑结果 |
 
 ## 已知边界
 
-- **M7 未开始。**
-- WSL 支持只会做到「实现 + 契约测试」：开发机没启用 WSL，所以**没有真机验证**过。
+写在这里的是**判据边界**，不是谦虚：
+
+- **SSH/SFTP 卷没有真实验证过。** 端点解析、host key 决策（fail-closed）、
+  SFTP 状态码→错误分类这三块有单测；握手、认证成功率、流式读、断连恢复**没有**。
+  `ssh_live.rs` 在没有 `FMNR_SSH_TEST_HOST` 时打印跳过并通过——
+  所以那一片绿灯不代表远程卷可用。
+- **WSL 是真机实测过的**（开发机装有 WSL2：`Ubuntu-24.04`、`docker-desktop`）：
+  两种 UNC 写法都能直接 `read_dir`，`wslpath` 双向可用，
+  所以浏览 WSL **不需要协议层**，复用本地卷即可。
+  仍未实测的只有「未安装 WSL」那条错误文案，因此代码里不按文案判可用性，
+  只看退出码。
+- **远程卷与归档卷都不做 hash 图标覆盖**（取 hash 的代价与本地不在一个量级）。
+- **归档卷只读**，且懒加载：只读中央目录/头，不解压成员。
 - Liquid Glass 是 egui 上的 acrylic **近似**，不是像素级多层模糊。
-- 不做：音视频转码（不内嵌 FFmpeg）、文件同步、云盘挂载。
+- 不做：音视频转码（不内嵌 FFmpeg）、文件同步、云盘挂载、系统级 Shell 扩展。
 
 ## License
 
