@@ -74,14 +74,12 @@ jobs:
       - name: Release build
         run: cargo build --workspace --locked --release
 
-  # ── 门禁 3：插件产物与源码同源 ────────────────────────────────────
-  # 钉两条：(a) 从源码重编出来的 wasm 能被**真宿主**加载并渲染出正确大纲
-  #          （这才是「分发件可用」的可操作含义）；
-  #        (b) 重编件与入库的 md-outline.wasm **逐字节相同**。
-  # (b) 会在 rustc 升级时判红——这是**故意**的：产物哈希变了必须有个人
-  #     类工重新确认并重新录一次，不允许悄悄漂移。
-  plugin-artifact:
-    name: plugin reproducible + works via real host
+  # ── 门禁 3a：插件「源码 → 真能跑」──────────────────────────────────
+  # 钉的结论：从源码重编出的 wasm 能被**真宿主**加载并渲染出正确大纲。
+  # 这条与工具链版本**无关**，所以永远不该因为 rustc 补丁号而判红——
+  # 它测的是行为。
+  plugin-behavior:
+    name: plugin builds and works via real host
     needs: lint
     runs-on: ubuntu-latest
     steps:
@@ -91,10 +89,47 @@ jobs:
           targets: wasm32-unknown-unknown
       - name: Rebuild plugin from source
         run: cargo build --release --manifest-path plugins/md-outline/Cargo.toml --target wasm32-unknown-unknown --locked
-      - name: Compare with committed artifact
+      - name: Load the rebuilt wasm through the real host
+        # 用重编件**覆盖**入库件后再跑 e2e：这样测的是「源码产出的插件经宿主
+        # ABI 能真的渲染」，而不是「仓库里那串字节碰巧能加载」。
+        # 顺序很重要：先验行为，再谈哈希——行为不过就是真缺陷，哈希不过可能只是版本差。
         run: |
-          # 插件是**自己的 workspace**（Cargo.toml 里有空的 [workspace]），
-          # 所以产物落在 plugins/md-outline/target/ 而不是仓根 target/。
+          BUILT=plugins/md-outline/target/wasm32-unknown-unknown/release/md_outline.wasm
+          if [ ! -f "$BUILT" ]; then
+            echo "::error::重编产物没找到，路径或 crate 名变了：$BUILT"
+            exit 2
+          fi
+          echo "committed: $(sha256sum plugins/md-outline/md-outline.wasm)"
+          echo "rebuilt:   $(sha256sum "$BUILT")"
+          cmp -s plugins/md-outline/md-outline.wasm "$BUILT" \
+            || echo "::notice::重编件与入库件字节不同（跨 rustc 版本属预期），下面照常验行为。"
+          cp "$BUILT" plugins/md-outline/md-outline.wasm
+          cargo test -p fmnr-plugins --locked
+
+  # ── 门禁 3b：字节可复现（**钉死工具链**才成立）─────────────────────
+  # 2026-10-16 的实测教训：这条原本与 3a 合成一个 job、跑在 ubuntu 的 stable 上，
+  # 结果判红——CI 用的是 rustc **1.99.1 (58cf8f9c3 2026-10-13)**，
+  # 而录这份产物时本机是 **1.99.0 (b940084d7 2026-09-28)**。
+  # wasm 里有 `production` 自定义段记录编译器版本，所以字节必然不同。
+  # ⇒ 「逐字节可复现」是个**有作用域的主张**：只有把编译器版本钉死、
+  #   并且在**录制它的那类环境**里重编，它才成立。放在浮动 stable 上，
+  #   它每天都可能因为上游发版而红，那种红不含信息，只会训练人去忽略红灯。
+  # 所以这里显式钉 1.99.0 + windows（产物当初就在 windows-gnu 上录的）。
+  # 升版流程：更新 local/CI 工具链 → 重录产物 → 把本 job 的 pin 一起改掉。
+  plugin-repro:
+    name: plugin byte-reproducible (pinned toolchain)
+    needs: lint
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+          targets: wasm32-unknown-unknown
+      - name: Rebuild with the pinned toolchain and compare bytes
+        shell: bash
+        run: |
+          cargo build --release --manifest-path plugins/md-outline/Cargo.toml --target wasm32-unknown-unknown --locked
           BUILT=plugins/md-outline/target/wasm32-unknown-unknown/release/md_outline.wasm
           if [ ! -f "$BUILT" ]; then
             echo "::error::重编产物没找到，路径或 crate 名变了：$BUILT"
@@ -103,19 +138,12 @@ jobs:
           echo "committed: $(sha256sum plugins/md-outline/md-outline.wasm)"
           echo "rebuilt:   $(sha256sum "$BUILT")"
           if ! cmp -s plugins/md-outline/md-outline.wasm "$BUILT"; then
-            echo "::error::入库的 md-outline.wasm 与源码重编结果不一致。"
-            echo "::error::若这是 rustc/cargo 升级带来的预期变化，请显式重录产物并在 commit message 里写明；"
-            echo "::error::若不是，说明源码与分发件已经分叉。"
+            echo "::error::在**录制该产物的同一工具链(1.99.0/windows)**下重编，字节仍不一致。"
+            echo "::error::这才是真信号：源码与分发件分叉了，或 pin 与实际录制环境不符。"
+            echo "::error::若是有意升级工具链，请重录产物并把本 job 的 toolchain 一起改。"
             exit 1
           fi
-          echo "产物与源码同源，逐字节一致。"
-      - name: Load the rebuilt wasm through the real host
-        # 用重编件**覆盖**入库件后再跑 e2e：这样测的就是「源码产出的插件
-        # 经宿主 ABI 能真的渲染」，而不是「仓库里那个字节串碰巧能加载」。
-        run: |
-          cp plugins/md-outline/target/wasm32-unknown-unknown/release/md_outline.wasm \
-             plugins/md-outline/md-outline.wasm
-          cargo test -p fmnr-plugins --locked
+          echo "同工具链下逐字节可复现。"
 
   # ── 门禁 4：外部客户端契约（MCP / HTTP / CLI）──────────────────────
   # 钉的结论：三个前端共用同一个内核分发表，不会出现「CLI 能删、MCP 不能」。

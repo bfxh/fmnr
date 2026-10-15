@@ -196,6 +196,14 @@ fn register_dry_run_prints_plan_without_writing() {
 
 /// 干跑不落盘：跑完之后注册表里不该多出 fmnr 键。
 /// 这条用 `reg query` 独立核对，不看程序自己的输出。
+///
+/// **`#[cfg(windows)]`**：见证者是 `reg.exe` 与 HKCU 注册表本身，Linux 上没有
+/// 对应物（`Command::new("reg")` 会直接 panic 在 `.expect()`，CI ubuntu 就是这么红的）。
+/// 注意上面那条 `register_dry_run_prints_plan_without_writing` **刻意不门控**：
+/// 它验的是「计划只落 HKCU\Software\Classes、共享键不进整键删除列表」这条
+/// **安全不变量**，而计划是 `RegistrationPlan::build` 生成的平台无关数据
+/// （只有 `apply`/`revert` 带 cfg），所以这条约束在两个平台上都得判红得了。
+#[cfg(windows)]
 #[test]
 fn register_dry_run_leaves_registry_untouched() {
     let fx = Fixture::new("regnoop");

@@ -433,12 +433,20 @@ fn copy_rename_policy_keeps_both_files() {
 // ---------------------------------------------------------------- open 决策
 
 /// 打开决策表必须与 UI 一致：文本走预览，未知类型走外部程序。
+///
+/// 🟡 这一条**跨平台分叉**（CI 首两轮 ubuntu 判红的根因）：
+/// `spawn_external_open` 只在 Windows 实现（要拿进程句柄做存活判定，见
+/// fmnr-fs 的 `CreateProcessW` 路径），非 Windows 返回 `Unsupported`。
+/// 所以这里不能整条 `#[cfg(windows)]` 掉——那会让 Linux 连
+/// 「文本走预览」这个平台无关的决策都不再验证。
+/// 两半**各自**都要有断言，Linux 侧断的是「不假装打开成功」。
 #[test]
 fn open_routes_text_to_preview_and_unknown_to_external() {
     let fx = Fixture::new("open");
     let mut mcp = Mcp::start(&fx.0);
     mcp.handshake();
 
+    // —— 平台无关的一半：文本必须走预览
     let txt = mcp.call(
         "tools/call",
         json!({
@@ -452,7 +460,6 @@ fn open_routes_text_to_preview_and_unknown_to_external() {
         "txt 应走预览"
     );
 
-    // 未知扩展名：会真的 spawn 一个 cmd.exe（挂角标），随后要清理掉。
     let unknown = fx.0.join("thing.xyzzy");
     std::fs::write(&unknown, b"?").unwrap();
     let resp = mcp.call(
@@ -462,17 +469,48 @@ fn open_routes_text_to_preview_and_unknown_to_external() {
             "arguments": {"path": unknown.to_string_lossy()}
         }),
     );
-    let p = tool_payload(&resp);
-    assert_eq!(p["route"], json!("external"), "未知类型应走外部程序：{p}");
-    assert!(p["program"].is_string());
 
-    // 角标状态应能查到
-    let opens = mcp.call(
-        "tools/call",
-        json!({"name": "external_opens", "arguments": {}}),
-    );
-    let op = tool_payload(&opens);
-    assert_eq!(op["count"], json!(1), "外置打开后应有一条角标：{op}");
+    #[cfg(windows)]
+    {
+        let p = tool_payload(&resp);
+        assert_eq!(p["route"], json!("external"), "未知类型应走外部程序：{p}");
+        assert!(p["program"].is_string());
+
+        // 角标状态应能查到
+        let opens = mcp.call(
+            "tools/call",
+            json!({"name": "external_opens", "arguments": {}}),
+        );
+        let op = tool_payload(&opens);
+        assert_eq!(op["count"], json!(1), "外置打开后应有一条角标：{op}");
+    }
+
+    #[cfg(not(windows))]
+    {
+        // 非 Windows：必须**报错**，不能回一个 route=external 的假成功，
+        // 也不能静默返回空——那会让客户端以为文件已经被打开了。
+        assert!(
+            resp["error"].is_object(),
+            "非 Windows 的未知类型必须报错而不是假装打开：{resp}"
+        );
+        // Unsupported 映射到 INTERNAL_ERROR（能力缺失不是客户端可修正的 4xx）。
+        assert_eq!(resp["error"]["code"], json!(-32603));
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("未实现"),
+            "文案要说清是未实现：{}",
+            resp["error"]["message"]
+        );
+        assert!(
+            resp["result"].is_null(),
+            "错误响应不该带 result（带了就是半成功）：{resp}"
+        );
+        // 报了这个错之后协议还得继续可用，不能一错就失联。
+        let ping = mcp.call("ping", json!({}));
+        assert_eq!(ping["result"], json!({}), "错误后协议应仍健康");
+    }
 
     mcp.finish();
 }
@@ -489,6 +527,14 @@ fn open_routes_text_to_preview_and_unknown_to_external() {
 /// 这里让子进程打印一个**独特标记**：句柄若仍共享，标记就会出现在我们的
 /// stdout 上，`finish()` 的「无多余帧」断言会把那段原文打出来。用 `/c` 而非
 /// `/k`：子进程自己退出，测试不留下常驻进程。
+///
+/// **`#[cfg(windows)]` 的理由**：这条钉的是 Win32 句柄继承语义，不是抽象契约。
+/// 非 Windows 上今天根本不会 spawn 子进程（`open` 直接报 Unsupported），
+/// 「不 spawn 所以不污染」在 `open_routes_text_to_preview_and_unknown_to_external`
+/// 的 unix 分支里已经用「报错后协议仍健康」覆盖到了。
+/// ⚠️ 等 unix 侧真实现了 spawn，**这条必须一起实现**，否则那个句柄 bug 会以
+/// 另一种形态在 Linux/macOS 上复活。
+#[cfg(windows)]
 #[test]
 fn external_spawn_does_not_pollute_stdout() {
     let fx = Fixture::new("isolation");
