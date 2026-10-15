@@ -4,6 +4,7 @@ members = [
     "crates/fmnr-core",
     "crates/fmnr-fs",
     "crates/fmnr-icons",
+    "crates/fmnr-plugins",
     "crates/fmnr-ui",
     "crates/fmnr-ai",
     "crates/fmnr-cli",
@@ -40,6 +41,7 @@ eframe = { version = "0.31", default-features = false, features = [
 ] }
 egui_extras = { version = "0.31", features = ["image", "svg"] }
 rayon = "1"
+wasmi = "0.47"
 
 [profile.release]
 opt-level = 2
