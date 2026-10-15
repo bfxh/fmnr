@@ -5,6 +5,7 @@ use fmnr_core::{
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub mod assoc;
 pub mod ops;
 
 /// 本地文件系统卷：一个盘符/挂载点。核心枚举在进程内完成，不 shell out。

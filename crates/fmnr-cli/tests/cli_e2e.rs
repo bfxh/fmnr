@@ -157,3 +157,57 @@ fn listing_missing_dir_fails_cleanly() {
     );
     assert!(!out.stderr.is_empty(), "错误信息应出现在 stderr");
 }
+
+/// `register --dry-run` 只打印计划，**不写注册表**。
+/// e2e 里刻意只用 dry-run：真写会污染跑测试那台机器的注册表。
+#[test]
+fn register_dry_run_prints_plan_without_writing() {
+    let fx = Fixture::new("regdry");
+    let p = run_json(&fx.0, &["register", "--dry-run"]);
+
+    let ops = p["will_write"].as_array().expect("应有 will_write");
+    assert!(!ops.is_empty(), "计划不该为空");
+
+    // 每一条都必须落在 HKCU\Software\Classes 下
+    for op in ops {
+        let key = op["key"].as_str().unwrap();
+        assert!(
+            key.starts_with("HKCU\\Software\\Classes\\"),
+            "越界写到 {key}：只允许 HKCU\\Software\\Classes"
+        );
+    }
+
+    // 共享键必须走「只删自己的值」那条路，不能进整键删除列表
+    let owned = p["owned_keys_we_would_delete"]
+        .as_array()
+        .expect("应有 owned_keys");
+    for ext in [".txt", ".md", ".log"] {
+        let shared = format!("Software\\Classes\\{ext}\\OpenWithProgids");
+        assert!(
+            !owned.iter().any(|k| k.as_str() == Some(&shared)),
+            "{shared} 进了整键删除列表——会误删别人的打开方式登记"
+        );
+    }
+
+    // 协议标记必须出现，否则 fmnr:// 不被 Windows 认作协议处理器
+    let has_url_protocol = ops.iter().any(|o| o["name"] == "URL Protocol");
+    assert!(has_url_protocol, "计划里缺少 URL Protocol 标记");
+}
+
+/// 干跑不落盘：跑完之后注册表里不该多出 fmnr 键。
+/// 这条用 `reg query` 独立核对，不看程序自己的输出。
+#[test]
+fn register_dry_run_leaves_registry_untouched() {
+    let fx = Fixture::new("regnoop");
+    let _ = run(&fx.0, &["register", "--dry-run"]);
+
+    // 独立的见证者：reg.exe，不是 fmnr 自己的说法
+    let out = Command::new("reg")
+        .args(["query", "HKCU\\Software\\Classes\\fmnr"])
+        .output()
+        .expect("reg query");
+    assert!(
+        !out.status.success(),
+        "干跑后不该存在 HKCU\\Software\\Classes\\fmnr，但 reg query 找到了"
+    );
+}

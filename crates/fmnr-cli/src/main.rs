@@ -95,6 +95,25 @@ enum Cmd {
 
     /// 当前被外部程序打开的文件（角标状态）
     Opens,
+
+    /// 把 fmnr 注册为「打开方式」候选，并注册 fmnr:// 协议（写 HKCU，免管理员）
+    ///
+    /// 只加入「打开方式」列表，**不改动系统默认程序**；不注册 COM。
+    Register {
+        /// 要注册的可执行文件路径；省略则用当前进程自身
+        #[arg(long)]
+        exe: Option<String>,
+        /// 只打印将要写的内容，不真写注册表
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// 撤销上面那次注册，把 fmnr 建的所有键值删干净（幂等）
+    Unregister {
+        /// 只打印将要删除的内容，不真删
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -112,11 +131,22 @@ enum ConflictArg {
     Rename,
 }
 
+/// 子命令的两类去向。
+///
+/// 大多数子命令是**一次工具调用**（与 MCP 共用 dispatch）；
+/// `register`/`unregister` 不是工具调用，而是本机的注册表动作——
+/// 它们碰的是系统边界，不该被远程客户端经由 MCP/HTTP 触发。
+enum Action {
+    Tool(&'static str, Value),
+    Register { exe: Option<String>, dry_run: bool },
+    Unregister { dry_run: bool },
+}
+
 impl Cmd {
-    /// 子命令 → (工具名, 工具参数)。纯映射，不碰 IO，便于单测。
-    fn to_call(&self) -> (&'static str, Value) {
+    /// 子命令 → 去向。纯映射，不碰 IO，便于单测。
+    fn to_action(&self) -> Action {
         match self {
-            Cmd::Volumes => ("list_volume", json!({})),
+            Cmd::Volumes => Action::Tool("list_volume", json!({})),
             Cmd::Ls { path, all, sort } => {
                 let mut a = json!({ "show_hidden": all });
                 if let Some(p) = path {
@@ -128,9 +158,9 @@ impl Cmd {
                     SortArg::Modified => "modified",
                     SortArg::Type => "type",
                 });
-                ("list_dir", a)
+                Action::Tool("list_dir", a)
             }
-            Cmd::Search { root, query, limit } => (
+            Cmd::Search { root, query, limit } => Action::Tool(
                 "search",
                 json!({ "root": root, "query": query, "limit": limit }),
             ),
@@ -138,7 +168,7 @@ impl Cmd {
                 sources,
                 to,
                 conflict,
-            } => (
+            } => Action::Tool(
                 "copy",
                 json!({ "sources": sources, "dest_dir": to, "conflict": conflict.as_str() }),
             ),
@@ -146,11 +176,11 @@ impl Cmd {
                 sources,
                 to,
                 conflict,
-            } => (
+            } => Action::Tool(
                 "move",
                 json!({ "sources": sources, "dest_dir": to, "conflict": conflict.as_str() }),
             ),
-            Cmd::Rm { targets } => ("delete", json!({ "targets": targets })),
+            Cmd::Rm { targets } => Action::Tool("delete", json!({ "targets": targets })),
             Cmd::Open {
                 path,
                 external,
@@ -160,9 +190,14 @@ impl Cmd {
                 if let Some(p) = program {
                     a["program"] = json!(p);
                 }
-                ("open", a)
+                Action::Tool("open", a)
             }
-            Cmd::Opens => ("external_opens", json!({})),
+            Cmd::Opens => Action::Tool("external_opens", json!({})),
+            Cmd::Register { exe, dry_run } => Action::Register {
+                exe: exe.clone(),
+                dry_run: *dry_run,
+            },
+            Cmd::Unregister { dry_run } => Action::Unregister { dry_run: *dry_run },
         }
     }
 }
@@ -179,8 +214,99 @@ impl ConflictArg {
 
 fn main() {
     let cli = Cli::parse();
-    let (tool, args) = cli.cmd.to_call();
 
+    match cli.cmd.to_action() {
+        Action::Register { exe, dry_run } => run_register(exe, dry_run),
+        Action::Unregister { dry_run } => run_unregister(dry_run),
+        Action::Tool(tool, args) => run_tool(tool, args),
+    }
+}
+
+/// 注册：只写 HKCU。默认拿当前进程自身当目标程序。
+fn run_register(exe: Option<String>, dry_run: bool) {
+    let exe = match exe {
+        Some(e) => e,
+        None => match std::env::current_exe() {
+            Ok(p) => p.display().to_string(),
+            Err(e) => {
+                eprintln!("fmnr: 拿不到自身路径：{e}");
+                std::process::exit(1);
+            }
+        },
+    };
+    let plan = fmnr_fs::assoc::RegistrationPlan::build(&exe);
+
+    if dry_run {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&plan_to_json(&plan)).unwrap()
+        );
+        return;
+    }
+
+    match fmnr_fs::assoc::apply(&plan) {
+        Ok(r) => println!(
+            "{}",
+            serde_json::json!({ "ok": true, "written": r.written, "exe": exe })
+        ),
+        Err(e) => {
+            eprintln!("fmnr: 注册失败：{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 撤销：删干净 fmnr 建的键值。共享键只摘自己的值。
+fn run_unregister(dry_run: bool) {
+    // 撤销不依赖 exe 路径：要删的键名是固定的。
+    let plan = fmnr_fs::assoc::RegistrationPlan::build("fmnr.exe");
+
+    if dry_run {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&plan_to_json(&plan)).unwrap()
+        );
+        return;
+    }
+
+    match fmnr_fs::assoc::revert(&plan) {
+        Ok(r) => println!(
+            "{}",
+            serde_json::json!({ "ok": true, "removed": r.removed })
+        ),
+        Err(e) => {
+            eprintln!("fmnr: 撤销失败：{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 把注册计划摊平成 JSON，供 `--dry-run` 展示「到底会写什么」。
+fn plan_to_json(plan: &fmnr_fs::assoc::RegistrationPlan) -> Value {
+    let ops: Vec<Value> = plan
+        .ops
+        .iter()
+        .map(|o| {
+            let v = match &o.value {
+                fmnr_fs::assoc::RegValue::Sz(s) => s.clone(),
+                fmnr_fs::assoc::RegValue::ExpandSz(s) => s.clone(),
+            };
+            json!({ "key": format!("HKCU\\{}", o.subkey), "name": o.name, "value": v })
+        })
+        .collect();
+    let shared: Vec<Value> = plan
+        .shared()
+        .iter()
+        .map(|(k, n)| json!({ "key": format!("HKCU\\{k}"), "value_to_remove": n }))
+        .collect();
+    json!({
+        "will_write": ops,
+        "shared_values_we_would_remove": shared,
+        "owned_keys_we_would_delete": plan.subkeys(),
+    })
+}
+
+fn run_tool(tool: &'static str, args: Value) {
     let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let volume = Arc::new(LocalVolume::new(root));
 
@@ -214,8 +340,12 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// 取工具调用；不是工具调用就 panic（调用点自己知道该是哪类）。
     fn call(cmd: Cmd) -> (&'static str, Value) {
-        cmd.to_call()
+        match cmd.to_action() {
+            Action::Tool(t, a) => (t, a),
+            _ => panic!("该子命令不是工具调用"),
+        }
     }
 
     #[test]
@@ -308,8 +438,33 @@ mod tests {
             Cmd::Opens,
         ];
         for c in cmds {
-            let (tool, _) = c.to_call();
+            let (tool, _) = call(c);
             assert!(names.contains(&tool), "CLI 指向了未注册的工具：{tool}");
         }
+    }
+
+    /// register/unregister 必须**不是**工具调用。
+    ///
+    /// 它们改的是本机注册表。如果做成工具，远程 MCP/HTTP 客户端就能
+    /// 顺着协议改用户系统的默认程序——那是系统边界，只能由本机命令行触发。
+    #[test]
+    fn registration_is_local_only_not_a_tool_call() {
+        assert!(matches!(
+            Cmd::Register {
+                exe: None,
+                dry_run: true
+            }
+            .to_action(),
+            Action::Register { .. }
+        ));
+        assert!(matches!(
+            Cmd::Unregister { dry_run: true }.to_action(),
+            Action::Unregister { .. }
+        ));
+
+        // 反向确认：这两个名字不在 MCP 工具表里
+        let names: Vec<&str> = tools::specs().iter().map(|s| s.name).collect();
+        assert!(!names.contains(&"register"), "register 不该是 MCP 工具");
+        assert!(!names.contains(&"unregister"), "unregister 不该是 MCP 工具");
     }
 }
