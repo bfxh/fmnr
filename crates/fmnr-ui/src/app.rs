@@ -115,7 +115,15 @@ impl App {
     }
 
     fn spawn_external(&mut self, path: &PathBuf) {
-        let program = default_program_for(&path);
+        let route = route_open(&path);
+        let program = match route {
+            OpenRoute::Preview => {
+                // M3 预览面板尚未上线，先占位：状态栏提示预览能力已识别，但不外置。
+                self.status = format!("预览（{}）— M3 面板待接入", path.display());
+                return;
+            }
+            OpenRoute::External(p) => p,
+        };
         let program_for_status = program.clone();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let volume = self.volume.clone();
@@ -396,10 +404,34 @@ fn crumbs_to_path(full: &PathBuf, upto: usize) -> PathBuf {
     p
 }
 
+/// 双击分流：预览优先，外置兜底。
+enum OpenRoute {
+    /// 内置预览面板（M3 统一预览）
+    Preview,
+    /// 交给外部程序打开
+    External(String),
+}
+
+/// 可预览扩展名（M3 覆盖文本/代码/图片；音视频仍走外置，不内嵌 FFmpeg）。
+fn is_previewable(path: &PathBuf) -> bool {
+    match path.extension().map(|e| e.to_string_lossy().to_lowercase()) {
+        Some(ext) => matches!(
+            ext.as_str(),
+            "txt" | "md" | "rs" | "py" | "js" | "ts" | "json" | "toml" | "yaml" | "yml"
+                | "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg"
+        ),
+        None => false,
+    }
+}
+
 /// 默认外部程序：未知类型交给系统默认（以扩展名匹配），已知文本类型先走内置预览。
-/// 暂时退回「全部交给系统默认」，M3 统一预览面板上线后按扩展名分流。
-fn default_program_for(_path: &PathBuf) -> String {
-    std::env::var("COMSPEC")
-        .or_else(|_| std::env::var("SHELL"))
-        .unwrap_or_else(|_| "cmd.exe".into())
+fn route_open(path: &PathBuf) -> OpenRoute {
+    if is_previewable(path) {
+        OpenRoute::Preview
+    } else {
+        let program = std::env::var("COMSPEC")
+            .or_else(|_| std::env::var("SHELL"))
+            .unwrap_or_else(|_| "cmd.exe".into());
+        OpenRoute::External(program)
+    }
 }
