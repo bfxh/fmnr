@@ -1,8 +1,31 @@
-use eframe::egui::{self, Key, Pos2, Rect, Response, Sense, Vec2};
+use eframe::egui::{self, Color32, Key};
 use fmnr_core::{ListOpts, SortOrder, VPath, Volume};
 use fmnr_fs::LocalVolume;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+fn color_for(exp: Option<&fmnr_core::ExternalOpen>) -> Color32 {
+    if let Some(o) = exp {
+        if o.is_expired() {
+            return Color32::from_rgba_unmultiplied(255, 0, 0, 90);
+        }
+        // 已摄入 UI：用 program 前缀做主题色
+        match o.program.to_lowercase().as_str() {
+            p if p.contains("chrome") | p.contains("edge") | p.contains("firefox") | p.contains("brave") => {
+                Color32::from_rgb(0, 122, 255)
+            }
+            p if p.contains("code") | p.contains("vscode") | p.contains("cursor") => {
+                Color32::from_rgb(230, 191, 0)
+            }
+            p if p.contains("notepad") | p.contains("word") | p.contains("excel") | p.contains("powerpoint") => {
+                Color32::from_rgb(230, 89, 38)
+            }
+            _ => Color32::from_rgb(0, 128, 255),
+        }
+    } else {
+        Color32::TRANSPARENT
+    }
+}
 
 pub struct App {
     volume: Arc<dyn Volume>,
@@ -86,13 +109,32 @@ impl App {
             self.right_filter.clear();
             self.refresh();
         } else {
-            // M0：双击文件交给系统默认程序（后续 M3 换成统一预览+状态角标）
-            self.status = format!("open: {}", path.display());
-            #[cfg(windows)]
-            {
-                let _ = std::process::Command::new("cmd")
-                    .args(["/c", "start", "", &path.display().to_string()])
-                    .spawn();
+            // 非目录：交给外部程序，并在 UI 挂状态角标
+            self.spawn_external(&path);
+        }
+    }
+
+    fn spawn_external(&mut self, path: &PathBuf) {
+        let program = default_program_for(&path);
+        let program_for_status = program.clone();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let volume = self.volume.clone();
+        let path = path.clone();
+        let result = rt.block_on(async move {
+            volume
+                .spawn_external_open(&fmnr_core::VPath(path.clone().into()), &program)
+                .await
+        });
+        match result {
+            Ok(open) => {
+                let pid = open.handle.as_deref().unwrap_or("?");
+                self.active_pane = Pane::Left;
+                self.status = format!("已在 {} 中打开（pid {}）", program_for_status, pid);
+                // 给 UI 挂状态；实际角标以 volume.external_opens() 驱动
+                self.refresh();
+            }
+            Err(e) => {
+                self.status = format!("打开失败 ({e})");
             }
         }
     }
@@ -179,6 +221,9 @@ impl App {
     }
 
     fn pane(&mut self, ui: &mut egui::Ui, which: Pane, width: f32) {
+        // 每帧清理一次（≤60次/秒），在 UI 线程里做，不阻塞 IO 线程池。
+        self.volume.clear_expired();
+
         let path = match which {
             Pane::Left => self.left_path.clone(),
             Pane::Right => self.right_path.clone(),
@@ -219,6 +264,10 @@ impl App {
             ui.separator();
 
             // 列视图
+            let base = match which {
+                Pane::Left => self.left_path.clone(),
+                Pane::Right => self.right_path.clone(),
+            };
             let entries: Vec<&fmnr_core::Entry> = {
                 let all = match which {
                     Pane::Left => &self.left_entries,
@@ -238,6 +287,16 @@ impl App {
                 }
             };
 
+            // 文件路径 -> 外置打开状态的索引（角标注入用）
+            let badges: Vec<Option<fmnr_core::ExternalOpen>> = entries
+                .iter()
+                .map(|e| {
+                    self.volume
+                        .external_opens()
+                        .get(&(base.join(&e.name).display().to_string()))
+                })
+                .collect();
+
             let selected = match which {
                 Pane::Left => &mut self.left_selected,
                 Pane::Right => &mut self.right_selected,
@@ -253,18 +312,35 @@ impl App {
                 |ui, row_range| {
                     for i in row_range {
                         let e = entries[i];
+                        let badge = badges[i].as_ref();
                         let label = if e.is_dir {
                             format!("📁 {}", e.name)
                         } else {
                             format!("📄 {}", e.name)
                         };
-                        let resp = ui.selectable_label(*selected == Some(i), label);
-                        if resp.clicked() {
-                            clicked = Some(i);
-                        }
-                        if resp.double_clicked() {
-                            dbl = Some(i);
-                        }
+                        ui.horizontal(|ui| {
+                            // 角标：左侧圆点，指示外部打开状态
+                            if let Some(o) = badge {
+                                let dot = egui::RichText::new("●").size(10.0).color(if o.is_expired() {
+                                    // 失活：红色，半透明
+                                    Color32::from_rgba_unmultiplied(255, 0, 0, 102)
+                                } else {
+                                    // 活跃：按程序命色
+                                    color_for(badge)
+                                });
+                                ui.label(dot);
+                            }
+                            let resp = ui.selectable_label(*selected == Some(i), label);
+                            if let Some(o) = badge {
+                                resp.clone().on_hover_text(format!("已在 {} 中打开", o.program));
+                            }
+                            if resp.clicked() {
+                                clicked = Some(i);
+                            }
+                            if resp.double_clicked() {
+                                dbl = Some(i);
+                            }
+                        });
                     }
                 },
             );
@@ -320,6 +396,10 @@ fn crumbs_to_path(full: &PathBuf, upto: usize) -> PathBuf {
     p
 }
 
-// 保留未用符号避免编译告警噪音（M0 占位）
-#[allow(dead_code)]
-fn _unused(_: Pos2, _: Rect, _: Response, _: Vec2, _: Sense) {}
+/// 默认外部程序：未知类型交给系统默认（以扩展名匹配），已知文本类型先走内置预览。
+/// 暂时退回「全部交给系统默认」，M3 统一预览面板上线后按扩展名分流。
+fn default_program_for(_path: &PathBuf) -> String {
+    std::env::var("COMSPEC")
+        .or_else(|_| std::env::var("SHELL"))
+        .unwrap_or_else(|_| "cmd.exe".into())
+}

@@ -1,5 +1,6 @@
 use fmnr_core::{
-    Attr, Entry, Error, ListOpts, Result, SortOrder, VPath, Volume, VolumeId, VolumeKind,
+    Attr, Entry, Error, ExternalOpen, ExternalOpens, ListOpts, Result, SortOrder, VPath, Volume,
+    VolumeId, VolumeKind,
 };
 use std::path::{Path, PathBuf};
 
@@ -7,22 +8,35 @@ use std::path::{Path, PathBuf};
 pub struct LocalVolume {
     id: VolumeId,
     root: PathBuf,
+    /// 外部打开状态登记表（UI 角标 + 心跳移除共用）
+    external_opens: ExternalOpens,
 }
 
 impl LocalVolume {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let id = VolumeId(format!("local:{}", root.display()));
-        Self { id, root }
+        Self {
+            id,
+            root,
+            external_opens: ExternalOpens::new(),
+        }
     }
 
-    /// 把卷内路径解析为真实文件系统路径。
     fn resolve(&self, path: &VPath) -> PathBuf {
         if path.0.is_absolute() {
             path.0.clone()
         } else {
             self.root.join(&path.0)
         }
+    }
+
+    pub fn external_opens(&self) -> &ExternalOpens {
+        &self.external_opens
+    }
+
+    pub fn external_opens_mut(&mut self) -> &mut ExternalOpens {
+        &mut self.external_opens
     }
 }
 
@@ -118,7 +132,7 @@ impl Volume for LocalVolume {
             .map_err(Error::Io)?;
         let chunk = bytes.to_vec();
         let stream = futures::stream::iter(std::iter::once(Ok(chunk)));
-        Ok(Box::new(stream))
+        Ok(Box::new(stream) as Box<dyn futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + Unpin>)
     }
 
     async fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
@@ -132,6 +146,91 @@ impl Volume for LocalVolume {
 
     fn native_path(&self, path: &VPath) -> Option<PathBuf> {
         Some(self.resolve(path))
+    }
+
+    fn external_opens(&self) -> &ExternalOpens {
+        &self.external_opens
+    }
+
+    fn clear_expired(&self) -> usize {
+        let before = self.external_opens.len();
+        self.external_opens.clear_expired();
+        before - self.external_opens.len()
+    }
+
+    /// 让外部程序打开指定文件，记录进程句柄/程序名、启动时间。
+    /// Windows: 走 CreateProcessW，不走 ShellExecute；派生外部窗口可见状态。
+    /// 只读卷（归档/远程）返回 Unsupported。
+    async fn spawn_external_open(
+        &self,
+        file_path: &VPath,
+        program: &str,
+    ) -> Result<ExternalOpen> {
+        let full = self.resolve(file_path);
+        if !full.exists() {
+            return Err(Error::NotFound(full.display().to_string()));
+        }
+
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::GetLastError;
+            use windows::Win32::System::Threading::{
+                CreateProcessW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+            };
+
+            let prog = program
+                .find(' ')
+                .map(|i| &program[..i])
+                .unwrap_or(program);
+            let cmdline = format!("\"{}\" \"{}\"", prog, full.display());
+
+            let prog_wide: Vec<u16> = prog.encode_utf16().chain(std::iter::once(0)).collect();
+            let cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
+
+            let mut si = STARTUPINFOW::default();
+            si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+            let mut pi = PROCESS_INFORMATION::default();
+
+            let ok = unsafe {
+                CreateProcessW(
+                    windows::core::PCWSTR(prog_wide.as_ptr()),
+                    Some(windows::core::PWSTR(cmdline_wide.as_ptr() as *mut _)),
+                    None,
+                    None,
+                    false,
+                    CREATE_UNICODE_ENVIRONMENT,
+                    None,
+                    None,
+                    &si,
+                    &mut pi,
+                )
+                .is_ok()
+            };
+            if !ok {
+                let err = unsafe { GetLastError() };
+                return Err(Error::Other(format!("CreateProcess failed: {:?}", err)));
+            }
+
+            // HANDLE 转字符串，供日志/状态可见
+            let handle = format!("0x{:x}", pi.hProcess.0 as usize);
+            let started_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            Ok(ExternalOpen {
+                program: prog.to_string(),
+                handle: Some(handle),
+                started_at_ms,
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            // Unix: 简化——直接在 UI 侧用 std::process 替代，暂不实现此契约。
+            Err(Error::Unsupported(
+                "Unix spawn_external_open 暂未实现，退回 ShellExecute".into(),
+            ))
+        }
     }
 }
 

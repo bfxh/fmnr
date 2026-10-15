@@ -13,3 +13,4 @@ tracing.workspace = true
 jwalk.workspace = true
 async-trait = "0.1"
 futures = "0.3"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security"] }
