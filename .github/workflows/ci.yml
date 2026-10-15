@@ -1,0 +1,126 @@
+# CI 门禁。
+#
+# 每个 step 钉一条**会判红**的结论，注释里写明是哪条；不写「跑了但判不出东西」的步骤。
+# 第三方 action 只用了 checkout 与 rust-toolchain（这两个是事实标准），
+# **没有**引入 rust-cache：缓存层多一个可写的外部依赖，而这里的 job 数量少、
+# 全量编译的墙钟可以接受——换供应链面不值。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 门禁 1：格式与 lint ────────────────────────────────────────────
+  # 钉的结论：`cargo fmt` 与 `clippy -D warnings` 在**两个平台**都干净。
+  # 分开成一个 job 而不是塞进 host：lint 判红时不该掩盖测试结论，反之亦然。
+  lint:
+    name: lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # clippy --all-targets 才覆盖 tests/ benches：只查 lib 会漏掉
+      # 「测试代码里的 lint」这类漂移。
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # ── 门禁 2：主平台 + 可移植性 ──────────────────────────────────────
+  # 钉的结论：全部单元/集成测试在 windows（真实目标平台，含 CreateProcessW
+  # 与句柄泄漏那批 cfg(windows) 测试）和 ubuntu（防只按 Windows 写码漂移）都过。
+  host:
+    name: build+test (${{ matrix.os }})
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # egui/eframe 在 Linux 要 GL + X11 + Wayland 开发包；没有音频依赖
+      # （Cargo.lock 里没有 cpal/alsa-sys），所以不装 libasound2。
+      - name: Linux system deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev \
+            libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libwayland-dev wayland-protocols pkg-config
+      - name: Test
+        run: cargo test --workspace --locked
+      # release 构建单独跑一次：`panic = "abort"`、lto 那套 profile 只在
+      # release 生效，光跑 debug 判不出 release 才有的链接问题。
+      - name: Release build
+        run: cargo build --workspace --locked --release
+
+  # ── 门禁 3：插件产物与源码同源 ────────────────────────────────────
+  # 钉两条：(a) 从源码重编出来的 wasm 能被**真宿主**加载并渲染出正确大纲
+  #          （这才是「分发件可用」的可操作含义）；
+  #        (b) 重编件与入库的 md-outline.wasm **逐字节相同**。
+  # (b) 会在 rustc 升级时判红——这是**故意**的：产物哈希变了必须有个人
+  #     类工重新确认并重新录一次，不允许悄悄漂移。
+  plugin-artifact:
+    name: plugin reproducible + works via real host
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Rebuild plugin from source
+        run: cargo build --release --manifest-path plugins/md-outline/Cargo.toml --target wasm32-unknown-unknown --locked
+      - name: Compare with committed artifact
+        run: |
+          # 插件是**自己的 workspace**（Cargo.toml 里有空的 [workspace]），
+          # 所以产物落在 plugins/md-outline/target/ 而不是仓根 target/。
+          BUILT=plugins/md-outline/target/wasm32-unknown-unknown/release/md_outline.wasm
+          if [ ! -f "$BUILT" ]; then
+            echo "::error::重编产物没找到，路径或 crate 名变了：$BUILT"
+            exit 2
+          fi
+          echo "committed: $(sha256sum plugins/md-outline/md-outline.wasm)"
+          echo "rebuilt:   $(sha256sum "$BUILT")"
+          if ! cmp -s plugins/md-outline/md-outline.wasm "$BUILT"; then
+            echo "::error::入库的 md-outline.wasm 与源码重编结果不一致。"
+            echo "::error::若这是 rustc/cargo 升级带来的预期变化，请显式重录产物并在 commit message 里写明；"
+            echo "::error::若不是，说明源码与分发件已经分叉。"
+            exit 1
+          fi
+          echo "产物与源码同源，逐字节一致。"
+      - name: Load the rebuilt wasm through the real host
+        # 用重编件**覆盖**入库件后再跑 e2e：这样测的就是「源码产出的插件
+        # 经宿主 ABI 能真的渲染」，而不是「仓库里那个字节串碰巧能加载」。
+        run: |
+          cp plugins/md-outline/target/wasm32-unknown-unknown/release/md_outline.wasm \
+             plugins/md-outline/md-outline.wasm
+          cargo test -p fmnr-plugins --locked
+
+  # ── 门禁 4：外部客户端契约（MCP / HTTP / CLI）──────────────────────
+  # 钉的结论：三个前端共用同一个内核分发表，不会出现「CLI 能删、MCP 不能」。
+  # 这些测试已经在 `host` 的 --workspace 里跑过，这里单列是因为它们是
+  # **起真子进程**的契约测试，判红时最可能是接口漂移，值得一个独立信号。
+  contracts:
+    name: external client contracts
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p fmnr-ai --locked --test mcp_contract --test http_contract
+      - run: cargo test -p fmnr-cli --locked --test cli_e2e
