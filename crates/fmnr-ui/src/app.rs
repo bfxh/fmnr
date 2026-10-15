@@ -48,6 +48,8 @@ pub struct App {
     status: String,
     /// M3 统一预览面板状态
     preview: Option<crate::preview::Preview>,
+    /// M1 图标纹理缓存（IconKey → 纹理）
+    icons: crate::icons::IconCache,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -75,6 +77,10 @@ impl App {
             right_filter: String::new(),
             status: String::new(),
             preview: None,
+            icons: crate::icons::IconCache::new(
+                overrides_dir(),
+                crate::icons::IconCache::builtin_dir(),
+            ),
         };
         app.refresh();
         app
@@ -369,6 +375,13 @@ impl App {
                 })
                 .collect();
 
+            // 图标纹理预先解析（闭包内不能可变借用 self.icons）。
+            let ctx = ui.ctx().clone();
+            let icon_handles: Vec<Option<egui::TextureHandle>> = entries
+                .iter()
+                .map(|e| self.icons.get(&ctx, &e.icon_key))
+                .collect();
+
             let selected = match which {
                 Pane::Left => &mut self.left_selected,
                 Pane::Right => &mut self.right_selected,
@@ -385,12 +398,17 @@ impl App {
                     for i in row_range {
                         let e = entries[i];
                         let badge = badges[i].as_ref();
-                        let label = if e.is_dir {
-                            format!("📁 {}", e.name)
-                        } else {
-                            format!("📄 {}", e.name)
-                        };
+                        let icon = icon_handles[i].clone();
                         ui.horizontal(|ui| {
+                            // 图标：自绘 SVG 纹理；缺失时退回字形占位
+                            match icon {
+                                Some(h) => {
+                                    ui.add(egui::Image::new((h.id(), egui::vec2(16.0, 16.0))));
+                                }
+                                None => {
+                                    ui.label(if e.is_dir { "📁" } else { "📄" });
+                                }
+                            }
                             // 角标：左侧圆点，指示外部打开状态
                             if let Some(o) = badge {
                                 let dot = egui::RichText::new("●").size(10.0).color(if o.is_expired() {
@@ -402,7 +420,7 @@ impl App {
                                 });
                                 ui.label(dot);
                             }
-                            let resp = ui.selectable_label(*selected == Some(i), label);
+                            let resp = ui.selectable_label(*selected == Some(i), &e.name);
                             if let Some(o) = badge {
                                 resp.clone().on_hover_text(format!("已在 {} 中打开", o.program));
                             }
@@ -480,6 +498,14 @@ fn dirs_home() -> PathBuf {
         .or_else(|_| std::env::var("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// 用户图标覆盖目录（`<config>/fmnr/icons`），不存在时 resolver 会静默跳过。
+fn overrides_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("fmnr")
+        .join("icons")
 }
 
 fn breadcrumbs(path: &PathBuf) -> Vec<String> {

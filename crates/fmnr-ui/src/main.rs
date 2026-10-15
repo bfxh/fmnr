@@ -1,6 +1,7 @@
 use eframe::egui;
 
 mod app;
+mod icons;
 mod preview;
 mod theme;
 

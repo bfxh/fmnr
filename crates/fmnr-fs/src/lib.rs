@@ -99,17 +99,22 @@ impl Volume for LocalVolume {
                 attrs.push(Attr::Symlink);
             }
 
-            let icon_key = match Path::new(&item.file_name().to_string_lossy().to_string())
-                .extension()
-                .map(|e| e.to_string_lossy().to_lowercase())
-            {
-                Some(ext) if !ext.is_empty() => fmnr_core::IconKey::ByExtension(ext),
-                _ => fmnr_core::IconKey::Generic,
+            let is_dir = meta.is_dir();
+            let icon_key = if is_dir {
+                fmnr_core::IconKey::Directory
+            } else {
+                match Path::new(&name)
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                {
+                    Some(ext) if !ext.is_empty() => fmnr_core::IconKey::ByExtension(ext),
+                    _ => fmnr_core::IconKey::Generic,
+                }
             };
 
             entries.push(Entry {
                 name,
-                is_dir: meta.is_dir(),
+                is_dir,
                 size: if meta.is_file() { Some(meta.len()) } else { None },
                 modified: meta.modified().ok(),
                 icon_key,
