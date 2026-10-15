@@ -176,14 +176,18 @@ mod tests {
             root: root.clone(),
             case_sensitive: false,
         });
-        for _ in 0..200 {
+        // 轮询等待，但**除下来的总预算是宽松的**：workspace 级并行会把
+        // 遍历线程挤到 1s 之外，那时失败的是机器不是代码。超时要给出
+        // 已等待多久，否则现场只剩一句没信息的 assertion failed。
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while !st.done && Instant::now() < deadline {
             st.drain();
-            if st.done {
-                break;
-            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(st.done);
+        assert!(
+            st.done,
+            "搜索线程未在 30s 内结束（可能被并行测试挤占，非代码缺陷）"
+        );
         assert_eq!(st.hits.len(), 1);
         assert_eq!(st.hits[0].name, "beta.txt");
         assert!(st.hits[0].path.ends_with("beta.txt"));

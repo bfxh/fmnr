@@ -148,7 +148,8 @@ impl App {
         app.plugins = plugins;
         app.plugin_warnings = warnings;
         // 白板：能读就恢复，读不到（首次运行/文件坏了）就用空板，不阻塞启动。
-        if let Ok(b) = fmnr_core::board::Board::load(&fmnr_core::board::Board::default_path("default"))
+        if let Ok(b) =
+            fmnr_core::board::Board::load(&fmnr_core::board::Board::default_path("default"))
         {
             app.board = b;
         }
@@ -1083,7 +1084,11 @@ impl App {
         self.board_viewport = rect;
 
         // 交互层：先占满整块画布，处理平移与缩放。
-        let bg = ui.interact(rect, egui::Id::new("board_bg"), egui::Sense::click_and_drag());
+        let bg = ui.interact(
+            rect,
+            egui::Id::new("board_bg"),
+            egui::Sense::click_and_drag(),
+        );
 
         // 滚轮缩放（Ctrl 或直接滚轮都可，白板里滚轮没有别的用途）。
         if bg.hovered() {
@@ -1114,8 +1119,14 @@ impl App {
             };
             let ra = crate::board_view::card_rect(a.pos);
             let rb = crate::board_view::card_rect(b.pos);
-            let ca = cam.to_screen(fmnr_core::board::Pos::new(ra.center().x, ra.center().y), origin);
-            let cb = cam.to_screen(fmnr_core::board::Pos::new(rb.center().x, rb.center().y), origin);
+            let ca = cam.to_screen(
+                fmnr_core::board::Pos::new(ra.center().x, ra.center().y),
+                origin,
+            );
+            let cb = cam.to_screen(
+                fmnr_core::board::Pos::new(rb.center().x, rb.center().y),
+                origin,
+            );
             painter.line_segment(
                 [ca, cb],
                 egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(150, 160, 175)),
@@ -1181,10 +1192,10 @@ impl App {
             }
             if resp.dragged() && self.board_drag == Some(idx) {
                 let d = cam.screen_delta_to_canvas(resp.drag_delta());
-                drag_to = Some((idx, fmnr_core::board::Pos::new(
-                    node.pos.x + d.x,
-                    node.pos.y + d.y,
-                )));
+                drag_to = Some((
+                    idx,
+                    fmnr_core::board::Pos::new(node.pos.x + d.x, node.pos.y + d.y),
+                ));
             }
             if resp.double_clicked() {
                 // 双击：交给既有的打开语义（预览或外置程序 + 角标）。
@@ -1229,9 +1240,7 @@ impl App {
         // 视图中心的画布坐标：走 to_canvas，这样缩放/平移后位置都算得对。
         // 之前用 pan 当中心，一缩放就会钉到看不见的地方。
         let vp_center = self.board_viewport.center();
-        let center = self
-            .board_cam
-            .to_canvas(vp_center, self.board_viewport.min);
+        let center = self.board_cam.to_canvas(vp_center, self.board_viewport.min);
 
         let mut added = 0usize;
         for p in paths.iter() {
@@ -1552,7 +1561,8 @@ fn truncate_label(s: &str, max_chars: usize) -> String {
     out
 }
 
-fn dirs_home() -> PathBuf {    std::env::var("USERPROFILE")
+fn dirs_home() -> PathBuf {
+    std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))

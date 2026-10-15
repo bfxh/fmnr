@@ -30,12 +30,12 @@ impl Default for Camera {
 
 impl Camera {
     /// 画布坐标 → 屏幕坐标。
-    pub fn to_screen(&self, p: Pos, origin: egui::Pos2) -> egui::Pos2 {
+    pub fn to_screen(self, p: Pos, origin: egui::Pos2) -> egui::Pos2 {
         origin + self.pan + egui::Vec2::new(p.x, p.y) * self.zoom
     }
 
     /// 屏幕坐标 → 画布坐标。与 [`Self::to_screen`] 互为逆运算。
-    pub fn to_canvas(&self, screen: egui::Pos2, origin: egui::Pos2) -> Pos {
+    pub fn to_canvas(self, screen: egui::Pos2, origin: egui::Pos2) -> Pos {
         let v = (screen - origin - self.pan) / self.zoom;
         Pos::new(v.x, v.y)
     }
@@ -61,10 +61,7 @@ pub const CARD_H: f32 = 64.0;
 
 /// 节点的画布矩形。
 pub fn card_rect(p: Pos) -> egui::Rect {
-    egui::Rect::from_min_size(
-        egui::pos2(p.x, p.y),
-        egui::vec2(CARD_W, CARD_H),
-    )
+    egui::Rect::from_min_size(egui::pos2(p.x, p.y), egui::vec2(CARD_W, CARD_H))
 }
 
 /// 一组节点的包围盒（画布坐标），用于「全部可见」。
@@ -87,11 +84,7 @@ pub fn bounds(positions: &[Pos]) -> Option<egui::Rect> {
 ///
 /// 留 5% 边距，免得节点贴着边。内容为空或视口退化时返回 None，
 /// 让调用方保持原相机而不是跳到一个没意义的位置。
-pub fn fit_camera(
-    content: egui::Rect,
-    viewport: egui::Rect,
-    origin: egui::Pos2,
-) -> Option<Camera> {
+pub fn fit_camera(content: egui::Rect, viewport: egui::Rect, origin: egui::Pos2) -> Option<Camera> {
     if content.width() <= 0.0 || content.height() <= 0.0 {
         return None;
     }
@@ -127,8 +120,14 @@ mod tests {
         let p = Pos::new(123.5, -40.25);
         let s = cam.to_screen(p, origin());
         let back = cam.to_canvas(s, origin());
-        assert!((back.x - p.x).abs() < 1e-3, "x 往返应相等：{back:?} vs {p:?}");
-        assert!((back.y - p.y).abs() < 1e-3, "y 往返应相等：{back:?} vs {p:?}");
+        assert!(
+            (back.x - p.x).abs() < 1e-3,
+            "x 往返应相等：{back:?} vs {p:?}"
+        );
+        assert!(
+            (back.y - p.y).abs() < 1e-3,
+            "y 往返应相等：{back:?} vs {p:?}"
+        );
     }
 
     /// 拖动换算：放大时鼠标位移要**除以** zoom，否则节点跑得比鼠标快。
@@ -205,8 +204,7 @@ mod tests {
     #[test]
     fn fit_puts_content_inside_the_viewport() {
         let content = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 500.0));
-        let viewport =
-            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 400.0));
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 400.0));
         let cam = fit_camera(content, viewport, origin()).unwrap();
 
         // 内容四角应落在视口内。

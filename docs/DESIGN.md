@@ -399,3 +399,17 @@ egui immediate-mode **无原生 backdrop blur**。方案：
 - 论文结论为摘要级理解，落地应读全文。
 - 「UV」经用户确认为「统一预览视图 + 让用户知道已被默认打开的 UX」，已落入 §4.7。
 - Liquid Glass 为 egui acrylic **近似**，非像素级多层模糊。
+
+### B.1 开发机资源约束（影响一切构建/测试命令）
+
+构建机内存吃紧：**空闲内存常年只有 1.3–1.8 GB**，页面文件在 HDD 上（即便 `CARGO_TARGET_DIR`
+已挪到 NVMe）。因此：
+
+- 编译测试**一律用最小规格**：`CARGO_BUILD_JOBS=1 cargo test`（不要并发 `-j` 默认值）。
+- 由此催生的一个**反模式**要避免：用 `for i in $(seq 1 N); do cargo test --workspace; done`
+  反复跑全工作区来「抓偶发失败」。这么跑会因内存压力把机器拖死、且失败多为资源性
+  flake 而非真 bug。要抓不确定性，用**定向重复单测**（`cargo test -p <crate> -- --exact <name>`）
+  或 `cargo-nextest` 的重试，而不是整仓循环。
+- 本约束来自开发期对话记录（Qoder 会话 `2026-10-15/cf9915da`），原始 5.2 MB 转写已清理；
+  该会话同时确认：M0–M6 的实现级教训（`name_matches` 契约陷阱、`list` vs `search` 错误分类、
+  角标 TTL 冒充存活的句柄泄漏）**均已落入代码与 commit message**，故不另存归档。
