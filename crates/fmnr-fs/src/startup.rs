@@ -424,11 +424,6 @@ fn mirror_entries() -> Vec<(String, String)> {
     .unwrap_or_default()
 }
 
-#[cfg(not(windows))]
-fn mirror_entries() -> Vec<(String, String)> {
-    Vec::new()
-}
-
 /// 用户「启动」文件夹。从注册表的 `User Shell Folders` 读，不硬编码——
 /// 那个位置可以被组策略重定向。
 #[cfg(windows)]
@@ -440,11 +435,6 @@ fn user_startup_dir() -> Option<std::path::PathBuf> {
     .ok()
     .flatten()?;
     Some(std::path::PathBuf::from(expand_vars(&raw)))
-}
-
-#[cfg(not(windows))]
-fn user_startup_dir() -> Option<std::path::PathBuf> {
-    None
 }
 
 /// 公共「启动」文件夹。
@@ -459,11 +449,7 @@ fn common_startup_dir() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(expand_vars(&raw)))
 }
 
-#[cfg(not(windows))]
-fn common_startup_dir() -> Option<std::path::PathBuf> {
-    None
-}
-
+#[cfg(any(windows, test))]
 /// `%NAME%` 展开。`std::env::var` 只认 Unix 风格的 `$NAME`，而注册表里的
 /// `REG_EXPAND_SZ` 用 `%NAME%`，所以自己展开。认不出来就原样留着——
 /// 宁可显示一个看得出没展开的路径，也不要猜一个把用户带到别处去。

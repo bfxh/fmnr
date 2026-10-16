@@ -327,7 +327,9 @@ fn delete_hkcu_tree(subkey: &str) -> Result<()> {
 // 免得每个模块各自抄一遍 RegSetValueExW 的 UTF-16 字节重解释——
 // 那种抄写最容易漏的是"删值不能删键"这条。
 
-/// 写一个 REG_SZ。
+/// 写一个 REG_SZ。跟着 `set_hkcu` 一起门控：非 Windows 上它没有实现，
+/// 不门控就会在 ubuntu 上编成"找不到函数"（这条 CI 判红过一次，本地看不见）。
+#[cfg(windows)]
 pub(crate) fn set_hkcu_str(subkey: &str, name: &str, value: &str) -> Result<()> {
     set_hkcu(subkey, name, &RegValue::Sz(value.to_string()))
 }
@@ -342,11 +344,6 @@ pub(crate) fn get_hkcu_str(subkey: &str, name: &str) -> Result<Option<String>> {
     )
 }
 
-#[cfg(not(windows))]
-pub(crate) fn get_hkcu_str(_subkey: &str, _name: &str) -> Result<Option<String>> {
-    Ok(None)
-}
-
 /// 同上，但读 HKLM。只读——写机器级要管理员，本程序不提权。
 #[cfg(windows)]
 pub(crate) fn get_hklm_str(subkey: &str, name: &str) -> Result<Option<String>> {
@@ -355,11 +352,6 @@ pub(crate) fn get_hklm_str(subkey: &str, name: &str) -> Result<Option<String>> {
         subkey,
         name,
     )
-}
-
-#[cfg(not(windows))]
-pub(crate) fn get_hklm_str(_subkey: &str, _name: &str) -> Result<Option<String>> {
-    Ok(None)
 }
 
 /// `RegGetValueW` 两步取：先问长度，再按长度取值。
