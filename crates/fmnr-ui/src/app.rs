@@ -2,7 +2,7 @@ use eframe::egui::{self, Color32, Key, Modifiers};
 use fmnr_core::open::{route_open as core_route_open, OpenRoute};
 use fmnr_core::volreg::VolumeRegistry;
 use fmnr_core::{ListOpts, SortOrder, VPath, Volume, VolumeId};
-use fmnr_fs::LocalVolume;
+use fmnr_mount::{MountSpec, MountTable};
 use futures::StreamExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,14 +36,35 @@ fn color_for(program: &str) -> Color32 {
 pub struct App {
     volume_registry: VolumeRegistry,
     current_volume_id: Option<VolumeId>,
+    /// 挂载记录（哪些挂上了、哪些失败了）——失败原因要留档，不能只闪一条状态。
+    mount_table: MountTable,
+    /// 挂载对话框；None = 未打开。
+    mount_dialog: Option<MountDialog>,
     /// 左栏当前目录
     left_path: PathBuf,
     /// 右栏当前目录
     right_path: PathBuf,
     left_entries: Vec<fmnr_core::Entry>,
     right_entries: Vec<fmnr_core::Entry>,
-    left_selected: Option<usize>,
-    right_selected: Option<usize>,
+    /// 每栏选中的**条目名**，不是行号。
+    ///
+    /// 存行号的话，过滤一生效行号就对不上 `*_entries`，
+    /// 回车/复制/删除会作用在另一条上——界面显示的和实际操作的对象分裂。
+    left_selected: Option<String>,
+    right_selected: Option<String>,
+    /// 每栏最近一次列目录失败的原因。
+    ///
+    /// 原来错误被 `unwrap_or_default()` 吞成空列表，用户看到的是
+    /// 「这个目录是空的」，而真相是「没权限 / 卷没挂上 / 路径不存在」。
+    left_error: Option<String>,
+    right_error: Option<String>,
+    /// 上一帧是否有文本框持有焦点：快捷键据此让行。
+    text_focus: bool,
+    /// 重命名/新建目录弹窗的输入框需要在打开那一帧抢到焦点。
+    name_focus: bool,
+    /// 弹窗里上一次提交被拒绝的原因（空名、已存在、非法字符…）。
+    name_error: Option<String>,
+    cjk_font_ok: bool,
     active_pane: Pane,
     show_hidden: bool,
     sort: SortOrder,
@@ -66,14 +87,25 @@ pub struct App {
     renaming: Option<String>,
     /// M2 新建目录名输入框
     new_dir_name: Option<String>,
-    /// M2 子树搜索（None = 搜索框未激活）
+    /// M2 子树搜索的在途任务（None = 当前没有搜索）
     search: Option<crate::search::SearchState>,
+    /// 搜索面板是否展开。和 `search` 分开存：
+    /// 面板刚打开、还没打字时 `search` 是 None，但面板得画出来。
+    search_open: bool,
+    /// 面板打开那一帧要抢焦点。
+    search_focus: bool,
+    /// 本次搜索的根目录，展开面板时锁定。
+    /// 每次敲键都重扫一遍当前子树：活动栏会被搜索面板顶掉，
+    /// 用 active_path 的话扫到一半栏位一变，结果集就跟着抖动。
+    search_root: PathBuf,
     /// 搜索框文本
     search_text: String,
     /// M5 插件宿主：按扩展名路由预览渲染器
     plugins: fmnr_plugins::registry::PluginSet,
     /// 插件加载警告（坏插件路径 + 原因），启动时填一次，状态栏可见
     plugin_warnings: Vec<fmnr_plugins::registry::LoadWarning>,
+    /// 目录树（左侧常驻侧栏的模型；契约见 tree 模块与 docs/UI-NEXT.md §8.1）
+    tree: crate::tree::Tree,
     /// M6 空间白板（布局层，与双栏视图互斥显示）
     board: fmnr_core::board::Board,
     /// 当前视图：双栏 or 白板
@@ -107,25 +139,108 @@ struct ConflictPrompt {
     choice: fmnr_core::ConflictPolicy,
 }
 
+/// 挂载对话框：选类型 + 填入参。三种入口共用一个窗口，
+/// 避免工具栏上挂三个长得几乎一样的按钮（UI 自身的克制，见 DESIGN §5）。
+struct MountDialog {
+    kind: MountKind,
+    /// 归档路径 / SSH 端点 /（发现失败时的）手动 distro 名。
+    input: String,
+    /// `wsl -l -q` 的发现结果；Some = 已尝试过发现。
+    wsl_distros: Option<Result<Vec<String>, String>>,
+    /// WSL 列表里的选中下标。
+    wsl_picked: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountKind {
+    Archive,
+    Wsl,
+    Ssh,
+}
+
+impl MountDialog {
+    fn new() -> Self {
+        Self {
+            kind: MountKind::Archive,
+            input: String::new(),
+            // 打开时同步发现（与本应用其它地方一致的同步模型；
+            // `wsl -l -q` 实测很快，不值得为它引一套异步管线）。
+            wsl_distros: Some(fmnr_mount::discover_wsl_distros().map_err(|e| e.to_string())),
+            wsl_picked: 0,
+        }
+    }
+
+    /// 把对话框内容拼成挂载 spec；WSL 优先用发现列表的选中项。
+    fn spec(&self) -> Option<MountSpec> {
+        match self.kind {
+            MountKind::Archive => {
+                let p = self.input.trim();
+                if p.is_empty() {
+                    return None;
+                }
+                Some(MountSpec::Archive {
+                    path: PathBuf::from(p),
+                })
+            }
+            MountKind::Wsl => {
+                if let Some(Ok(list)) = &self.wsl_distros {
+                    if let Some(d) = list.get(self.wsl_picked) {
+                        return Some(MountSpec::Wsl { distro: d.clone() });
+                    }
+                }
+                let d = self.input.trim();
+                if d.is_empty() {
+                    return None;
+                }
+                Some(MountSpec::Wsl {
+                    distro: d.to_string(),
+                })
+            }
+            MountKind::Ssh => {
+                let e = self.input.trim();
+                if e.is_empty() {
+                    return None;
+                }
+                Some(MountSpec::Ssh {
+                    endpoint: e.to_string(),
+                })
+            }
+        }
+    }
+}
+
 impl App {
     pub fn new(cjk_font_ok: bool) -> Self {
-        // M8 卷接线：本地卷注册进 `VolumeRegistry`，UI 靠 `current_volume_id`
-        // 选中卷；远程/WSL/归档卷后续注册进同一个 registry 就能被 UI 选中。
+        // M8 卷接线：启动时用 fmnr_mount 的默认计划挂载（本地 home 起步，
+        // 归档/WSL/SSH 由顶栏「挂载」入口随时补挂），与 CLI 共用同一套逻辑。
         let home = dirs_home();
         let registry = VolumeRegistry::new();
-        // 用 add 回传的真实 id，而不是硬编码 local:. —— LocalVolume::new(home)
-        // 自生的 id 是 local:<home 绝对路径>，写死 local:. 会永远查不到，
+        let specs = fmnr_mount::default_plan(&home, None);
+        let mount_table = fmnr_mount::mount_plan(&registry, &specs);
+        // 当前卷取挂载成功的第一个 id —— 不硬编码：LocalVolume::new(home)
+        // 自生的 id 是 local:<home 绝对路径>，写死会永远查不到、
         // 让 current_volume() 每次都走 fallback，等于卷接线没生效。
-        let current_volume_id = Some(registry.add(Arc::new(LocalVolume::new(home.clone()))));
+        let current_volume_id = mount_table
+            .entries()
+            .iter()
+            .find_map(|e| e.volume_id.clone());
         let mut app = Self {
             volume_registry: registry,
             current_volume_id,
+            mount_table,
+            mount_dialog: None,
             left_path: home.clone(),
             right_path: home,
             left_entries: Vec::new(),
             right_entries: Vec::new(),
             left_selected: None,
             right_selected: None,
+            left_error: None,
+            right_error: None,
+            text_focus: false,
+            name_focus: false,
+            name_error: None,
+            cjk_font_ok,
             active_pane: Pane::Left,
             show_hidden: false,
             sort: SortOrder::Name,
@@ -149,9 +264,13 @@ impl App {
             renaming: None,
             new_dir_name: None,
             search: None,
+            search_open: false,
+            search_focus: false,
+            search_root: PathBuf::new(),
             search_text: String::new(),
             plugins: fmnr_plugins::registry::PluginSet::new(),
             plugin_warnings: Vec::new(),
+            tree: crate::tree::Tree::default(),
             board: fmnr_core::board::Board::new("default"),
             view: ViewMode::Panes,
             board_cam: crate::board_view::Camera::default(),
@@ -169,6 +288,7 @@ impl App {
             app.board = b;
         }
         app.refresh();
+        app.reset_tree_roots();
         app
     }
 
@@ -180,19 +300,155 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        // 一个 runtime 列两栏：`Runtime::new()` 每次会起工作线程，
+        // 按栏各建一个等于每次刷新白扔一个线程。
         let rt = tokio::runtime::Runtime::new().unwrap();
         let opts = self.opts();
-        // 空仓不 panic：UI 启动即注册本地卷，正常路径下 `current_volume()`
-        // 必定有值；但注册表被清空时不该让整个界面崩掉，留两栏空列表即可。
         let Some(volume) = self.current_volume() else {
             self.left_entries = Vec::new();
             self.right_entries = Vec::new();
+            self.left_error = Some("没有已挂载的卷".to_string());
+            self.right_error = self.left_error.clone();
             return;
         };
-        let l = rt.block_on(volume.list(&VPath(self.left_path.clone()), &opts));
-        let r = rt.block_on(volume.list(&VPath(self.right_path.clone()), &opts));
-        self.left_entries = l.unwrap_or_default();
-        self.right_entries = r.unwrap_or_default();
+        let (entries, error) = Self::list_dir(&rt, &volume, &self.left_path, &opts);
+        self.left_entries = entries;
+        self.left_error = error;
+        let (entries, error) = Self::list_dir(&rt, &volume, &self.right_path, &opts);
+        self.right_entries = entries;
+        self.right_error = error;
+
+        // 走到这里的都是"目录内容变了"（删除/改名/新建/粘贴完成），
+        // 树里那两层的缓存就过期了。只作废两栏路径之下：
+        // 全清会让每次刷新都重列一遍用户点开的分支。
+        let (l, r) = (self.left_path.clone(), self.right_path.clone());
+        self.tree.invalidate_below(&l);
+        self.tree.invalidate_below(&r);
+    }
+
+    /// 只刷一栏。导航/面包屑跳转用这个——全刷会把对栏也重列一遍，
+    /// 而列归档卷或远程卷是慢操作，对栏没变不该跟着抖。
+    fn refresh_pane(&mut self, which: Pane) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let opts = self.opts();
+        let Some(volume) = self.current_volume() else {
+            self.set_entries(which, Vec::new(), Some("没有已挂载的卷".to_string()));
+            return;
+        };
+        let path = self.path_of(which).clone();
+        let (entries, error) = Self::list_dir(&rt, &volume, &path, &opts);
+        self.set_entries(which, entries, error);
+    }
+
+    /// 列一个目录，把失败原因原样带出来而不是吞掉。
+    ///
+    /// 空目录和"读不了"必须能区分：前者显示"这里没有文件"，
+    /// 后者显示路径 + 错误，用户才知道要挂卷还是改权限。
+    fn list_dir(
+        rt: &tokio::runtime::Runtime,
+        volume: &Arc<dyn Volume>,
+        path: &Path,
+        opts: &ListOpts,
+    ) -> (Vec<fmnr_core::Entry>, Option<String>) {
+        match rt.block_on(volume.list(&VPath(path.to_path_buf()), opts)) {
+            Ok(entries) => (entries, None),
+            Err(e) => (Vec::new(), Some(e.to_string())),
+        }
+    }
+
+    fn set_entries(&mut self, which: Pane, entries: Vec<fmnr_core::Entry>, error: Option<String>) {
+        match which {
+            Pane::Left => {
+                self.left_entries = entries;
+                self.left_error = error;
+            }
+            Pane::Right => {
+                self.right_entries = entries;
+                self.right_error = error;
+            }
+        }
+    }
+
+    /// 让某一栏进入新目录：换路径、清掉该栏的过滤与选中，再重新取条目。
+    ///
+    /// 必须清过滤：路径变了但过滤词还在，新目录的条目会被旧词筛掉，
+    /// 界面显示成一个近乎空的列表，看起来像"目录被清空了"。
+    fn navigate(&mut self, which: Pane, path: PathBuf) {
+        self.status = format!(
+            "{} → {}",
+            match which {
+                Pane::Left => "左栏",
+                Pane::Right => "右栏",
+            },
+            path.display()
+        );
+        match which {
+            Pane::Left => {
+                self.left_path = path;
+                self.left_filter.clear();
+                self.left_selected = None;
+            }
+            Pane::Right => {
+                self.right_path = path;
+                self.right_filter.clear();
+                self.right_selected = None;
+            }
+        }
+        self.refresh_pane(which);
+    }
+
+    /// 卷的起点路径。与 `switch_volume` 里那套一致：
+    /// 本地/WSL 卷从 home 起步，归档等虚拟卷没有 home，从卷根（空路径）开始。
+    fn volume_root(&self) -> PathBuf {
+        match self.current_volume().map(|v| v.kind()) {
+            Some(fmnr_core::VolumeKind::Local) => dirs_home(),
+            _ => PathBuf::new(),
+        }
+    }
+
+    /// 重建树的根为"当前卷"。
+    ///
+    /// 只放一个根：跨卷混排会让"点这个目录该用哪个卷去列"变成需要额外规则的问题，
+    /// 而切卷本来就有顶栏下拉。特殊文件夹按拍定的方案挂成这个根下的子节点。
+    fn reset_tree_roots(&mut self) {
+        let volume = match self.current_volume() {
+            Some(v) => v,
+            None => {
+                self.tree.set_roots(Vec::new());
+                return;
+            }
+        };
+        let root = self.volume_root();
+        // 根节点的名字取**这个起点目录自己**的名字，不取卷 id 的短名。
+        // `short_volume_name` 是按"盘符开头"设计的（把 `local:C:\<home>` 收成 `local:C:`），
+        // 起点不是盘根时它会截出误导性标签：实测把 `E:\tmp\fmnr-ui-check`
+        // 显示成 `local:E:\`，而它列出来的确实是 fmnr-ui-check 的子目录。
+        // 只有起点真的是盘根（或归档卷的空路径）时才回落到卷名。
+        let name = match root.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => short_volume_name(&volume.id().0),
+        };
+        self.tree
+            .set_roots(vec![crate::tree::TreeDir { name, path: root }]);
+        // 根下第一层默认展开：否则侧栏开局只有一个孤零零的卷名，看着像坏了。
+        if let Some(first) = self.tree.roots().first() {
+            let path = first.path.clone();
+            self.tree.toggle(&path);
+        }
+    }
+
+    fn path_of(&self, which: Pane) -> &PathBuf {
+        match which {
+            Pane::Left => &self.left_path,
+            Pane::Right => &self.right_path,
+        }
+    }
+
+    fn selection_of(&self, which: Pane) -> Option<String> {
+        match which {
+            Pane::Left => self.left_selected.clone(),
+            Pane::Right => self.right_selected.clone(),
+        }
     }
 
     /// 当前选中的卷（Registry 查表）。
@@ -232,6 +488,7 @@ impl App {
         self.left_selected = None;
         self.right_selected = None;
         self.preview = None;
+        self.reset_tree_roots();
         self.status = format!(
             "已切换到卷 {}",
             short_volume_name(&self.current_volume_id.as_ref().unwrap().0)
@@ -283,18 +540,52 @@ impl App {
         }
     }
 
-    fn enter(&mut self, path: PathBuf) {
-        if path.is_dir() {
-            match self.active_pane {
-                Pane::Left => self.left_path = path,
-                Pane::Right => self.right_path = path,
-            }
-            self.left_filter.clear();
-            self.right_filter.clear();
-            self.refresh();
+    /// 打开一个条目：目录在当前栏进入，文件走外部程序（内部会先试预览）。
+    ///
+    /// `is_dir` 由调用方从**卷报的条目**里取，不在这里问文件系统：
+    /// 归档卷里的 `/doc/readme.txt` 在本地不存在，`path.is_dir()` 恒为 false，
+    /// 那样 zip 里的文件夹会变成"用外部程序打开一个不存在的文件"。
+    fn enter(&mut self, path: PathBuf, is_dir: bool) {
+        if is_dir {
+            self.navigate(self.active_pane, path);
+            self.view = ViewMode::Panes;
         } else {
-            // 非目录：交给外部程序，并在 UI 挂状态角标
             self.spawn_external(&path);
+        }
+    }
+
+    /// 从搜索结果回到文件：活动栏进它的目录、对栏进它的父目录、选中它。
+    ///
+    /// 原来搜到结果双击只把**活动栏**导航过去，选中态留在上一个目录里，
+    /// 用户看到的还是旧目录高亮着旧文件——搜索结果等于没落到地面上。
+    fn reveal_in_panes(&mut self, path: &Path) {
+        let Some(dir) = path.parent() else {
+            return;
+        };
+        let other = match self.active_pane {
+            Pane::Left => Pane::Right,
+            Pane::Right => Pane::Left,
+        };
+        // 对栏停在这个文件的父目录：一屏就能同时看到"它在哪"和"它旁边有什么"。
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.navigate(other, dir.to_path_buf());
+        self.set_selection_for(other, &name);
+    }
+
+    /// 按名字设某一栏的选中态。名字不在该栏列表里就不选——
+    /// 选中一个看不见的条目等于给用户一个点了删除会动别的东西的假象。
+    fn set_selection_for(&mut self, which: Pane, name: &str) {
+        let entries = match which {
+            Pane::Left => &self.left_entries,
+            Pane::Right => &self.right_entries,
+        };
+        let hit = entries.iter().any(|e| e.name == name);
+        match which {
+            Pane::Left => self.left_selected = hit.then(|| name.to_string()),
+            Pane::Right => self.right_selected = hit.then(|| name.to_string()),
         }
     }
 
@@ -309,18 +600,22 @@ impl App {
         };
         let program_for_status = program.clone();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let volume = self.current_volume().as_ref().unwrap().clone();
+        let Some(volume) = self.current_volume() else {
+            self.status = "打开失败：没有已挂载的卷".into();
+            return;
+        };
+        let volume = volume.clone();
         let vpath = VPath(path.to_path_buf());
-        let result = rt.block_on(async move { volume.spawn_external_open(&vpath, &program).await });
+        let spawn_volume = volume.clone();
+        let result =
+            rt.block_on(async move { spawn_volume.spawn_external_open(&vpath, &program).await });
         match result {
             Ok(open) => {
-                // 登记进角标表：看门狗线程会在该进程退出时自动摘掉。
+                // 登记进**刚才那个卷**的角标表：看门狗线程会在该进程退出时自动摘掉。
+                // 这里再查一次 current_volume() 的话，中途切了卷就把角标挂到别的卷上，
+                // 而读角标的是原来那一栏，于是角标永远不亮（也不报错）。
                 let key = path.display().to_string();
-                self.current_volume()
-                    .as_ref()
-                    .unwrap()
-                    .external_opens()
-                    .insert(key, open);
+                volume.external_opens().insert(key, open);
                 self.status = format!(
                     "已在 {} 中打开，关闭该程序后角标自动消失",
                     program_for_status
@@ -335,12 +630,7 @@ impl App {
 
     fn go_up(&mut self) {
         if let Some(parent) = self.active_path().parent() {
-            let p = parent.to_path_buf();
-            match self.active_pane {
-                Pane::Left => self.left_path = p,
-                Pane::Right => self.right_path = p,
-            }
-            self.refresh();
+            self.navigate(self.active_pane, parent.to_path_buf());
         }
     }
 
@@ -348,7 +638,14 @@ impl App {
     fn open_preview(&mut self, path: &Path) {
         let cap = crate::preview::cap_for(path);
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let volume = self.current_volume().as_ref().unwrap().clone();
+        // 这里原来直接 unwrap()：卷表被清空（挂载失败/全被卸载）时
+        // 双击任何文件都是 panic，而 UI 崩掉比报一句"没有卷"糟得多。
+        let Some(volume) = self.current_volume() else {
+            self.preview = None;
+            self.status = "预览失败：没有已挂载的卷".into();
+            return;
+        };
+        let volume = volume.clone();
         let vpath = VPath(path.to_path_buf());
         let bytes = rt.block_on(async move {
             let mut stream = volume.read_stream(&vpath).await?;
@@ -395,14 +692,11 @@ impl App {
     // ---- M2 文件操作 ----
 
     /// 当前栏选中的条目名（可能多选，预留）。
+    ///
+    /// 名字直接来自选中态本身，不再拿下标去 `*_entries` 里捞——
+    /// 列表会被过滤词筛短，下标一旦按筛后的行列出、按全量取，就指向别的文件。
     fn selected_names(&self) -> Vec<String> {
-        let (entries, sel) = match self.active_pane {
-            Pane::Left => (&self.left_entries, self.left_selected),
-            Pane::Right => (&self.right_entries, self.right_selected),
-        };
-        sel.and_then(|i| entries.get(i))
-            .map(|e| vec![e.name.clone()])
-            .unwrap_or_default()
+        self.selection_of(self.active_pane).into_iter().collect()
     }
 
     fn selected_paths(&self) -> Vec<PathBuf> {
@@ -443,18 +737,12 @@ impl App {
             .map(|p| VPath(p.clone()))
             .collect();
 
-        // 目标 = 非活动栏的当前目录；单栏时就是活动栏自己。
-        let dest_pane = match self.active_pane {
-            Pane::Left => Pane::Right,
-            Pane::Right => Pane::Left,
-        };
-        let dest = match dest_pane {
-            Pane::Left => self.left_path.clone(),
-            Pane::Right => self.right_path.clone(),
-        };
-        // 同栏粘贴到自身目录等于原地复制，无意义 —— 直接拒绝。
-        if dest == *self.active_path() {
-            self.status = "源与目标同目录，无需粘贴".into();
+        // 目标 = 对栏当前目录：双栏管理器的常规走法，"把左边的挪到右边"少一步。
+        let dest = self.other_pane_path();
+        // 两栏显示同一个目录时（单栏用法、或刚跳进同一层），对栏就是自己。
+        // 这时复制应当就地生成副本，剪切则是原地不动 —— 那种要挡掉。
+        if dest == *self.active_path() && self.clipboard.mode == Some(crate::ops::ClipMode::Cut) {
+            self.status = "剪切的目标就是源所在目录，无需粘贴".into();
             return;
         }
 
@@ -472,9 +760,14 @@ impl App {
         self.start_op(
             kind,
             sources,
-            Some(VPath(dest)),
+            Some(VPath(dest.clone())),
             fmnr_core::ConflictPolicy::Skip,
         );
+        // 说清贴到哪了：状态栏原本只写"复制…"，粘完之后用户不知道文件去了哪。
+        if self.running.is_some() {
+            let verb = if cut { "移动到" } else { "复制到" };
+            self.status = format!("{verb} {}", dest.display());
+        }
     }
 
     /// 列出「源名在目标目录已存在」的条目名。
@@ -509,7 +802,11 @@ impl App {
             dest_dir,
             policy,
         };
-        match crate::ops::spawn_op(self.current_volume().as_ref().unwrap().clone(), req) {
+        let Some(volume) = self.current_volume() else {
+            self.status = "无法启动操作：没有已挂载的卷".into();
+            return;
+        };
+        match crate::ops::spawn_op(volume.clone(), req) {
             Ok(running) => {
                 self.status = running.label.clone();
                 self.running = Some(running);
@@ -580,6 +877,8 @@ impl App {
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or(old);
+        self.name_error = None;
+        self.name_focus = true;
         self.renaming = Some(stem);
     }
 
@@ -587,30 +886,55 @@ impl App {
         let Some(input) = self.renaming.take() else {
             return;
         };
-        let name = input.trim();
         let Some(old) = self.selected_names().first().cloned() else {
             return;
         };
+        let name = input.trim();
         if name.is_empty() {
+            // 名字为空：留着弹窗、把输入还给用户，而不是悄悄丢掉整个重命名。
+            self.name_error = Some("名称不能为空".into());
+            self.renaming = Some(input);
+            self.name_focus = true;
             return;
         }
+        // 框里只有 stem：用户没写扩展名就把原来的补回去，写了就按写的走。
+        let new_name = rename_target(&old, name);
         let base = self.active_path().clone();
         let from = VPath(base.join(&old));
-        let to = VPath(base.join(name));
+        let to = VPath(base.join(&new_name));
         if from == to {
+            self.renaming = None;
+            self.name_error = None;
             return;
         }
         let rt = tokio::runtime::Runtime::new().unwrap();
-        match rt.block_on(self.current_volume().as_ref().unwrap().rename(&from, &to)) {
+        let result = match self.current_volume() {
+            Some(volume) => rt.block_on(volume.rename(&from, &to)),
+            None => Err(fmnr_core::Error::Other("没有已挂载的卷".to_string())),
+        };
+        match result {
             Ok(()) => {
-                self.status = format!("已重命名为 {name}");
+                self.status = format!("已重命名为 {new_name}");
+                self.renaming = None;
+                self.name_error = None;
+                // 选中跟着新名字走，而且要落在**活动栏**：写死左栏的话
+                // 在右栏重命名完，高亮跑到左栏一个叫 new_name 的条目上（或没有）。
+                let pane = self.active_pane;
                 self.refresh();
+                self.set_selection_for(pane, &new_name);
             }
-            Err(e) => self.status = format!("重命名失败：{e}"),
+            Err(e) => {
+                // 失败时不关窗：用户已经打好的字不该被吞掉。
+                self.name_error = Some(format!("重命名失败：{e}"));
+                self.renaming = Some(input);
+                self.name_focus = true;
+            }
         }
     }
 
     fn begin_new_dir(&mut self) {
+        self.name_error = None;
+        self.name_focus = true;
         self.new_dir_name = Some("新建文件夹".into());
     }
 
@@ -620,20 +944,76 @@ impl App {
         };
         let name = input.trim();
         if name.is_empty() {
+            self.name_error = Some("目录名不能为空".into());
+            self.new_dir_name = Some(input);
+            self.name_focus = true;
             return;
         }
-        let target = VPath(self.active_path().join(name));
+        let base = self.active_path().clone();
+        if base.join(name).exists() {
+            self.name_error = Some(format!("{name} 已经存在，换个名字"));
+            self.new_dir_name = Some(input);
+            self.name_focus = true;
+            return;
+        }
+        let target = VPath(base.join(name));
         let rt = tokio::runtime::Runtime::new().unwrap();
-        match rt.block_on(self.current_volume().as_ref().unwrap().create_dir(&target)) {
+        let result = match self.current_volume() {
+            Some(volume) => rt.block_on(volume.create_dir(&target)),
+            None => Err(fmnr_core::Error::Other("没有已挂载的卷".to_string())),
+        };
+        match result {
             Ok(()) => {
                 self.status = format!("已新建 {name}");
+                self.new_dir_name = None;
+                self.name_error = None;
                 self.refresh();
             }
-            Err(e) => self.status = format!("新建失败：{e}"),
+            Err(e) => {
+                self.name_error = Some(format!("新建失败：{e}"));
+                self.new_dir_name = Some(input);
+                self.name_focus = true;
+            }
         }
     }
 
     // ---- M2 即时搜索 ----
+
+    /// 展开搜索面板：锁定本次搜索的根、把焦点交给输入框。
+    ///
+    /// 面板状态（`search_open`）和在途任务（`search`）是两个东西——
+    /// 原来工具栏按钮直接调 `start_search()`，而空搜索词会让它把
+    /// `search` 置回 None，于是**点按钮什么也不会发生**：面板根本没开过。
+    fn open_search(&mut self) {
+        let kind = self.current_volume().map(|v| v.kind());
+        if !local_walkable(kind) {
+            // 不是"搜不到"，是"还没接上"——两句话必须分开说。
+            self.status =
+                "这个卷还搜不了：子树搜索目前只走本地文件系统（归档/远程卷未接进 Volume）"
+                    .to_string();
+            return;
+        }
+        if self.search_open {
+            self.search_focus = true;
+            return;
+        }
+        self.search_open = true;
+        self.search_focus = true;
+        self.search_root = self.active_path().clone();
+        let scope = if self.search_root.as_os_str().is_empty() {
+            "卷根".to_string()
+        } else {
+            self.search_root.display().to_string()
+        };
+        self.status = format!("在 {scope} 中搜索");
+    }
+
+    fn close_search(&mut self) {
+        self.search_open = false;
+        self.search_focus = false;
+        self.search = None;
+        self.search_text.clear();
+    }
 
     fn start_search(&mut self) {
         let text = self.search_text.trim().to_string();
@@ -643,20 +1023,26 @@ impl App {
         }
         self.search = Some(crate::search::spawn_search(crate::search::Query {
             text,
-            root: self.active_path().clone(),
+            root: self.search_root.clone(),
             case_sensitive: false,
         }));
     }
 
-    fn stop_search(&mut self) {
-        self.search = None;
-        self.search_text.clear();
-    }
-
-    /// 每帧拉一次搜索增量。
-    fn poll_search(&mut self) {
-        if let Some(s) = self.search.as_mut() {
-            s.drain();
+    /// 每帧拉一次搜索增量；有新结果就催重绘。
+    ///
+    /// egui 只在有输入事件时重绘。后台线程是按批次推结果的，
+    /// 用户不动鼠标时结果到了界面也不更新——看起来就是"搜索卡住了"。
+    fn poll_search(&mut self, ctx: &egui::Context) {
+        let repaint = match self.search.as_mut() {
+            Some(s) => {
+                let was_done = s.done;
+                let got_batch = s.drain();
+                got_batch || (s.done && !was_done)
+            }
+            None => false,
+        };
+        if repaint {
+            ctx.request_repaint();
         }
     }
 }
@@ -666,16 +1052,78 @@ impl eframe::App for App {
         self.handle_keys(ctx);
         self.handle_dropped_files(ctx);
         self.poll_running();
-        self.poll_search();
+        self.poll_search(ctx);
 
+        // 工具栏分两行。原来 12 个控件挤在一行：窄窗口下"排序"下拉直接被裁掉，
+        // 而且看不出哪些是"我在哪"、哪些是"对选中的东西动手"。
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("fmnr");
+                ui.label(egui::RichText::new("fmnr").strong());
                 ui.separator();
                 if ui.button("⬅ 上级").clicked() {
                     self.go_up();
                 }
+                if ui.button("⟳ 刷新").clicked() {
+                    self.refresh();
+                }
+                if ui.button("🔎 搜索").clicked() {
+                    self.open_search();
+                }
                 ui.separator();
+                // M8 卷接线：卷列表来自 VolumeRegistry，不是写死的本地盘。
+                // 注册进 registry 的卷（归档/WSL/SSH）会自动出现在这里。
+                let volumes = self.volume_registry.list();
+                if !volumes.is_empty() {
+                    let current = self
+                        .current_volume_id
+                        .as_ref()
+                        .map(|id| id.0.clone())
+                        .unwrap_or_default();
+                    let mut picked: Option<VolumeId> = None;
+                    egui::ComboBox::from_id_salt("volume")
+                        .selected_text(short_volume_name(&current))
+                        .show_ui(ui, |ui| {
+                            for v in &volumes {
+                                let label = format!(
+                                    "{}{}",
+                                    short_volume_name(&v.id.0),
+                                    if v.writable { "" } else { "（只读）" }
+                                );
+                                if ui.selectable_label(v.id.0 == current, label).clicked() {
+                                    picked = Some(v.id.clone());
+                                }
+                            }
+                        });
+                    if let Some(id) = picked {
+                        self.switch_volume(id);
+                    }
+                }
+                // M8 挂载入口：归档/WSL/SSH 卷在这里注册进同一个 registry。
+                if ui.button("📦 挂载").clicked() {
+                    self.mount_dialog = Some(MountDialog::new());
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // 只在白板视图里有意义：平移走远后靠它找回自己的东西。
+                    if self.view == ViewMode::Board && ui.button("🔍 适应全部").clicked() {
+                        self.fit_board();
+                    }
+                    if ui
+                        .selectable_label(self.view == ViewMode::Board, "🗺 白板")
+                        .clicked()
+                    {
+                        self.view = ViewMode::Board;
+                    }
+                    if ui
+                        .selectable_label(self.view == ViewMode::Panes, "▥ 双栏")
+                        .clicked()
+                    {
+                        self.view = ViewMode::Panes;
+                    }
+                });
+            });
+
+            ui.horizontal(|ui| {
                 if ui.button("📋 复制").clicked() {
                     self.put_clipboard(crate::ops::ClipMode::Copy);
                 }
@@ -694,65 +1142,32 @@ impl eframe::App for App {
                 if ui.button("＋ 新建目录").clicked() {
                     self.begin_new_dir();
                 }
-                ui.separator();
-                if ui.button("🔎 搜索").clicked() {
-                    self.start_search();
-                }
-                // 视图切换：双栏 ↔ 白板
-                if ui
-                    .selectable_label(self.view == ViewMode::Board, "🗺 白板")
-                    .clicked()
-                {
-                    self.view = if self.view == ViewMode::Board {
-                        ViewMode::Panes
-                    } else {
-                        ViewMode::Board
-                    };
-                }
                 if ui.button("📌 钉到白板").clicked() {
                     self.pin_selected_to_board();
                 }
-                // 只在白板视图里有意义：平移到看不见东西后靠它找回来。
-                if self.view == ViewMode::Board && ui.button("🔍 适应全部").clicked() {
-                    self.fit_board();
+                ui.separator();
+                // 这两个改变的是列表内容本身，不重列的话要等下次导航才见效——
+                // 用户勾完看到列表纹丝不动，只会以为勾选框没接上。
+                if ui.checkbox(&mut self.show_hidden, "隐藏项").changed() {
+                    self.refresh();
                 }
-                ui.checkbox(&mut self.show_hidden, "隐藏项");
-                // M8 卷接线：卷列表来自 VolumeRegistry，不是写死的本地盘。
-                // 注册进 registry 的卷（归档/WSL/SSH）会自动出现在这里。
-                let volumes = self.volume_registry.list();
-                if !volumes.is_empty() {
-                    let current = self
-                        .current_volume_id
-                        .as_ref()
-                        .map(|id| id.0.clone())
-                        .unwrap_or_default();
-                    let mut picked: Option<VolumeId> = None;
-                    egui::ComboBox::from_label("卷")
-                        .selected_text(short_volume_name(&current))
-                        .show_ui(ui, |ui| {
-                            for v in &volumes {
-                                let label = format!(
-                                    "{}{}",
-                                    short_volume_name(&v.id.0),
-                                    if v.writable { "" } else { "（只读）" }
-                                );
-                                if ui.selectable_label(v.id.0 == current, label).clicked() {
-                                    picked = Some(v.id.clone());
-                                }
-                            }
-                        });
-                    if let Some(id) = picked {
-                        self.switch_volume(id);
-                    }
-                }
-                egui::ComboBox::from_label("排序")
-                    .selected_text(format!("{:?}", self.sort))
+                let mut sort_changed = false;
+                egui::ComboBox::new("sort", "排序")
+                    .selected_text(sort_label(self.sort))
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.sort, SortOrder::Name, "名称");
-                        ui.selectable_value(&mut self.sort, SortOrder::Size, "大小");
-                        ui.selectable_value(&mut self.sort, SortOrder::Modified, "修改时间");
-                        ui.selectable_value(&mut self.sort, SortOrder::Type, "类型");
+                        for (order, name) in [
+                            (SortOrder::Name, "名称"),
+                            (SortOrder::Size, "大小"),
+                            (SortOrder::Modified, "修改时间"),
+                            (SortOrder::Type, "类型"),
+                        ] {
+                            sort_changed |=
+                                ui.selectable_value(&mut self.sort, order, name).changed();
+                        }
                     });
+                if sort_changed {
+                    self.refresh();
+                }
             });
         });
 
@@ -775,6 +1190,18 @@ impl eframe::App for App {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(self.clipboard.summary());
+                    // 没装到 CJK 字体时整屏中文都是豆腐块，而用户分不清
+                    // "程序坏了"和"这台机没字体"——这条必须一直挂在状态栏上。
+                    if !self.cjk_font_ok {
+                        ui.label(
+                            egui::RichText::new("⚠ 缺中文字体")
+                                .color(Color32::from_rgb(185, 38, 48)),
+                        )
+                        .on_hover_text(
+                            "没找到任何 CJK 字体，界面中文显示成 □□。\
+                             候选路径与安装办法见 fmnr-ui/src/fonts.rs",
+                        );
+                    }
                     // 插件状态要**可见**：坏插件静默失败的话，用户看到的现象是
                     // 「插件装上了但不生效」，没有线索可查。
                     if !self.plugin_warnings.is_empty() {
@@ -799,8 +1226,14 @@ impl eframe::App for App {
             });
         });
 
-        // 搜索框：激活时取代中央区
-        if self.search.is_some() {
+        // 目录树侧栏：只在双栏且搜索面板没展开时占位。
+        // SidePanel 必须在 CentralPanel 之前声明，否则拿不到剩余宽度。
+        if self.view == ViewMode::Panes && !self.search_open {
+            self.render_tree(ctx);
+        }
+
+        // 搜索面板展开时接管中央区（双栏暂时让位，回来时列表状态不变）。
+        if self.search_open {
             self.render_search_panel(ctx);
         } else if self.view == ViewMode::Board {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -836,10 +1269,9 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     self.render_preview(ui, ctx);
                 });
-            if !open {
-                self.preview = None;
-            }
-            if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            // `open` 每帧都是新写的 true，所以必须在这里读它：
+            // 点标题栏的 ✕ 只会把这个局部变量置 false，不读就等于关不掉窗口。
+            if !open || ctx.input(|i| i.key_pressed(Key::Escape)) {
                 self.preview = None;
             }
         }
@@ -914,6 +1346,9 @@ impl App {
         if let Some(mut text) = self.renaming.take() {
             let mut submit = false;
             let mut cancel = false;
+            let error = self.name_error.clone();
+            let want_focus = self.name_focus;
+            self.name_focus = false;
             egui::Window::new("重命名")
                 .id(egui::Id::new("rename"))
                 .collapsible(false)
@@ -925,8 +1360,22 @@ impl App {
                             .desired_width(260.0)
                             .hint_text("新名称"),
                     );
+                    // 打开即抢焦点：不抢的话回车条件永不成立，只能拿鼠标点确定。
+                    if want_focus {
+                        resp.request_focus();
+                    }
+                    if resp.has_focus() {
+                        self.text_focus = true;
+                    }
+                    // 回车提交。原来判的是 `resp.lost_focus() && Enter`，
+                    // 而这个输入框打开时根本没拿到焦点 ⇒ 条件永不成立，
+                    // 只能靠鼠标点「确定」。
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         submit = true;
+                    }
+                    if let Some(err) = error {
+                        let c = ui.visuals().error_fg_color;
+                        ui.colored_label(c, err);
                     }
                     ui.horizontal(|ui| {
                         if ui.button("确定").clicked() {
@@ -942,6 +1391,7 @@ impl App {
                 self.commit_rename();
             } else if cancel {
                 self.renaming = None;
+                self.name_error = None;
             } else {
                 self.renaming = Some(text);
             }
@@ -950,6 +1400,9 @@ impl App {
         if let Some(mut text) = self.new_dir_name.take() {
             let mut submit = false;
             let mut cancel = false;
+            let error = self.name_error.clone();
+            let want_focus = self.name_focus;
+            self.name_focus = false;
             egui::Window::new("新建目录")
                 .id(egui::Id::new("newdir"))
                 .collapsible(false)
@@ -961,8 +1414,18 @@ impl App {
                             .desired_width(260.0)
                             .hint_text("目录名"),
                     );
+                    if want_focus {
+                        resp.request_focus();
+                    }
+                    if resp.has_focus() {
+                        self.text_focus = true;
+                    }
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         submit = true;
+                    }
+                    if let Some(err) = error {
+                        let c = ui.visuals().error_fg_color;
+                        ui.colored_label(c, err);
                     }
                     ui.horizontal(|ui| {
                         if ui.button("确定").clicked() {
@@ -978,86 +1441,294 @@ impl App {
                 self.commit_new_dir();
             } else if cancel {
                 self.new_dir_name = None;
+                self.name_error = None;
             } else {
                 self.new_dir_name = Some(text);
+            }
+        }
+
+        self.render_mount_dialog(ctx);
+    }
+
+    /// 挂载对话框：类型三选一 + 入参 + 结果反馈。
+    fn render_mount_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dlg) = self.mount_dialog.take() else {
+            return;
+        };
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Window::new("挂载卷")
+            .id(egui::Id::new("mount"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut dlg.kind, MountKind::Archive, "归档");
+                    ui.selectable_value(&mut dlg.kind, MountKind::Wsl, "WSL");
+                    ui.selectable_value(&mut dlg.kind, MountKind::Ssh, "SSH");
+                });
+                match dlg.kind {
+                    MountKind::Archive => {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut dlg.input)
+                                .desired_width(320.0)
+                                .hint_text(r"D:\path\to\a.zip"),
+                        );
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            submit = true;
+                        }
+                        ui.label("支持 zip / tar / tar.gz / tgz / tar.bz2；只读");
+                    }
+                    MountKind::Wsl => match &mut dlg.wsl_distros {
+                        Some(Ok(list)) if !list.is_empty() => {
+                            egui::ComboBox::from_label("发行版")
+                                .selected_text(
+                                    list.get(dlg.wsl_picked)
+                                        .cloned()
+                                        .unwrap_or_else(|| "（无）".into()),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (i, d) in list.iter().enumerate() {
+                                        ui.selectable_value(&mut dlg.wsl_picked, i, d);
+                                    }
+                                });
+                            ui.label("发现自 wsl -l -q；写入走 Windows UNC");
+                        }
+                        Some(Ok(_)) => {
+                            ui.label("wsl -l -q 返回空列表：没有任何发行版");
+                        }
+                        Some(Err(e)) => {
+                            ui.label(format!("发现失败：{e}；可手动输入 distro 名"));
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut dlg.input)
+                                    .desired_width(260.0)
+                                    .hint_text("distro 名，如 Ubuntu-24.04"),
+                            );
+                            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                submit = true;
+                            }
+                        }
+                        None => {
+                            ui.label("正在发现发行版…");
+                        }
+                    },
+                    MountKind::Ssh => {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut dlg.input)
+                                .desired_width(320.0)
+                                .hint_text("ssh://user@host[:port][/path]"),
+                        );
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            submit = true;
+                        }
+                        ui.label("认证走本机 ssh-agent；未知主机键会被拒绝");
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("挂载").clicked() {
+                        submit = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if submit {
+            self.commit_mount(dlg);
+        } else if cancel {
+            // 取消只丢对话框，不动已挂的卷。
+        } else {
+            self.mount_dialog = Some(dlg);
+        }
+    }
+
+    /// 执行挂载：成功注册并切过去；失败把原因写进状态栏 + 挂载记录。
+    ///
+    /// 走 `mount_all`（fmnr-mount 的受测路径），不在 UI 里另写一套挂载逻辑——
+    /// 两套逻辑迟早分叉，而失败处理这种地方分叉就是静默 bug。
+    fn commit_mount(&mut self, dlg: MountDialog) {
+        let Some(spec) = dlg.spec() else {
+            self.status = "挂载：输入为空".to_string();
+            return;
+        };
+        let display = spec.display();
+        let failures = self
+            .mount_table
+            .mount_all(&self.volume_registry, std::slice::from_ref(&spec));
+        let last_id = self
+            .mount_table
+            .entries()
+            .last()
+            .and_then(|r| r.volume_id.clone());
+        match last_id {
+            Some(id) if self.current_volume_id.as_ref() == Some(&id) => {
+                self.status = format!("卷 {display} 已在仓中");
+            }
+            Some(id) => {
+                self.status = format!("已挂载 {display}");
+                self.switch_volume(id);
+            }
+            None => {
+                // 失败原因已经由 mount_all 格式化好（带 spec 前缀）。
+                self.status = format!(
+                    "挂载失败：{}",
+                    failures.first().cloned().unwrap_or_default()
+                );
             }
         }
     }
 
     /// 搜索面板：输入框 + 增量结果。
+    ///
+    /// 命中行要自己造命中区：`ui.horizontal(..).response` 的 Sense 是 hover，
+    /// 挂在它上面的 `double_clicked()` 恒为 false——原来双击结果没反应就是这个原因。
     fn render_search_panel(&mut self, ctx: &egui::Context) {
+        let root = self.search_root.clone();
+        let want_focus = self.search_focus;
+        self.search_focus = false;
+
         egui::TopBottomPanel::top("searchbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("🔎");
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.search_text)
-                        .hint_text("在当前子树搜索…")
-                        .desired_width(300.0),
+                        .hint_text("在这个子树里搜索…")
+                        .desired_width(320.0),
                 );
+                if want_focus {
+                    resp.request_focus();
+                }
+                if resp.has_focus() {
+                    self.text_focus = true;
+                }
                 // 逐字符触发增量搜索：不等回车
                 if resp.changed() {
                     self.start_search();
                 }
                 if ui.button("关闭").clicked() {
-                    self.stop_search();
+                    self.close_search();
                 }
             });
+            ui.label(
+                egui::RichText::new(format!(
+                    "范围 {} · 单击定位 · 双击打开 · Esc 返回",
+                    root.display()
+                ))
+                .weak(),
+            );
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // 摘出渲染所需字段：双击要调 self.enter，闭包不能借用 self
-            let Some(hits) = self.search.as_ref().map(|s| s.hits.clone()) else {
+            let started = self
+                .search
+                .as_ref()
+                .map(|s| (s.hits.clone(), s.total, s.done, s.elapsed_ms));
+            let Some((hits, total, done, ms)) = started else {
+                ui.label(
+                    egui::RichText::new("输入即搜：不用回车，也不用等整棵树扫完才看到第一批结果。")
+                        .weak(),
+                );
                 return;
             };
-            let (n, total, done, ms) = match self.search.as_ref() {
-                Some(s) => (s.hits.len(), s.total, s.done, s.elapsed_ms),
-                None => return,
-            };
+
             ui.horizontal(|ui| {
                 if done {
                     ui.label(format!("{total} 个结果 · {ms} ms"));
                 } else {
-                    ui.label(format!("搜索中… 已找到 {n} 个"));
+                    ui.label(format!("搜索中… 已列出 {} 个", hits.len()));
                 }
             });
             ui.separator();
 
+            if done && hits.is_empty() {
+                // 归档/远程卷上"0 个结果"是**假**的：搜索线程走的是 jwalk，
+                // 只能走本地文件系统，包内条目它根本看不见。
+                // 报"没有匹配项"等于把"我搜不了"说成"这里没有"。
+                let searchable = matches!(
+                    self.current_volume().map(|v| v.kind()),
+                    None | Some(fmnr_core::VolumeKind::Local)
+                        | Some(fmnr_core::VolumeKind::Unc)
+                        | Some(fmnr_core::VolumeKind::Wsl)
+                );
+                let msg = if searchable {
+                    format!("「{}」在这个子树里没有匹配项", self.search_text.trim())
+                } else {
+                    format!(
+                        "「{}」：这个卷的子树搜索还没接上（搜索目前只走本地文件系统），                         所以这里说的是\"搜不了\"，不是\"没有\"",
+                        self.search_text.trim()
+                    )
+                };
+                ui.label(egui::RichText::new(msg).weak());
+                return;
+            }
+
             let mut jump: Option<(PathBuf, bool)> = None;
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for hit in &hits {
+            let mut locate: Option<PathBuf> = None;
+            let width = (ui.available_width() - 16.0).max(120.0);
+            egui::ScrollArea::vertical().show_rows(ui, 22.0, hits.len(), |ui, range| {
+                for i in range {
+                    let hit = &hits[i];
+                    let row_rect =
+                        egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, 22.0));
+                    let resp =
+                        ui.interact(row_rect, ui.id().with(("hit", i)), egui::Sense::click());
+                    if resp.hovered() {
+                        ui.painter()
+                            .rect_filled(row_rect, 6.0, ui.visuals().faint_bg_color);
+                    }
                     // 命中片段高亮：命中段用强调色，其余普通
                     let label = highlight_hit(hit, ui.style());
                     let icon = if hit.is_dir { "📁" } else { "📄" };
-                    let size = if hit.is_dir {
-                        egui::RichText::new("")
-                    } else {
-                        egui::RichText::new(format!("{} B", hit.size)).weak()
-                    };
-                    let resp = ui
-                        .horizontal(|ui| {
-                            ui.label(icon);
-                            ui.label(label);
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(size);
-                                },
-                            );
-                        })
-                        .response;
+                    ui.horizontal(|ui| {
+                        ui.label(icon);
+                        ui.add(egui::Label::new(label).selectable(false));
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(width - 40.0, 22.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let parent = hit
+                                    .path
+                                    .parent()
+                                    .map(|p| truncate_label(&p.display().to_string(), 46))
+                                    .unwrap_or_default();
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(parent).weak().size(12.0))
+                                        .selectable(false),
+                                );
+                                let size = if hit.is_dir {
+                                    String::new()
+                                } else {
+                                    fmt_size(hit.size)
+                                };
+                                ui.label(egui::RichText::new(size).weak().monospace());
+                            },
+                        );
+                    });
+                    let resp = resp.on_hover_text(hit.path.display().to_string());
                     if resp.double_clicked() {
                         jump = Some((hit.path.clone(), hit.is_dir));
-                        break;
+                    } else if resp.clicked() {
+                        // 单击也要有反应：只把这一条记下来，收掉面板后
+                        // 两栏就落在它的位置上。原来单击什么都不做，
+                        // 一整行看起来可点、实际是死的。
+                        locate = Some(hit.path.clone());
                     }
                 }
             });
             if let Some((path, is_dir)) = jump {
                 if is_dir {
-                    self.enter(path);
+                    self.enter(path, true);
                 } else {
+                    // 先把两栏落到那个文件上再打开。原来双击完两栏还停在
+                    // 搜索前的目录，用户看不出自己开的是哪里的文件。
+                    self.reveal_in_panes(&path);
                     self.spawn_external(&path);
                 }
-                self.stop_search();
+                self.close_search();
+            } else if let Some(path) = locate {
+                self.reveal_in_panes(&path);
+                self.close_search();
             }
         });
     }
@@ -1065,6 +1736,11 @@ impl App {
 
 impl App {
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        // 上一帧有文本框持焦 ⇒ 用户在打字，快捷键必须让行。
+        // 不拦的话在左栏过滤框里按退格，会一边删掉一个字符、
+        // 一边让**右栏**跳到上级目录：处理器根本不知道焦点在哪。
+        let typing = std::mem::take(&mut self.text_focus);
+
         // 弹窗打开时，键盘全归弹窗（否则 Backspace 会同时删输入和跳目录）
         if self.conflict.is_some() || self.renaming.is_some() || self.new_dir_name.is_some() {
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -1075,9 +1751,23 @@ impl App {
             return;
         }
 
-        // Ctrl+F 开搜索；搜索中任意按键喂给搜索框
-        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::F)) {
-            self.status = "输入搜索词（Esc 退出）".into();
+        // Ctrl+F 唤起搜索。排在文本框闸门之前：从过滤框里也能唤起搜索面板。
+        if ctx.input_mut(|i| {
+            i.consume_key(Modifiers::CTRL, Key::F)
+                || i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::F)
+        }) {
+            self.open_search();
+            return;
+        }
+
+        // 搜索面板开着时 Esc 收掉它（连同结果列表一起退出这个模式）。
+        if self.search_open && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.close_search();
+            return;
+        }
+
+        if typing {
+            return;
         }
 
         ctx.input(|i| {
@@ -1091,19 +1781,18 @@ impl App {
                 self.go_up();
             }
             if i.key_pressed(Key::Enter) {
-                let sel = match self.active_pane {
-                    Pane::Left => self.left_selected,
-                    Pane::Right => self.right_selected,
-                };
-                let entries = match self.active_pane {
-                    Pane::Left => &self.left_entries,
-                    Pane::Right => &self.right_entries,
-                };
-                if let Some(idx) = sel {
-                    if let Some(e) = entries.get(idx) {
-                        let base = self.active_path().clone();
-                        self.enter(base.join(&e.name));
+                // 目录/文件要问卷，不能问 `path.is_dir()`：归档卷里的
+                // `/doc/readme.txt` 在本地文件系统上不存在，is_dir() 一律 false，
+                // 于是 zip 里的文件夹回车会变成"用外部程序打开一个不存在的文件"。
+                if let Some(name) = self.selection_of(self.active_pane) {
+                    let is_dir = match self.active_pane {
+                        Pane::Left => &self.left_entries,
+                        Pane::Right => &self.right_entries,
                     }
+                    .iter()
+                    .any(|e| e.name == name && e.is_dir);
+                    let path = self.active_path().join(&name);
+                    self.enter(path, is_dir);
                 }
             }
         });
@@ -1124,6 +1813,9 @@ impl App {
 
         // 功能键
         ctx.input(|i| {
+            if i.key_pressed(Key::F3) {
+                self.open_search();
+            }
             if i.key_pressed(Key::F5) {
                 let dest = self.other_pane_path();
                 let paths = self.selected_paths();
@@ -1297,8 +1989,10 @@ impl App {
             }
             if resp.double_clicked() {
                 // 双击：交给既有的打开语义（预览或外置程序 + 角标）。
+                // 白板节点是本地路径（钉的时候从栏里取的），问文件系统是对的。
                 let p = node.path.clone();
-                self.enter(p);
+                let is_dir = p.is_dir();
+                self.enter(p, is_dir);
             }
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
@@ -1388,64 +2082,184 @@ impl App {
         }
     }
 
+    /// 画目录树侧栏，并把"可见但还没列"的目录补上数据。
+    ///
+    /// 列举放在渲染开头而不是点击回调里：一次 runtime 列完所有待列节点，
+    /// 且同一帧就能看到结果（点击时只改展开态，下一帧自然补数据）。
+    fn render_tree(&mut self, ctx: &egui::Context) {
+        let pending = self.tree.pending_loads();
+        if !pending.is_empty() {
+            if let Some(volume) = self.current_volume() {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let opts = self.opts();
+                for path in pending {
+                    let level = match rt.block_on(volume.list(&VPath(path.clone()), &opts)) {
+                        Ok(entries) => crate::tree::level_of(&path, &entries),
+                        Err(e) => crate::tree::Level {
+                            dirs: Vec::new(),
+                            error: Some(e.to_string()),
+                        },
+                    };
+                    self.tree.put_level(&path, level);
+                }
+            }
+        }
+
+        // 先把要画的取出来：闭包里不碰 self，点击结果留到闭包外再落到状态上。
+        let rows = self.tree.rows();
+        let selected = self.tree.selected().map(|p| p.to_path_buf());
+        let mut toggle_to: Option<PathBuf> = None;
+        let mut open_to: Option<PathBuf> = None;
+
+        egui::SidePanel::left("tree")
+            .default_width(220.0)
+            .width_range(150.0..=460.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for row in rows {
+                            let path = row.dir.path.clone();
+                            let err = row.error.clone();
+                            let indent = 12.0 * row.depth as f32;
+                            ui.horizontal(|ui| {
+                                ui.add_space(indent);
+                                // 三角只管展开收起，点名字只管"去那儿"：
+                                // 两件事挤在一次点击上，收起时就会顺手跳过去。
+                                let mark = if row.expanded { "▾" } else { "▸" };
+                                if ui
+                                    .add(
+                                        egui::Label::new(
+                                            egui::RichText::new(mark).weak().size(11.0),
+                                        )
+                                        .selectable(false)
+                                        .sense(egui::Sense::click()),
+                                    )
+                                    .clicked()
+                                {
+                                    toggle_to = Some(path.clone());
+                                }
+                                let mut label = egui::RichText::new(&row.dir.name);
+                                if err.is_some() {
+                                    label = label.color(Color32::from_rgb(185, 38, 48));
+                                }
+                                let resp = ui.add(egui::SelectableLabel::new(
+                                    selected.as_deref() == Some(path.as_path()),
+                                    label,
+                                ));
+                                resp.clone().on_hover_text(path.display().to_string());
+                                match &err {
+                                    // 读不了的目录必须标出来：静默显示成空，
+                                    // 用户会以为这个目录真的没东西。
+                                    Some(e) => {
+                                        resp.clone().on_hover_text(format!("读不了这一层：{e}"));
+                                    }
+                                    None => {
+                                        if row.known_leaf {
+                                            resp.clone().on_hover_text("这个目录下没有子目录");
+                                        }
+                                    }
+                                }
+                                if resp.clicked() {
+                                    open_to = Some(path);
+                                }
+                            });
+                        }
+                    });
+            });
+
+        if let Some(path) = toggle_to {
+            self.tree.toggle(&path);
+            // 展开态变了要再走一帧才会补数据。
+            ctx.request_repaint();
+        }
+        if let Some(path) = open_to {
+            self.tree.select(Some(path.clone()));
+            self.navigate(self.active_pane, path);
+        }
+    }
+
+    /// 一栏：栏头 → 面包屑 → 过滤 → 行列表。
+    ///
+    /// 整行可点。原来只有文件名那几个像素是 `selectable_label` 的命中区，
+    /// 点图标或行尾空白没有反应，可那一行看上去明明是一整条。
     fn pane(&mut self, ui: &mut egui::Ui, which: Pane, width: f32) {
-        let path = match which {
-            Pane::Left => self.left_path.clone(),
-            Pane::Right => self.right_path.clone(),
-        };
-        let is_active = self.active_pane == which;
-        let _ = is_active;
+        let path = self.path_of(which).clone();
 
         ui.push_id(which, |ui| {
             ui.vertical(|ui| {
                 ui.set_width(width);
-                // 面包屑 + 行内过滤
-                ui.horizontal(|ui| {
+
+                // 栏头：活动栏是实心点 + 强调色。用 Tab 在两栏间切换时，
+                // 这是唯一说明"现在操作的是哪一边"的可见信号。
+                let active = self.active_pane == which;
+                let head_text = if active {
+                    egui::RichText::new(format!("● {}", path.display()))
+                        .color(Color32::from_rgb(0, 122, 255))
+                        .strong()
+                } else {
+                    egui::RichText::new(format!("○ {}", path.display())).weak()
+                };
+                let head = ui
+                    .add(
+                        egui::Label::new(head_text)
+                            .truncate()
+                            .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text("设为当前栏（Tab 也可以切换）");
+                if head.clicked() {
+                    self.active_pane = which;
+                }
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
                     let crumbs = breadcrumbs(&path);
                     for (i, c) in crumbs.iter().enumerate() {
-                        if ui.button(c).clicked() {
+                        if ui.small_button(c).clicked() {
                             let target = crumbs_to_path(&path, i);
-                            match which {
-                                Pane::Left => self.left_path = target,
-                                Pane::Right => self.right_path = target,
-                            }
-                            self.refresh();
+                            self.navigate(which, target);
+                            self.active_pane = which;
                         }
                         if i + 1 < crumbs.len() {
                             ui.label("›");
                         }
                     }
                 });
+
+                let mut filter_focused = false;
                 ui.horizontal(|ui| {
                     let filter = match which {
                         Pane::Left => &mut self.left_filter,
                         Pane::Right => &mut self.right_filter,
                     };
                     ui.label("🔍");
-                    ui.add(
+                    let resp = ui.add(
                         egui::TextEdit::singleline(filter)
-                            .hint_text("过滤…")
-                            .desired_width(width - 60.0),
+                            .hint_text("按名称过滤")
+                            .desired_width((width - 116.0).max(80.0)),
                     );
-                    if ui.button("✕").clicked() {
+                    filter_focused = resp.has_focus();
+                    if !filter.is_empty() && ui.button("✕").clicked() {
                         filter.clear();
                     }
                 });
+                self.text_focus |= filter_focused;
                 ui.separator();
 
                 // 列视图
-                let base = match which {
-                    Pane::Left => self.left_path.clone(),
-                    Pane::Right => self.right_path.clone(),
+                let base = self.path_of(which).clone();
+                let error = match which {
+                    Pane::Left => self.left_error.clone(),
+                    Pane::Right => self.right_error.clone(),
+                };
+                let filter = match which {
+                    Pane::Left => self.left_filter.clone(),
+                    Pane::Right => self.right_filter.clone(),
                 };
                 let entries: Vec<&fmnr_core::Entry> = {
                     let all = match which {
                         Pane::Left => &self.left_entries,
                         Pane::Right => &self.right_entries,
-                    };
-                    let filter = match which {
-                        Pane::Left => &self.left_filter,
-                        Pane::Right => &self.right_filter,
                     };
                     if filter.is_empty() {
                         all.iter().collect()
@@ -1457,17 +2271,31 @@ impl App {
                     }
                 };
 
+                // 选中的条目被过滤掉时取消选中。留着的话状态栏显示的还是刚才那条，
+                // 而回车/删除作用的却是这个已经看不见的文件。
+                {
+                    let sel = match which {
+                        Pane::Left => &mut self.left_selected,
+                        Pane::Right => &mut self.right_selected,
+                    };
+                    if let Some(name) = sel.as_ref() {
+                        if !entries.iter().any(|e| &e.name == name) {
+                            *sel = None;
+                        }
+                    }
+                }
+
                 // 文件路径 -> 外置打开状态的索引（角标注入用）
-                let badges: Vec<Option<fmnr_core::ExternalOpen>> = entries
-                    .iter()
-                    .map(|e| {
-                        self.current_volume()
-                            .as_ref()
-                            .unwrap()
-                            .external_opens()
-                            .get(base.join(&e.name).display().to_string())
-                    })
-                    .collect();
+                let badges: Vec<Option<fmnr_core::ExternalOpen>> = match self.current_volume() {
+                    Some(v) => entries
+                        .iter()
+                        .map(|e| {
+                            v.external_opens()
+                                .get(base.join(&e.name).display().to_string())
+                        })
+                        .collect(),
+                    None => entries.iter().map(|_| None).collect(),
+                };
 
                 // 图标纹理预先解析（闭包内不能可变借用 self.icons）。
                 let ctx = ui.ctx().clone();
@@ -1481,59 +2309,134 @@ impl App {
                     Pane::Right => &mut self.right_selected,
                 };
 
+                let row_h = 24.0;
+                // 留 16px 给纵向滚动条：不留的话右栏整行会顶出窗口右缘，
+                // 大小那一列被切掉半个字。
+                let avail_w = (ui.available_width() - 16.0).max(120.0);
+
                 // 闭包内不借用 self（避免与 selected 冲突），事件收集到闭包外处理。
-                let mut clicked: Option<usize> = None;
-                let mut dbl: Option<usize> = None;
-                egui::ScrollArea::vertical().show_rows(ui, 24.0, entries.len(), |ui, row_range| {
-                    for i in row_range {
-                        let e = entries[i];
-                        let badge = badges[i].as_ref();
-                        let icon = icon_handles[i].clone();
-                        ui.horizontal(|ui| {
-                            // 图标：自绘 SVG 纹理；缺失时退回字形占位
-                            match icon {
-                                Some(h) => {
-                                    ui.add(egui::Image::new((h.id(), egui::vec2(16.0, 16.0))));
-                                }
-                                None => {
-                                    ui.label(if e.is_dir { "📁" } else { "📄" });
-                                }
+                let mut dbl_pick: Option<(String, bool)> = None;
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .show_rows(ui, row_h, entries.len(), |ui, row_range| {
+                        for i in row_range {
+                            let e = entries[i];
+                            let badge = badges[i].as_ref();
+                            let icon = icon_handles[i].clone();
+                            let is_sel = selected.as_deref() == Some(e.name.as_str());
+
+                            // 命中区 = 整行，不只是文件名。
+                            // `ui.horizontal(...).response` 的 Sense 是 hover，
+                            // 挂在它上面的 clicked()/double_clicked() 永远为 false。
+                            let row_rect = egui::Rect::from_min_size(
+                                ui.cursor().min,
+                                egui::vec2(avail_w, row_h),
+                            );
+                            let resp = ui.interact(
+                                row_rect,
+                                ui.id().with(("row", e.name.as_str())),
+                                egui::Sense::click(),
+                            );
+                            if is_sel || resp.hovered() {
+                                // 底色必须画在文字之前，否则色块把字盖住。
+                                let fill = if is_sel {
+                                    ui.visuals().selection.bg_fill
+                                } else {
+                                    ui.visuals().faint_bg_color
+                                };
+                                ui.painter().rect_filled(row_rect, 6.0, fill);
                             }
-                            // 角标：左侧圆点，仅在该进程仍存活时出现
-                            if let Some(o) = badge {
-                                ui.label(
-                                    egui::RichText::new("●")
-                                        .size(10.0)
-                                        .color(color_for(&o.program)),
+
+                            ui.horizontal(|ui| {
+                                // 图标：自绘 SVG 纹理；缺失时退回字形占位
+                                match icon {
+                                    Some(h) => {
+                                        ui.add(egui::Image::new((h.id(), egui::vec2(16.0, 16.0))));
+                                    }
+                                    None => {
+                                        ui.label(if e.is_dir { "📁" } else { "📄" });
+                                    }
+                                }
+                                // 角标：左侧圆点，仅在该进程仍存活时出现
+                                if let Some(o) = badge {
+                                    ui.label(
+                                        egui::RichText::new("●")
+                                            .size(10.0)
+                                            .color(color_for(&o.program)),
+                                    );
+                                }
+                                // 名字紧跟图标左对齐、超长才截断。
+                                // `add_sized` 用的是 centered_and_justified 布局，
+                                // 会把名字推到行中间；`with_layout(right_to_left)`
+                                // 则不设宽度，会把大小列顶到窗口右缘外面去。
+                                // 所以两列各自占固定宽，整行 = avail_w。
+                                let label = ui
+                                    .allocate_ui_with_layout(
+                                        egui::vec2((avail_w - 130.0).max(60.0), row_h),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            // selectable(false)：Label 默认可选文本，
+                                            // 它会吃掉这一行的点击——点在名字上选中不了，
+                                            // 点在名字右边的空白上却可以。
+                                            ui.add(
+                                                egui::Label::new(&e.name)
+                                                    .selectable(false)
+                                                    .truncate(),
+                                            )
+                                        },
+                                    )
+                                    .inner;
+                                if let Some(o) = badge {
+                                    label.on_hover_text(format!("已在 {} 中打开", o.program));
+                                }
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(110.0, row_h),
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let size =
+                                            e.size.map(fmt_size).unwrap_or_else(|| "—".to_string());
+                                        ui.label(egui::RichText::new(size).weak().monospace());
+                                    },
                                 );
-                            }
-                            let resp = ui.selectable_label(*selected == Some(i), &e.name);
-                            if let Some(o) = badge {
-                                resp.clone()
-                                    .on_hover_text(format!("已在 {} 中打开", o.program));
-                            }
-                            if resp.clicked() {
-                                clicked = Some(i);
+                            });
+
+                            let tip = base.join(&e.name).display().to_string();
+                            let resp = resp.on_hover_text(tip);
+                            if resp.clicked() && !resp.double_clicked() {
+                                *selected = Some(e.name.clone());
                             }
                             if resp.double_clicked() {
-                                dbl = Some(i);
+                                dbl_pick = Some((e.name.clone(), e.is_dir));
                             }
-                        });
-                    }
-                });
+                        }
+                    });
 
-                if let Some(i) = clicked {
-                    match which {
-                        Pane::Left => self.left_selected = Some(i),
-                        Pane::Right => self.right_selected = Some(i),
-                    }
+                // 先把要用的结论取出来：`entries` 借的是 self 的列表字段，
+                // 而下面的 enter() 会重新列目录（可变借用 self），两者不能重叠。
+                let visible_empty = entries.is_empty();
+
+                if let Some((name, is_dir)) = dbl_pick {
+                    // 双击哪一栏就操作哪一栏：早先用 active_path() 当基准，
+                    // 在非活动栏里双击会把**活动栏**导航过去，或直接开错文件。
                     self.active_pane = which;
+                    let target = base.join(&name);
+                    self.enter(target, is_dir);
                 }
-                if let Some(i) = dbl {
-                    if let Some(e) = entries.get(i) {
-                        let base = self.active_path().clone();
-                        self.enter(base.join(&e.name));
-                    }
+
+                if let Some(err) = error {
+                    let c = ui.visuals().error_fg_color;
+                    ui.colored_label(c, format!("读取失败：{err}"));
+                    ui.label(
+                        egui::RichText::new("路径、卷、权限都可能是原因；可切「卷」或挂载后重试")
+                            .weak(),
+                    );
+                } else if visible_empty {
+                    let msg = if filter.is_empty() {
+                        "这个目录是空的"
+                    } else {
+                        "没有匹配这个过滤词的条目"
+                    };
+                    ui.label(egui::RichText::new(msg).weak());
                 }
             });
         });
@@ -1654,6 +2557,67 @@ fn highlight_hit(hit: &crate::search::Hit, style: &egui::Style) -> egui::WidgetT
     egui::WidgetText::from(job)
 }
 
+/// 这个卷的条目能不能用「遍历本地文件系统」的方式搜到。
+///
+/// 搜索线程走的是 `jwalk`，它只认本地路径。归档卷的根是**包内虚拟路径**：
+/// zip 的根甚至是空串，而 `WalkDir::new("")` 会去遍历**进程当前目录**——
+/// 于是搜的是完全另一棵树，还理直气壮地报"没有匹配项"。
+/// 远程卷同理（本地路径不存在）。所以先挡住，别给假答案。
+///
+/// WSL 报的是 UNC 根，那是能直接 `read_dir` 的真路径 ⇒ 放行。
+fn local_walkable(kind: Option<fmnr_core::VolumeKind>) -> bool {
+    matches!(
+        kind,
+        None | Some(fmnr_core::VolumeKind::Local)
+            | Some(fmnr_core::VolumeKind::Unc)
+            | Some(fmnr_core::VolumeKind::Wsl)
+    )
+}
+
+/// 重命名后的完整新名。
+///
+/// 弹窗里只放 `file_stem`（与主流文件管理器一致），所以"用户有没有改扩展名"
+/// 要和**我们发给他那个 stem** 比，而不是和空比：
+/// `a.tar.gz` 的 stem 是 `a.tar`（自带一个点），只比"输入里有没有点"会把它
+/// 判成"用户自己写了扩展名"，于是 `.gz` 被丢掉——而用户其实只把 `a` 改成 `b`。
+/// 改完名变成无扩展名/少一截扩展名，坏的是图标和"双击用什么打开"。
+///
+/// 拆成纯函数是为了能单测：`commit_rename` 里全是 tokio 与卷副作用。
+fn rename_target(old: &str, input: &str) -> String {
+    let ext_of = |s: &str| {
+        Path::new(s)
+            .extension()
+            .map(|e| e.to_string_lossy().to_string())
+    };
+    let stem = Path::new(old)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| old.to_string());
+    // 输入的扩展名和原 stem 的扩展名一致 ⇒ 用户没碰扩展名那一段，补回真正的扩展名。
+    let untouched_ext = ext_of(input) == ext_of(&stem);
+    match (ext_of(old), untouched_ext) {
+        (Some(ext), true) => format!("{input}.{ext}"),
+        _ => input.to_string(),
+    }
+}
+
+/// 条目大小的一行显示。目录不给大小（列了也不等于 anything 有用），
+/// 用 "—" 占位比留空更不容易被读成"这一列坏了"。
+fn fmt_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// 卡片标题截断。按**字符**截而不是字节，否则中文会被切成半个字。
 fn truncate_label(s: &str, max_chars: usize) -> String {
     let mut out: String = s.chars().take(max_chars).collect();
@@ -1674,6 +2638,17 @@ fn short_volume_name(id: &str) -> String {
         return format!("local:{}", head);
     }
     truncate_label(id, 40)
+}
+
+/// 排序下拉的当前项文案。`SortOrder` 的 Debug 输出是英文枚举名，
+/// 直接 `format!("{:?}")` 会让按钮上写着 `Modified` 而菜单里写着"修改时间"。
+fn sort_label(order: SortOrder) -> &'static str {
+    match order {
+        SortOrder::Name => "名称",
+        SortOrder::Size => "大小",
+        SortOrder::Modified => "修改时间",
+        SortOrder::Type => "类型",
+    }
 }
 
 fn dirs_home() -> PathBuf {
@@ -1725,6 +2700,77 @@ fn crumbs_to_path(full: &Path, upto: usize) -> PathBuf {
         p.push(c.as_os_str());
     }
     p
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    #[test]
+    fn editing_the_stem_keeps_the_extension() {
+        // 这条锁住的是"改完名变成无扩展名文件"：图标和默认打开方式都跟着坏。
+        assert_eq!(rename_target("report.txt", "summary"), "summary.txt");
+    }
+
+    #[test]
+    fn typing_an_extension_overrides_the_old_one() {
+        assert_eq!(rename_target("notes.txt", "notes.md"), "notes.md");
+    }
+
+    #[test]
+    fn files_without_extension_are_left_alone() {
+        assert_eq!(rename_target("Makefile", "make"), "make");
+        assert_eq!(rename_target("LICENSE", "copying"), "copying");
+    }
+
+    #[test]
+    fn dotfiles_do_not_lose_their_leading_dot() {
+        // `.bashrc` 的 extension 是 None、file_stem 是 ".bashrc"，
+        // 补扩展名的分支不能把它截成 "bashrc"。
+        assert_eq!(rename_target(".bashrc", ".zshrc"), ".zshrc");
+    }
+
+    #[test]
+    fn multi_part_extension_survives_a_stem_edit() {
+        // `a.tar.gz` 发进弹窗的 stem 是 `a.tar`，它自带一个点。
+        // 判"用户没改扩展名"要和这个 stem 比，否则只把 a 改成 b 也会把 .gz 吃掉。
+        assert_eq!(rename_target("a.tar.gz", "b.tar"), "b.tar.gz");
+    }
+
+    #[test]
+    fn a_real_extension_change_is_honoured() {
+        // 同一条规则的另一侧：输入的扩展名和原 stem 不同，
+        // 那是用户真在换格式，不能被自动补名盖掉。
+        assert_eq!(rename_target("a.tar.gz", "b.zip"), "b.zip");
+    }
+
+    #[test]
+    fn archive_and_remote_volumes_are_not_local_walkable() {
+        // 归档卷根是包内虚拟路径（zip 根甚至是空串），jwalk 拿空串会去遍历
+        // 进程当前目录 ⇒ 搜错树还报"没有匹配项"。这条锁住"不许给假答案"。
+        assert!(!local_walkable(Some(fmnr_core::VolumeKind::Archive)));
+        assert!(!local_walkable(Some(fmnr_core::VolumeKind::Remote)));
+    }
+
+    #[test]
+    fn local_unc_and_wsl_roots_are_walkable() {
+        // WSL 报的是 UNC 根，那是能直接 read_dir 的真路径 ⇒ 不该被挡。
+        assert!(local_walkable(Some(fmnr_core::VolumeKind::Local)));
+        assert!(local_walkable(Some(fmnr_core::VolumeKind::Unc)));
+        assert!(local_walkable(Some(fmnr_core::VolumeKind::Wsl)));
+        assert!(local_walkable(None), "没挂任何卷时不拦，面板自己会说搜不到");
+    }
+
+    #[test]
+    fn sizes_switch_unit_at_the_boundary() {
+        assert_eq!(fmt_size(0), "0 B");
+        assert_eq!(fmt_size(1023), "1023 B");
+        assert_eq!(fmt_size(1024), "1.0 KB");
+        assert_eq!(fmt_size(1536), "1.5 KB");
+        assert_eq!(fmt_size(5 * 1024 * 1024), "5.0 MB");
+        // GB 封顶：再大也不会出现 TB 之外的空单位。
+        assert_eq!(fmt_size(4000 * 1024 * 1024 * 1024), "4000.0 GB");
+    }
 }
 
 #[cfg(test)]
@@ -1817,5 +2863,119 @@ mod drop_tests {
             DropPlan::Ignore(reason) => assert!(!reason.is_empty()),
             other => panic!("空拖放不该拷贝：{other:?}"),
         }
+    }
+}
+
+/// 挂载对话框的 spec 拼装：纯逻辑，不碰 egui，可在无显示环境下测。
+///
+/// 这里钉住的是「用户在对话框里看到的」与「真正挂载的」之间的翻译不走样——
+/// UI 层最容易出的 bug 就是把输入 trim/传参错一遍再交给挂载层。
+#[cfg(test)]
+mod mount_dialog_tests {
+    use super::*;
+
+    /// 绕开 `MountDialog::new()` 里的 `discover_wsl_distros()`（会真跑 wsl.exe），
+    /// 直接构造确定性状态——单测不依赖本机装没装 WSL。
+    fn dlg(
+        kind: MountKind,
+        input: &str,
+        distros: Option<Result<Vec<String>, String>>,
+    ) -> MountDialog {
+        MountDialog {
+            kind,
+            input: input.to_string(),
+            wsl_distros: distros,
+            wsl_picked: 0,
+        }
+    }
+
+    #[test]
+    fn empty_input_yields_no_spec() {
+        for kind in [MountKind::Archive, MountKind::Ssh] {
+            let d = dlg(kind, "   ", None);
+            assert!(d.spec().is_none(), "空输入不该拼出 spec（kind={kind:?}）");
+        }
+        // WSL 的挂载对象来自列表选中项而非输入框：列表空 + 输入空才该放弃。
+        let d = dlg(MountKind::Wsl, "   ", Some(Ok(vec![])));
+        assert!(d.spec().is_none(), "列表空且输入空白时不该拼出 spec");
+    }
+
+    #[test]
+    fn archive_input_is_trimmed() {
+        let d = dlg(MountKind::Archive, "  D:/x/y.zip  ", None);
+        assert_eq!(
+            d.spec(),
+            Some(MountSpec::Archive {
+                path: PathBuf::from("D:/x/y.zip"),
+            }),
+            "首尾空白必须 trim：路径粘错一个空格就是 NotFound"
+        );
+    }
+
+    #[test]
+    fn wsl_prefers_picked_distro_over_free_text() {
+        let d = dlg(
+            MountKind::Wsl,
+            "手打的不该被用到",
+            Some(Ok(vec!["Ubuntu-24.04".into(), "docker-desktop".into()])),
+        );
+        assert_eq!(
+            d.spec(),
+            Some(MountSpec::Wsl {
+                distro: "Ubuntu-24.04".to_string(),
+            })
+        );
+        // 选中第二个：优先级跟着选中项走。
+        let mut d2 = d;
+        d2.wsl_picked = 1;
+        assert_eq!(
+            d2.spec(),
+            Some(MountSpec::Wsl {
+                distro: "docker-desktop".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn wsl_falls_back_to_manual_when_discovery_failed() {
+        let d = dlg(
+            MountKind::Wsl,
+            "Ubuntu-24.04",
+            Some(Err("本机没装 WSL".to_string())),
+        );
+        assert_eq!(
+            d.spec(),
+            Some(MountSpec::Wsl {
+                distro: "Ubuntu-24.04".to_string(),
+            }),
+            "发现失败后手动输入必须还能挂"
+        );
+    }
+
+    #[test]
+    fn wsl_picked_out_of_range_falls_back_to_text() {
+        let mut d = dlg(
+            MountKind::Wsl,
+            "Manual-Distro",
+            Some(Ok(vec!["Ubuntu-24.04".into()])),
+        );
+        d.wsl_picked = 99; // 列表刷新后下标可能越界，不能 panic
+        assert_eq!(
+            d.spec(),
+            Some(MountSpec::Wsl {
+                distro: "Manual-Distro".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn ssh_input_is_trimmed() {
+        let d = dlg(MountKind::Ssh, " me@host:22 ", None);
+        assert_eq!(
+            d.spec(),
+            Some(MountSpec::Ssh {
+                endpoint: "me@host:22".to_string(),
+            })
+        );
     }
 }

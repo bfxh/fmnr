@@ -56,8 +56,13 @@ impl SearchState {
                     got = true;
                 }
                 Err(TryRecvError::Disconnected) => {
-                    self.done = true;
-                    self.elapsed_ms = self.started.elapsed().as_millis() as u64;
+                    // elapsed_ms 只记第一次：drain() 每帧都跑，
+                    // 无条件覆写的话"搜索耗时"会随窗口开着一直涨，
+                    // 扫完 2.5s 的树十分钟后显示成 17s。
+                    if !self.done {
+                        self.done = true;
+                        self.elapsed_ms = self.started.elapsed().as_millis() as u64;
+                    }
                     break;
                 }
                 Err(TryRecvError::Empty) => {

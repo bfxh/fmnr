@@ -8,6 +8,7 @@ mod ops;
 mod preview;
 mod search;
 mod theme;
+mod tree;
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt::init();
