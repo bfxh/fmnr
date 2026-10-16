@@ -353,7 +353,7 @@ fn route_volume(
     let mut best: Option<fmnr_core::VolumeId> = None;
     for s in path_samples(args) {
         for id in &ids {
-            if s.starts_with(&id.0) && best.as_ref().map_or(true, |b| id.0.len() > b.0.len()) {
+            if s.starts_with(&id.0) && best.as_ref().is_none_or(|b| id.0.len() > b.0.len()) {
                 best = Some(id.clone());
             }
         }
