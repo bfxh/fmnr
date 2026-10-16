@@ -73,6 +73,9 @@ pub struct App {
     right_filter: String,
     /// 状态栏消息
     status: String,
+    /// 待写入**系统**剪贴板的文本（"复制完整路径"用）。
+    /// 攒到字段里是因为动作执行时手上没有 ui，下一帧开头再交给 egui。
+    clipboard_text: Option<String>,
     /// M3 统一预览面板状态
     preview: Option<crate::preview::Preview>,
     /// M1 图标纹理缓存（IconKey → 纹理）
@@ -128,6 +131,25 @@ enum ViewMode {
 enum Pane {
     Left,
     Right,
+}
+
+/// 右键菜单里的一个动作。
+///
+/// 刻意做成"收集意图 → 闭包外执行"：菜单是在 `show_rows` 的闭包里画的，
+/// 而每个动作都要可变借用 `self`（重列目录、起长操作、开弹窗）。
+/// 在闭包里直接执行会和列表的借用打架。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowAction {
+    Open,
+    OpenExternal,
+    Copy,
+    Cut,
+    Paste,
+    Delete,
+    Rename,
+    CopyPath,
+    PinToBoard,
+    OpenInOtherPane,
 }
 
 /// 冲突弹窗：已把请求暂存，等用户选策略。
@@ -248,6 +270,7 @@ impl App {
             right_filter: String::new(),
             // 没装到 CJK 字体的话，界面所有中文都是豆腐块，而用户无从知道
             // 是"程序坏了"还是"这台机没字体"。这条要说出来。
+            clipboard_text: None,
             status: if cjk_font_ok {
                 String::new()
             } else {
@@ -1049,6 +1072,10 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 系统剪贴板：上一帧右键"复制完整路径"攒下的文本在这里落地。
+        if let Some(text) = self.clipboard_text.take() {
+            ctx.copy_text(text);
+        }
         self.handle_keys(ctx);
         self.handle_dropped_files(ctx);
         self.poll_running();
@@ -1857,6 +1884,59 @@ impl App {
         });
     }
 
+    /// 执行右键菜单选中的动作。
+    ///
+    /// 全部走既有的方法，不在这里另写一套动作层：工具栏按钮、快捷键和右键
+    /// 三条入口必须做同一件事，否则会出现"右键能删、按钮删不掉"这种分叉。
+    fn run_row_action(&mut self, act: RowAction, path: &Path, is_dir: bool, which: Pane) {
+        // 菜单是对哪一栏弹的，就把那一栏设为活动栏：
+        // 在右栏右键"删除"却删了左栏选中的文件，是最糟糕的一种意外。
+        self.active_pane = which;
+        match act {
+            // 没有单独的"预览"项：文件的 Open 本来就走预览
+            // （enter → spawn_external → route_open 判为 Preview）。
+            // 少一个动词，就少一处"两个菜单项做同一件事却可能不一致"。
+            RowAction::Open => self.enter(path.to_path_buf(), is_dir),
+            RowAction::OpenExternal => {
+                // force_external = true：即使是可预览类型也交给外部程序。
+                // 这是"预览"和"用默认程序打开"必须分成两项的原因。
+                let route = core_route_open(path, true);
+                if let OpenRoute::External(_) = route {
+                    self.spawn_external(path);
+                } else {
+                    self.status = "这个类型没有可外部打开的程序".into();
+                }
+            }
+            RowAction::Copy => self.put_clipboard(crate::ops::ClipMode::Copy),
+            RowAction::Cut => self.put_clipboard(crate::ops::ClipMode::Cut),
+            RowAction::Paste => self.paste(),
+            RowAction::Delete => self.delete_selected(),
+            RowAction::Rename => self.begin_rename(),
+            RowAction::CopyPath => {
+                let text = path.display().to_string();
+                self.status = format!("已复制路径 {text}");
+                self.clipboard_text = Some(text);
+            }
+            RowAction::PinToBoard => self.pin_selected_to_board(),
+            RowAction::OpenInOtherPane => {
+                let other = match which {
+                    Pane::Left => Pane::Right,
+                    Pane::Right => Pane::Left,
+                };
+                if is_dir {
+                    self.navigate(other, path.to_path_buf());
+                } else if let Some(parent) = path.parent() {
+                    self.navigate(other, parent.to_path_buf());
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    self.set_selection_for(other, &name);
+                }
+            }
+        }
+    }
+
     fn other_pane_path(&self) -> PathBuf {
         match self.active_pane {
             Pane::Left => self.right_path.clone(),
@@ -2316,6 +2396,7 @@ impl App {
 
                 // 闭包内不借用 self（避免与 selected 冲突），事件收集到闭包外处理。
                 let mut dbl_pick: Option<(String, bool)> = None;
+                let mut row_action: Option<(RowAction, PathBuf, bool)> = None;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, true])
                     .show_rows(ui, row_h, entries.len(), |ui, row_range| {
@@ -2405,15 +2486,47 @@ impl App {
                             if resp.clicked() && !resp.double_clicked() {
                                 *selected = Some(e.name.clone());
                             }
-                            if resp.double_clicked() {
-                                dbl_pick = Some((e.name.clone(), e.is_dir));
+                            // 右键先选中再弹菜单：否则菜单动的是"上一次点的行"，
+                            // 而用户的眼睛停在他刚右键的那一行上。
+                            let full = base.join(&e.name);
+                            let is_dir = e.is_dir;
+                            if resp.secondary_clicked() {
+                                *selected = Some(e.name.clone());
                             }
+                            if resp.double_clicked() {
+                                dbl_pick = Some((e.name.clone(), is_dir));
+                            }
+                            resp.context_menu(|ui| {
+                                let mut pick = |ui: &mut egui::Ui, act, label: &str| {
+                                    if ui.button(label).clicked() {
+                                        row_action = Some((act, full.clone(), is_dir));
+                                        ui.close_menu();
+                                    }
+                                };
+                                pick(ui, RowAction::Open, if is_dir { "打开" } else { "预览" });
+                                pick(ui, RowAction::OpenExternal, "用默认程序打开");
+                                ui.separator();
+                                pick(ui, RowAction::Copy, "复制");
+                                pick(ui, RowAction::Cut, "剪切");
+                                pick(ui, RowAction::Paste, "粘贴到这里");
+                                ui.separator();
+                                pick(ui, RowAction::Rename, "重命名");
+                                pick(ui, RowAction::Delete, "删除");
+                                ui.separator();
+                                pick(ui, RowAction::CopyPath, "复制完整路径");
+                                pick(ui, RowAction::OpenInOtherPane, "在对栏打开");
+                                pick(ui, RowAction::PinToBoard, "钉到白板");
+                            });
                         }
                     });
 
                 // 先把要用的结论取出来：`entries` 借的是 self 的列表字段，
                 // 而下面的 enter() 会重新列目录（可变借用 self），两者不能重叠。
                 let visible_empty = entries.is_empty();
+
+                if let Some((act, path, is_dir)) = row_action {
+                    self.run_row_action(act, &path, is_dir, which);
+                }
 
                 if let Some((name, is_dir)) = dbl_pick {
                     // 双击哪一栏就操作哪一栏：早先用 active_path() 当基准，
