@@ -162,6 +162,20 @@ pub fn on_ops(item: &StartupItem) -> Vec<Op> {
     }
 }
 
+/// 非 Windows 上这两个**必须有实现**：调用方 fmnr-ui 是跨平台编译的，
+/// 只给 `#[cfg(windows)]` 版本会让 ubuntu 上整个 crate 编不过
+/// （`list()` 有桩所以没暴露这个问题——桩该不该给，看的是**调用方跨不跨平台**，
+/// 不是"看起来完不完整"：上一笔给死代码补桩就是反例）。
+#[cfg(not(windows))]
+pub fn turn_off(_item: &StartupItem) -> Result<usize> {
+    Err(Error::Unsupported("自启动调整目前只实现了 Windows".into()))
+}
+
+#[cfg(not(windows))]
+pub fn turn_on(_item: &StartupItem) -> Result<usize> {
+    Err(Error::Unsupported("自启动调整目前只实现了 Windows".into()))
+}
+
 /// 列出这台机器上能列到的自启动项。
 ///
 /// 某一处读不到（没有权限、键不存在）不影响其余：它进 `warnings` 而不是让整份列表失败——
