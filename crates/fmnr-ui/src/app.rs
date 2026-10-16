@@ -111,6 +111,14 @@ pub struct App {
     tree: crate::tree::Tree,
     /// 包更新盘点（只读，入口在目录树那一排的「更新」）
     pkg: PkgPanel,
+    /// 设置窗口
+    settings_open: bool,
+    /// 自启动状态。`None` = 还没读；读失败走 `autostart_error` 而不是当成"没开"——
+    /// 把"读不到"显示成"未开启"会诱导用户去点开启，然后覆盖一个他看不见的项。
+    autostart_status: Option<fmnr_fs::autostart::Status>,
+    autostart_error: Option<String>,
+    /// 自启动要登记的就是这个 exe 自己
+    self_exe: PathBuf,
     /// M6 空间白板（布局层，与双栏视图互斥显示）
     board: fmnr_core::board::Board,
     /// 当前视图：双栏 or 白板
@@ -326,6 +334,10 @@ impl App {
             plugin_warnings: Vec::new(),
             tree: crate::tree::Tree::default(),
             pkg: PkgPanel::default(),
+            settings_open: false,
+            autostart_status: None,
+            autostart_error: None,
+            self_exe: std::env::current_exe().unwrap_or_default(),
             board: fmnr_core::board::Board::new("default"),
             view: ViewMode::Panes,
             board_cam: crate::board_view::Camera::default(),
@@ -1207,6 +1219,167 @@ impl App {
             self.clipboard_text = Some(cmd);
         }
     }
+
+    /// 打开设置窗口。自启动状态在**第一次打开时**读一次：
+    /// 每帧读注册表既没必要（用户不会在别的窗口里改它而期望这里立刻跟着变），
+    /// 也会让"读失败"变成每帧刷新的红字。
+    fn open_settings(&mut self) {
+        self.settings_open = true;
+        if self.self_exe.as_os_str().is_empty() {
+            self.autostart_error =
+                Some("拿不到本程序的路径（current_exe 失败），无法登记自启动".into());
+            return;
+        }
+        if self.autostart_status.is_none() && self.autostart_error.is_none() {
+            self.read_autostart();
+        }
+    }
+
+    fn read_autostart(&mut self) {
+        let exe = self.self_exe.display().to_string();
+        match fmnr_fs::autostart::status(&exe) {
+            Ok(s) => {
+                self.autostart_status = Some(s);
+                self.autostart_error = None;
+            }
+            Err(e) => {
+                self.autostart_status = None;
+                self.autostart_error = Some(e.to_string());
+            }
+        }
+    }
+
+    fn render_settings(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let exe = self.self_exe.display().to_string();
+        // 按钮要做的动作先记下来，闭包外再做：这里头既有注册表写入又有刷新，
+        // 画 UI 的闭包里不干这些。
+        let mut want_enable = false;
+        let mut want_disable = false;
+        let mut want_reread = false;
+        let mut rehidden = false;
+        let mut open = self.settings_open;
+
+        egui::Window::new("设置")
+            .id(egui::Id::new("settings"))
+            .default_size([460.0, 320.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("开机自启动").strong());
+                match &self.autostart_error {
+                    Some(err) => {
+                        let c = ui.visuals().error_fg_color;
+                        ui.colored_label(c, err);
+                        ui.label("这一步只读 HKCU 下我们自己的那一个值，读不到就是读不到。");
+                    }
+                    None => {
+                        // 先取成 owned 值再画按钮：闭包里还要写 self.autostart_status，
+                        // 直接 match &self.… 会让这段借用横跨整个臂体。
+                        let status = self.autostart_status.clone();
+                        let (text, enabled) = match &status {
+                            Some(fmnr_fs::autostart::Status::Off) => {
+                                ("未开启。".to_string(), false)
+                            }
+                            Some(fmnr_fs::autostart::Status::Ours) => {
+                                (format!("已开启，指向 {exe}"), true)
+                            }
+                            Some(fmnr_fs::autostart::Status::Foreign(v)) => {
+                                (format!("值名 fmnr 已被别的命令占用：{v}"), false)
+                            }
+                            None => ("（还没读）".to_string(), false),
+                        };
+                        ui.label(text);
+                        ui.horizontal(|ui| {
+                            ui.add_enabled_ui(!enabled, |ui| {
+                                if ui.button("开启").clicked() {
+                                    want_enable = true;
+                                }
+                            });
+                            ui.add_enabled_ui(enabled, |ui| {
+                                if ui.button("关闭").clicked() {
+                                    want_disable = true;
+                                }
+                            });
+                            if ui.button("重新读取").clicked() {
+                                want_reread = true;
+                            }
+                        });
+                        if matches!(status, Some(fmnr_fs::autostart::Status::Foreign(_))) {
+                            let c = Color32::from_rgb(230, 89, 38);
+                            ui.colored_label(
+                                c,
+                                "这种情况这里不提供按钮：覆盖它等于替你把别人的自启动改掉。",
+                            );
+                        }
+                    }
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "只写 HKCU\\...\\Run 下名为 fmnr 的那一个值；关闭时也只删这一个值，\
+                         不删 Run 键——里面是这台机器所有程序的自启动项。",
+                    )
+                    .size(12.0)
+                    .weak(),
+                );
+
+                ui.separator();
+                ui.label(egui::RichText::new("列表").strong());
+                if ui.checkbox(&mut self.show_hidden, "显示隐藏项").changed() {
+                    rehidden = true;
+                }
+
+                ui.separator();
+                ui.label(egui::RichText::new("这台机器上 fmnr 看到的").strong());
+                ui.label(format!(
+                    "卷 {} 个 · 插件 {} 个",
+                    self.volume_registry.list().len(),
+                    self.plugins.len()
+                ));
+                ui.label(
+                    egui::RichText::new(format!("本程序：{exe}"))
+                        .size(12.0)
+                        .weak(),
+                );
+                if !self.plugin_warnings.is_empty() {
+                    let c = Color32::from_rgb(230, 89, 38);
+                    ui.colored_label(
+                        c,
+                        format!(
+                            "{} 个插件没加载成功，状态栏那条会说明原因",
+                            self.plugin_warnings.len()
+                        ),
+                    );
+                }
+            });
+
+        self.settings_open = open;
+        if want_reread {
+            self.autostart_status = None;
+            self.autostart_error = None;
+            self.read_autostart();
+        }
+        if want_enable {
+            match fmnr_fs::autostart::enable(&exe) {
+                Ok(r) => self.status = format!("已登记自启动（写 {} 项）", r.written),
+                Err(e) => self.status = format!("自启动开启失败：{e}"),
+            }
+            self.autostart_status = None;
+            self.read_autostart();
+        }
+        if want_disable {
+            match fmnr_fs::autostart::disable() {
+                Ok(r) => self.status = format!("已取消自启动（删 {} 项）", r.removed),
+                Err(e) => self.status = format!("自启动取消失败：{e}"),
+            }
+            self.autostart_status = None;
+            self.read_autostart();
+        }
+        if rehidden {
+            self.refresh();
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -1270,6 +1443,9 @@ impl eframe::App for App {
                 // M8 挂载入口：归档/WSL/SSH 卷在这里注册进同一个 registry。
                 if ui.button("📦 挂载").clicked() {
                     self.mount_dialog = Some(MountDialog::new());
+                }
+                if ui.button("⚙ 设置").clicked() {
+                    self.open_settings();
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1661,6 +1837,7 @@ impl App {
 
         self.render_mount_dialog(ctx);
         self.render_pkg_panel(ctx);
+        self.render_settings(ctx);
     }
 
     /// 挂载对话框：类型三选一 + 入参 + 结果反馈。

@@ -212,7 +212,7 @@ pub fn revert(plan: &RegistrationPlan) -> Result<RegistrationReport> {
 }
 
 #[cfg(windows)]
-fn wide(s: &str) -> Vec<u16> {
+pub(crate) fn wide(s: &str) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     std::ffi::OsStr::new(s)
         .encode_wide()
