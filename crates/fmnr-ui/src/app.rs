@@ -113,6 +113,12 @@ pub struct App {
     pkg: PkgPanel,
     /// 设置窗口
     settings_open: bool,
+    /// 磁盘占用视图：在跑的扫描 + 窗口是否开着
+    usage_open: bool,
+    usage: Option<crate::usage::Running>,
+    /// 当前在看哪一层（点占比条会下钻，面包屑回上级）。
+    /// 和扫描的 root 是同一个东西：下钻=重起一次以它为根的扫描。
+    usage_root: PathBuf,
     /// 自启动状态。`None` = 还没读；读失败走 `autostart_error` 而不是当成"没开"——
     /// 把"读不到"显示成"未开启"会诱导用户去点开启，然后覆盖一个他看不见的项。
     autostart_status: Option<fmnr_fs::autostart::Status>,
@@ -356,6 +362,9 @@ impl App {
             tree: crate::tree::Tree::default(),
             pkg: PkgPanel::default(),
             settings_open: false,
+            usage_open: false,
+            usage: None,
+            usage_root: PathBuf::new(),
             autostart_status: None,
             autostart_error: None,
             self_exe: std::env::current_exe().unwrap_or_default(),
@@ -1644,6 +1653,208 @@ impl App {
             self.refresh();
         }
     }
+
+    /// 打开磁盘占用视图，从当前栏正在看的那一层开始算。
+    fn open_usage(&mut self) {
+        self.usage_open = true;
+        let root = self.active_path().clone();
+        if self.usage_root != root || self.usage.is_none() {
+            self.start_usage_scan(root);
+        }
+    }
+
+    /// 起一次扫描。旧的那次先取消：同时跑两棵树等于把内存和磁盘带宽翻倍，
+    /// 而用户只会看最后点的那一层。
+    fn start_usage_scan(&mut self, root: PathBuf) {
+        if let Some(old) = self.usage.take() {
+            old.cancel();
+        }
+        self.usage_root = root.clone();
+        self.usage = Some(crate::usage::Running::start(root));
+    }
+
+    fn poll_usage(&mut self, ctx: &egui::Context) {
+        let got = match self.usage.as_mut() {
+            Some(r) => r.poll(),
+            None => false,
+        };
+        let busy = self.usage.as_ref().is_some_and(|r| r.busy());
+        if got {
+            ctx.request_repaint();
+        }
+        if busy {
+            // 扫描线程不会自己叫醒我们：给它一个节流的重绘节奏，
+            // 条会长，但不会把 CPU 烧在空转重绘上。
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        }
+    }
+
+    /// 水位线 + 逐级占比条。
+    ///
+    /// "差了多少"要先给结论再给图：只剩一点时，用户要的是"动哪个有用"，
+    /// 不是一根需要自己换算的条。
+    fn render_usage(&mut self, ctx: &egui::Context) {
+        if !self.usage_open {
+            return;
+        }
+        let root = self.usage_root.clone();
+        let space = fmnr_fs::space::of(&root).ok();
+        let usage = self.usage.as_ref().and_then(|r| r.view()).cloned();
+        let busy = self.usage.as_ref().is_some_and(|r| r.busy());
+        let mut descend: Option<PathBuf> = None;
+        let mut want_rescan = false;
+        let mut want_cancel = false;
+        let mut open = self.usage_open;
+
+        egui::Window::new("磁盘占用")
+            .id(egui::Id::new("usage"))
+            .default_size([560.0, 420.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(root.display().to_string()).strong());
+                    if ui.button("重扫").clicked() {
+                        want_rescan = true;
+                    }
+                    // 下钻之后必须出得来：没有"上一级"的话，点一次就被关在一层里，
+                    // 只能关掉窗口重开。
+                    if let Some(p) = root.parent().filter(|x| x.is_dir()) {
+                        if ui.button("↑ 上一级").clicked() {
+                            descend = Some(p.to_path_buf());
+                        }
+                    }
+                    if busy && ui.button("取消").clicked() {
+                        want_cancel = true;
+                    }
+                });
+
+                // 水位线
+                match &space {
+                    Some(s) => {
+                        let ratio = s.used_ratio().unwrap_or(0.0);
+                        let w = ui.available_width();
+                        let rect = egui::Rect::from_min_size(
+                            ui.cursor().min,
+                            egui::vec2(w.max(80.0), 18.0),
+                        );
+                        ui.painter().rect_filled(rect, 6.0, ui.visuals().faint_bg_color);
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_size(
+                                rect.min,
+                                egui::vec2(rect.width() * ratio, rect.height()),
+                            ),
+                            6.0,
+                            if ratio > 0.92 {
+                                Color32::from_rgb(220, 50, 50)
+                            } else if ratio > 0.8 {
+                                Color32::from_rgb(230, 191, 0)
+                            } else {
+                                Color32::from_rgb(0, 122, 255)
+                            },
+                        );
+                        ui.allocate_at_least(rect.size(), egui::Sense::hover());
+                        ui.label(format!(
+                            "剩余 {} / 共 {}（已用 {:.0}%）",
+                            fmt_size(s.free),
+                            fmt_size(s.total),
+                            ratio * 100.0
+                        ));
+                        // 结论先行：只剩一点时直接说动谁有用，别让用户自己换算条子
+                        if s.free < 5 * 1024 * 1024 * 1024 {
+                            let c = ui.visuals().error_fg_color;
+                            let mut lines = vec![format!(
+                                "只剩 {}：装一个常见的更新包就可能不够。",
+                                fmt_size(s.free)
+                            )];
+                            if let Some(u) = &usage {
+                                for b in u.sorted().into_iter().take(3) {
+                                    lines.push(format!(
+                                        "  最大的一支：{}（{}，{} 个文件）",
+                                        b.name,
+                                        fmt_size(b.bytes),
+                                        b.entries
+                                    ));
+                                }
+                            }
+                            ui.colored_label(c, lines.join("\n"));
+                        }
+                    }
+                    None => {
+                        let c = ui.visuals().error_fg_color;
+                        ui.colored_label(
+                            c,
+                            "这一层的剩余空间读不到（只实现了 Windows 的卷查询）。读不到就说读不到，不画成空盘。",
+                        );
+                    }
+                }
+
+                ui.separator();
+                match &usage {
+                    None => {
+                        ui.label("（还没起扫描）");
+                    }
+                    Some(u) => {
+                        if let Some(err) = &u.error {
+                            let c = ui.visuals().error_fg_color;
+                            ui.colored_label(c, format!("扫描：{err}"));
+                        }
+                        ui.label(format!(
+                            "{} · 已扫 {} 个文件 · 合计 {}",
+                            if u.done {
+                                "扫完了"
+                            } else {
+                                "还在算（下面的数会一路长）"
+                            },
+                            u.visited,
+                            fmt_size(u.total())
+                        ));
+                        let total = u.total().max(1);
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if u.loose_bytes > 0 {
+                                    bar(
+                                        ui,
+                                        "（这一层散落的文件）",
+                                        u.loose_bytes,
+                                        u.loose_bytes as f64 / total as f64,
+                                        0,
+                                        false,
+                                    );
+                                }
+                                for b in u.sorted() {
+                                    let frac = b.bytes as f64 / total as f64;
+                                    if bar(ui, &b.name, b.bytes, frac, b.errors, !u.done) {
+                                        descend = Some(b.path.clone());
+                                    }
+                                }
+                            });
+                    }
+                }
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(
+                        "点一条进到那一层重算。这里只统计大小，不删任何东西；\
+                         没扫完之前数字是半截的，别当结论用。",
+                    )
+                    .size(12.0)
+                    .weak(),
+                );
+            });
+
+        self.usage_open = open;
+        if want_rescan {
+            self.start_usage_scan(root);
+        }
+        if want_cancel {
+            if let Some(r) = self.usage.as_ref() {
+                r.cancel();
+            }
+        }
+        if let Some(p) = descend {
+            self.start_usage_scan(p);
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -1657,6 +1868,7 @@ impl eframe::App for App {
         self.poll_running();
         self.poll_search(ctx);
         self.poll_pkg(ctx);
+        self.poll_usage(ctx);
         // 拖拽目标每帧重算：它是"这一帧指针悬在哪个目录上"的结论。
         self.drop_target = None;
 
@@ -1710,6 +1922,9 @@ impl eframe::App for App {
                 }
                 if ui.button("⚙ 设置").clicked() {
                     self.open_settings();
+                }
+                if ui.button("📊 空间").clicked() {
+                    self.open_usage();
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2102,6 +2317,7 @@ impl App {
         self.render_mount_dialog(ctx);
         self.render_pkg_panel(ctx);
         self.render_settings(ctx);
+        self.render_usage(ctx);
     }
 
     /// 挂载对话框：类型三选一 + 入参 + 结果反馈。
@@ -3437,6 +3653,57 @@ fn highlight_hit(hit: &crate::search::Hit, style: &egui::Style) -> egui::WidgetT
     );
     job.wrap.max_width = f32::INFINITY;
     egui::WidgetText::from(job)
+}
+
+/// 一根占比条。返回 `true` = 用户点它要下钻。
+///
+/// 条长按**占本层的比例**，标签里同时给绝对值——只有比例的话
+/// "1% 但 40 GB"和"1% 但 400 MB"看起来一模一样，而那正是要分清的两种情况。
+fn bar(ui: &mut egui::Ui, name: &str, bytes: u64, frac: f64, errors: u64, partial: bool) -> bool {
+    let row_h = 22.0;
+    let w = ui.available_width().max(120.0);
+    let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(w, row_h));
+    let resp = ui.interact(
+        rect,
+        ui.id().with(("usage-bar", name)),
+        egui::Sense::click(),
+    );
+    ui.painter()
+        .rect_filled(rect, 5.0, ui.visuals().faint_bg_color);
+    let fill_w = (rect.width() * frac.clamp(0.0, 1.0) as f32).max(2.0);
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, rect.height())),
+        5.0,
+        if resp.hovered() {
+            Color32::from_rgb(0, 102, 204)
+        } else {
+            Color32::from_rgb(0, 122, 255)
+        },
+    );
+    let mut label = format!("{name}  {}  {:.1}%", fmt_size(bytes), frac * 100.0);
+    if errors > 0 {
+        // 读不了的目录不能算成 0：那一支的真实大小只会比显示的更大
+        label.push_str(&format!("  （有 {errors} 处读不了，实际更大）"));
+    }
+    if partial {
+        label.push_str("  ·还在算");
+    }
+    // 标签左对齐画在条上。用 `ui.put` 会居中——它内部是
+    // `Layout::centered_and_justified`（egui 0.31 ui.rs 里写着），
+    // 而占比条的文字居中会盖住"条子有多长"这个信息本身。
+    // 只推进游标、不再 interact 一次：同一块矩形上挂两个身份会串 hover。
+    ui.advance_cursor_after_rect(rect);
+    let color = if frac > 0.35 {
+        Color32::WHITE
+    } else {
+        ui.visuals().text_color()
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label, egui::FontId::proportional(12.0), color);
+    ui.painter()
+        .galley(rect.min + egui::vec2(6.0, 4.0), galley, color);
+    resp.clicked()
 }
 
 /// 详情里的一行：没有值就干脆不写这行，不写"（无）"占满屏。

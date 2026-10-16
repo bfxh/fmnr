@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub mod assoc;
 pub mod autostart;
 pub mod ops;
+pub mod space;
 
 /// 本地文件系统卷：一个盘符/挂载点。核心枚举在进程内完成，不 shell out。
 pub struct LocalVolume {

@@ -194,8 +194,7 @@ pub fn match_target<'a>(apps: &'a [InstalledApp], target: &str) -> Option<&'a In
             cand = a
                 .uninstall_string
                 .as_deref()
-                .and_then(|s| std::path::Path::new(s.trim_matches('"')).parent())
-                .map(|p| norm(&p.display().to_string()));
+                .and_then(|s| dirname_any(s.trim_matches('"')).map(norm));
         }
         let Some(c) = cand.filter(|c| !c.is_empty()) else {
             continue;
@@ -210,6 +209,18 @@ pub fn match_target<'a>(apps: &'a [InstalledApp], target: &str) -> Option<&'a In
         }
     }
     best.map(|(_, a)| a)
+}
+
+/// 取"最后一个分隔符之前"。**不用 `Path::parent`**：
+/// 底账里的路径永远是 Windows 形状（`D:\a\b.exe`），而在非 Windows 上
+/// `Path::parent` 只认 `/`，会把整串当成一个文件名返回 `None`——
+/// 于是同一份数据在两个平台上判出两种结果（CI 的 ubuntu 就是这么抓到的）。
+fn dirname_any(s: &str) -> Option<&str> {
+    let i = s.rfind(['\\', '/'])?;
+    if i == 0 {
+        return None;
+    }
+    Some(&s[..i])
 }
 
 fn norm(s: &str) -> String {
@@ -564,6 +575,16 @@ mod tests {
     /// 199/273 条没有 InstallLocation；这类退到卸载串所在目录。
     #[test]
     fn falls_back_to_the_uninstaller_directory() {
+        // 这条在 ubuntu 上也要能过——它踩的就是"Windows 形状的路径
+        // 在别的平台上用 Path::parent 会判空"那个坑（CI 抓到过一次）。
+        assert_eq!(
+            dirname_any(r"D:\Programs\NoLoc\unins000.exe"),
+            Some(r"D:\Programs\NoLoc")
+        );
+        assert_eq!(dirname_any("/a/b/c"), Some("/a/b"));
+        assert_eq!(dirname_any("no-separator"), None);
+        assert_eq!(dirname_any("/only-root"), None, "根目录之上没有目录");
+
         let apps = vec![app(
             "NoLoc",
             None,
@@ -571,7 +592,7 @@ mod tests {
         )];
         assert_eq!(
             match_target(&apps, r"D:\Programs\NoLoc\app.exe")
-                .unwrap()
+                .expect("非 Windows 平台上也该认出来")
                 .name,
             "NoLoc"
         );
