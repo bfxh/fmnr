@@ -139,6 +139,59 @@ fn header_recognition_is_structural_not_localized() {
     );
 }
 
+/// 夹具**形状**的守卫。这份语料是从真件去个人化来的，最怕的就是
+/// 后来的人为了让某条断言过而去手改它——一改就把它从"观测"降级成"假设"。
+/// 所以把真件里那几个"让解析器必须成立"的性质钉在这里：
+/// 谁把某一格填齐了、把计数行改得和行数不一致了，这条就判红。
+#[test]
+fn fixture_keeps_the_shapes_the_parser_exists_to_handle() {
+    let lines: Vec<&str> = REAL.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(lines.len() >= 5, "夹具不该被删到只剩几行");
+    assert_eq!(
+        lines[0].split_whitespace().count(),
+        5,
+        "表头必须是 5 列：{:?}",
+        lines[0]
+    );
+    assert!(
+        lines[1].chars().all(|c| c == '-') && lines[1].chars().count() >= 100,
+        "第二行必须是那条长横线，拿到 {:?}",
+        lines[1]
+    );
+    let count_line = lines.last().expect("结尾要有汇总行");
+    let announced: usize = count_line
+        .split_whitespace()
+        .find(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+        .and_then(|t| t.parse().ok())
+        .expect("汇总行里要有那个数字");
+
+    let rows = &lines[2..lines.len() - 1];
+    assert_eq!(
+        rows.len(),
+        announced,
+        "数据行数必须等于汇总行里那个数——不相等就是有人手改了语料"
+    );
+
+    // 三个"解析器之所以要从右往左数"的性质，一个都不能被填平
+    assert!(
+        rows.iter()
+            .any(|r| r.split_whitespace().count() > 5 && r.contains("  ")),
+        "至少要有一行名称里带空格（否则从右往左数这条规则失去意义）"
+    );
+    assert!(
+        rows.iter().any(|r| !r.is_ascii()),
+        "至少要有一行非 ASCII 名称（CJK 对齐是真件的一部分）"
+    );
+    // 版本列撑满 ⇒ 两列之间只剩一个空格。找那种"单个空格隔开两个长版本号"的行。
+    assert!(
+        rows.iter().any(|r| {
+            let f: Vec<&str> = r.split_whitespace().collect();
+            f.len() >= 4 && f[f.len() - 3].len() >= 12 && f[f.len() - 2].len() >= 12
+        }),
+        "至少要有一行版本列被撑满（真件里 Edge 那种 13 字符版本号）"
+    );
+}
+
 #[test]
 fn empty_output_is_an_error_not_an_empty_list() {
     assert_eq!(
