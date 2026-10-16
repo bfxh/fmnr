@@ -117,6 +117,13 @@ pub struct App {
     board_cam: crate::board_view::Camera,
     /// 白板上正在拖拽的节点下标
     board_drag: Option<usize>,
+    /// 应用内拖拽：正在拖的那批文件（None = 没在拖）。
+    ///
+    /// 刻意不用 egui 的 `DragAndDrop` payload：它在**释放那一帧**就被清掉，
+    /// 而"落到哪个目录"恰好要在释放那一帧判。自己存一份，时序才说得清。
+    drag: Option<DragPayload>,
+    /// 本帧指针悬在哪个目录上（可以收这次拖拽）。每帧开头清空。
+    drop_target: Option<PathBuf>,
     /// 上一帧的画布区域。用于把「视图中心」换算成画布坐标（钉节点、适应全部）。
     board_viewport: egui::Rect,
 }
@@ -127,7 +134,7 @@ enum ViewMode {
     Board,
 }
 
-#[derive(PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 enum Pane {
     Left,
     Right,
@@ -150,6 +157,15 @@ enum RowAction {
     CopyPath,
     PinToBoard,
     OpenInOtherPane,
+}
+
+/// 一次应用内拖拽搬的那批路径。
+///
+/// 来源目录不单独记栏位——`plan_drop` 从 `paths` 的父目录判原地拖放，
+/// 栏位只是对同一件事的第二种说法，两者不一致时反而不知道该信谁。
+#[derive(Debug, Clone)]
+struct DragPayload {
+    paths: Vec<PathBuf>,
 }
 
 /// 冲突弹窗：已把请求暂存，等用户选策略。
@@ -297,6 +313,8 @@ impl App {
             board: fmnr_core::board::Board::new("default"),
             view: ViewMode::Panes,
             board_cam: crate::board_view::Camera::default(),
+            drag: None,
+            drop_target: None,
             board_drag: None,
             board_viewport: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)),
         };
@@ -1080,6 +1098,8 @@ impl eframe::App for App {
         self.handle_dropped_files(ctx);
         self.poll_running();
         self.poll_search(ctx);
+        // 拖拽目标每帧重算：它是"这一帧指针悬在哪个目录上"的结论。
+        self.drop_target = None;
 
         // 工具栏分两行。原来 12 个控件挤在一行：窄窗口下"排序"下拉直接被裁掉，
         // 而且看不出哪些是"我在哪"、哪些是"对选中的东西动手"。
@@ -1275,6 +1295,49 @@ impl eframe::App for App {
                     self.pane(ui, Pane::Right, half);
                 });
             });
+        }
+
+        // 拖拽落地：释放那一帧才知道目标，而目标正是上面画两栏时记下的。
+        if self.drag.is_some() {
+            let released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+            let copy = ctx.input(|i| i.modifiers.command);
+            if released {
+                self.finish_drag(copy);
+            } else {
+                // 指针位置要在 `ctx.input` 里读出来，但**画图必须在闭包外**：
+                // `Context::input` 拿的是 Context 的写锁，而 `layer_painter()`
+                // （内部 `screen_rect()` → 又一次 `input()`）和 `style()` 也要这把锁。
+                // 写在闭包里的话不是报错而是**整条 UI 线程自锁死**——窗口从此
+                // 不响应、不再出帧，只有拖一下才踩得到。
+                let hover = ctx.input(|i| i.pointer.hover_pos());
+                if let Some(pt) = hover {
+                    let text = match (self.drag.as_ref(), copy) {
+                        (Some(d), true) => format!("复制 {} 项", d.paths.len()),
+                        (Some(d), false) => format!("移动 {} 项", d.paths.len()),
+                        (None, _) => String::new(),
+                    };
+                    if !text.is_empty() {
+                        let style = ctx.style();
+                        let painter = ctx.layer_painter(egui::LayerId::new(
+                            egui::Order::Foreground,
+                            egui::Id::new("drag_ghost"),
+                        ));
+                        let at = pt + egui::vec2(14.0, 14.0);
+                        let g = painter.layout_no_wrap(
+                            text,
+                            egui::FontId::proportional(12.0),
+                            style.visuals.text_color(),
+                        );
+                        let box_rect =
+                            egui::Rect::from_min_size(at, g.size() + egui::vec2(12.0, 6.0));
+                        painter.rect_filled(box_rect, 6.0, style.visuals.widgets.hovered.bg_fill);
+                        painter.galley(at + egui::vec2(6.0, 3.0), g, egui::Color32::PLACEHOLDER);
+                    }
+                }
+                // 拖拽中要连续重绘，否则高亮不跟手、幽灵标签会停在原地。
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                ctx.request_repaint();
+            }
         }
 
         self.render_modals(ctx);
@@ -1937,6 +2000,65 @@ impl App {
         }
     }
 
+    /// 拖拽落地。目标目录是画那一栏时记下来的（`drop_target`）。
+    ///
+    /// 判定复用 `plan_drop`——那是"从外面拖进窗口"用的同一个纯函数
+    /// （路径不存在、原地复制、文件夹拖进自己子树）。两条入口共用一份规则，
+    /// 才不会出现"从外面拖进来被挡住、自己拖过去却把目录套嵌了"。
+    fn finish_drag(&mut self, copy: bool) {
+        let Some(drag) = self.drag.take() else { return };
+        let Some(target) = self.drop_target.take() else {
+            // 松手时没落在任何可接收的目录上：什么都不做，但要说一句，
+            // 否则用户会以为已经搬走了。
+            self.status = "未在目录上松手，未移动".into();
+            return;
+        };
+        let sources = match plan_drop(&drag.paths, &target) {
+            DropPlan::Ignore(reason) => {
+                self.status = reason;
+                return;
+            }
+            DropPlan::Copy(sources) => sources,
+        };
+        let kind = if copy {
+            crate::ops::OpKind::Copy
+        } else {
+            crate::ops::OpKind::Move
+        };
+        if kind == crate::ops::OpKind::Move {
+            if let Some(v) = self.current_volume() {
+                if !v.writable() {
+                    self.status = "这个卷是只读的，不能移动".into();
+                    return;
+                }
+            }
+        }
+        let n = sources.len();
+        let vpaths: Vec<VPath> = sources.into_iter().map(VPath).collect();
+        let conflicts = self.find_conflicts(&vpaths, &target);
+        if !conflicts.is_empty() {
+            // 冲突交给既有的策略弹窗，和粘贴同一条路：不静默覆盖也不静默跳过。
+            self.conflict = Some(ConflictPrompt {
+                kind,
+                sources: vpaths,
+                dest_dir: Some(VPath(target.clone())),
+                conflicting: conflicts,
+                choice: fmnr_core::ConflictPolicy::Rename,
+            });
+            return;
+        }
+        self.start_op(
+            kind,
+            vpaths,
+            Some(VPath(target.clone())),
+            fmnr_core::ConflictPolicy::Skip,
+        );
+        if self.running.is_some() {
+            let verb = if copy { "拖放复制" } else { "拖放移动" };
+            self.status = format!("{verb} {n} 项 → {}", target.display());
+        }
+    }
+
     fn other_pane_path(&self) -> PathBuf {
         match self.active_pane {
             Pane::Left => self.right_path.clone(),
@@ -2384,6 +2506,11 @@ impl App {
                     .map(|e| self.icons.get(&ctx, &e.icon_key))
                     .collect();
 
+                // 归档/远程卷里那些是虚拟路径，落地要用的本地文件系统操作对不上，
+                // 所以干脆不发起拖拽——比"拖得动、松手没反应"诚实。
+                // 必须在下面 `selected` 的可变借用之前问，否则 self 会被同时借两次。
+                let can_drag = local_walkable(self.current_volume().map(|v| v.kind()));
+
                 let selected = match which {
                     Pane::Left => &mut self.left_selected,
                     Pane::Right => &mut self.right_selected,
@@ -2397,6 +2524,13 @@ impl App {
                 // 闭包内不借用 self（避免与 selected 冲突），事件收集到闭包外处理。
                 let mut dbl_pick: Option<(String, bool)> = None;
                 let mut row_action: Option<(RowAction, PathBuf, bool)> = None;
+                // 拖拽要跨帧：起点在这一帧记下来，落地由 update() 在释放那一帧处理。
+                let dragging = self.drag.is_some();
+                let pointer = ui.ctx().input(|i| i.pointer.hover_pos());
+                let mut drag_began: Option<DragPayload> = None;
+                let mut drop_hit: Option<PathBuf> = None;
+                // 整栏区域：空白处（行下方）松手算「搬进这一栏正在看的目录」。
+                let list_rect = ui.max_rect();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, true])
                     .show_rows(ui, row_h, entries.len(), |ui, row_range| {
@@ -2405,6 +2539,8 @@ impl App {
                             let badge = badges[i].as_ref();
                             let icon = icon_handles[i].clone();
                             let is_sel = selected.as_deref() == Some(e.name.as_str());
+                            let full = base.join(&e.name);
+                            let is_dir = e.is_dir;
 
                             // 命中区 = 整行，不只是文件名。
                             // `ui.horizontal(...).response` 的 Sense 是 hover，
@@ -2416,16 +2552,36 @@ impl App {
                             let resp = ui.interact(
                                 row_rect,
                                 ui.id().with(("row", e.name.as_str())),
-                                egui::Sense::click(),
+                                // click_and_drag：只有 click 的话 drag_started() 永不成立。
+                                egui::Sense::click_and_drag(),
                             );
-                            if is_sel || resp.hovered() {
+                            // 拖拽悬停判定用指针坐标，不用 resp.hovered()：
+                            // 有东西正在被拖时，egui 会把别的 widget 的 hovered 压掉。
+                            let is_drop_target = dragging
+                                && is_dir
+                                && pointer.is_some_and(|pt| row_rect.contains(pt));
+                            if is_drop_target {
+                                drop_hit = Some(full.clone());
+                            }
+                            if is_sel || resp.hovered() || is_drop_target {
                                 // 底色必须画在文字之前，否则色块把字盖住。
-                                let fill = if is_sel {
+                                let fill = if is_drop_target {
+                                    ui.visuals().widgets.active.bg_fill
+                                } else if is_sel {
                                     ui.visuals().selection.bg_fill
                                 } else {
                                     ui.visuals().faint_bg_color
                                 };
                                 ui.painter().rect_filled(row_rect, 6.0, fill);
+                                if is_drop_target {
+                                    // 只换个底色看不出一松手会发生什么，所以补一圈描边。
+                                    ui.painter().rect_stroke(
+                                        row_rect,
+                                        6.0,
+                                        egui::Stroke::new(1.0_f32, Color32::from_rgb(0, 122, 255)),
+                                        egui::StrokeKind::Middle,
+                                    );
+                                }
                             }
 
                             ui.horizontal(|ui| {
@@ -2486,10 +2642,13 @@ impl App {
                             if resp.clicked() && !resp.double_clicked() {
                                 *selected = Some(e.name.clone());
                             }
+                            if resp.drag_started() && can_drag {
+                                drag_began = Some(DragPayload {
+                                    paths: vec![full.clone()],
+                                });
+                            }
                             // 右键先选中再弹菜单：否则菜单动的是"上一次点的行"，
                             // 而用户的眼睛停在他刚右键的那一行上。
-                            let full = base.join(&e.name);
-                            let is_dir = e.is_dir;
                             if resp.secondary_clicked() {
                                 *selected = Some(e.name.clone());
                             }
@@ -2519,6 +2678,28 @@ impl App {
                             });
                         }
                     });
+
+                if let Some(d) = drag_began {
+                    self.drag = Some(d);
+                }
+                // 没落在任何文件夹行上、但落点还在这一栏里，且这一栏确实列出了
+                // 内容（列失败时 base 可能根本不存在）：目标是这一栏正在看的目录。
+                if drop_hit.is_none() && dragging && error.is_none() {
+                    if let Some(pt) = pointer {
+                        if list_rect.contains(pt) {
+                            drop_hit = Some(base.clone());
+                            ui.painter().rect_stroke(
+                                list_rect.shrink(2.0),
+                                6.0,
+                                egui::Stroke::new(1.0_f32, Color32::from_rgb(0, 122, 255)),
+                                egui::StrokeKind::Middle,
+                            );
+                        }
+                    }
+                }
+                if drop_hit.is_some() {
+                    self.drop_target = drop_hit;
+                }
 
                 // 先把要用的结论取出来：`entries` 借的是 self 的列表字段，
                 // 而下面的 enter() 会重新列目录（可变借用 self），两者不能重叠。
