@@ -119,6 +119,10 @@ pub struct App {
     /// 当前在看哪一层（点占比条会下钻，面包屑回上级）。
     /// 和扫描的 root 是同一个东西：下钻=重起一次以它为根的扫描。
     usage_root: PathBuf,
+    /// 自启动管理（顶栏常驻入口）。`None` = 还没读。
+    startup_open: bool,
+    startup: Option<fmnr_fs::startup::StartupInventory>,
+    startup_error: Option<String>,
     /// 自启动状态。`None` = 还没读；读失败走 `autostart_error` 而不是当成"没开"——
     /// 把"读不到"显示成"未开启"会诱导用户去点开启，然后覆盖一个他看不见的项。
     autostart_status: Option<fmnr_fs::autostart::Status>,
@@ -365,6 +369,9 @@ impl App {
             usage_open: false,
             usage: None,
             usage_root: PathBuf::new(),
+            startup_open: false,
+            startup: None,
+            startup_error: None,
             autostart_status: None,
             autostart_error: None,
             self_exe: std::env::current_exe().unwrap_or_default(),
@@ -1855,6 +1862,123 @@ impl App {
             self.start_usage_scan(p);
         }
     }
+
+    fn open_startup(&mut self) {
+        self.startup_open = true;
+        if self.startup.is_none() {
+            self.reload_startup();
+        }
+    }
+
+    fn reload_startup(&mut self) {
+        match fmnr_fs::startup::list() {
+            Ok(inv) => {
+                self.startup = Some(inv);
+                self.startup_error = None;
+            }
+            Err(e) => {
+                self.startup = None;
+                self.startup_error = Some(e.to_string());
+            }
+        }
+    }
+
+    /// 自启动管理器：全量列出，用户级的可开关，机器级只读并说明原因。
+    fn render_startup(&mut self, ctx: &egui::Context) {
+        if !self.startup_open {
+            return;
+        }
+        // 先取成 owned 值：闭包里要按名字回写 self.startup 之外的字段
+        let inv = self.startup.clone();
+        let err = self.startup_error.clone();
+        let mut toggle: Option<(fmnr_fs::startup::StartupItem, bool)> = None;
+        let mut want_reload = false;
+        let mut open = self.startup_open;
+
+        egui::Window::new("开机自启动")
+            .id(egui::Id::new("startup"))
+            .default_size([620.0, 420.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("重新读取").clicked() {
+                        want_reload = true;
+                    }
+                    ui.label(
+                        egui::RichText::new("关掉一项会先把它的命令行抄进 HKCU\\Software\\fmnr\\startup-off 再删，所以能开回来。")
+                            .size(12.0)
+                            .weak(),
+                    );
+                });
+                if let Some(e) = err {
+                    let c = ui.visuals().error_fg_color;
+                    ui.colored_label(c, e);
+                }
+                let Some(inv) = inv else {
+                    return;
+                };
+                for w in &inv.warnings {
+                    ui.colored_label(Color32::from_rgb(230, 89, 38), format!("有一处没读到：{w}"));
+                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let mut last: Option<fmnr_fs::startup::Origin> = None;
+                        for it in &inv.items {
+                            if Some(it.origin) != last {
+                                last = Some(it.origin);
+                                ui.separator();
+                                ui.label(egui::RichText::new(it.origin.label()).strong());
+                            }
+                            ui.horizontal(|ui| {
+                                let name = if it.turned_off_by_us {
+                                    format!("（已关）{}", it.name)
+                                } else {
+                                    it.name.clone()
+                                };
+                                ui.label(name);
+                                if it.origin.editable() {
+                                    let verb = if it.turned_off_by_us { "开回来" } else { "关掉" };
+                                    if ui.button(verb).clicked() {
+                                        toggle = Some((it.clone(), it.turned_off_by_us));
+                                    }
+                                } else if let Some(r) = it.origin.reason() {
+                                    ui.weak(r);
+                                }
+                            });
+                            ui.label(
+                                egui::RichText::new(it.command.clone()).size(11.0).weak(),
+                            );
+                        }
+                    });
+            });
+
+        self.startup_open = open;
+        if want_reload {
+            self.reload_startup();
+        }
+        if let Some((item, was_off)) = toggle {
+            let res = if was_off {
+                fmnr_fs::startup::turn_on(&item)
+            } else {
+                fmnr_fs::startup::turn_off(&item)
+            };
+            match res {
+                Ok(n) => {
+                    self.status = if was_off {
+                        format!("已开回「{}」（{n} 步）", item.name)
+                    } else {
+                        format!("已关掉「{}」，原值存在镜像里（{n} 步）", item.name)
+                    };
+                    self.reload_startup();
+                }
+                Err(e) => {
+                    self.status = format!("调整「{}」失败：{e}", item.name);
+                    self.reload_startup();
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -1925,6 +2049,11 @@ impl eframe::App for App {
                 }
                 if ui.button("📊 空间").clicked() {
                     self.open_usage();
+                }
+                // 自启动放在顶栏常驻，不藏进设置面板：用户要的是"随时能看到、
+                // 随时能改"，而藏在设置里等于每次都要开一个窗口再翻一层。
+                if ui.button("🚀 自启动").clicked() {
+                    self.open_startup();
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2318,6 +2447,7 @@ impl App {
         self.render_pkg_panel(ctx);
         self.render_settings(ctx);
         self.render_usage(ctx);
+        self.render_startup(ctx);
     }
 
     /// 挂载对话框：类型三选一 + 入参 + 结果反馈。

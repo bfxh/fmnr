@@ -221,7 +221,7 @@ pub(crate) fn wide(s: &str) -> Vec<u16> {
 }
 
 #[cfg(windows)]
-fn set_hkcu(subkey: &str, name: &str, value: &RegValue) -> Result<()> {
+pub(crate) fn set_hkcu(subkey: &str, name: &str, value: &RegValue) -> Result<()> {
     use windows::Win32::Foundation::ERROR_SUCCESS;
     use windows::Win32::System::Registry::{
         RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_WRITE,
@@ -280,7 +280,7 @@ fn set_hkcu(subkey: &str, name: &str, value: &RegValue) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn delete_hkcu_value(subkey: &str, name: &str) -> Result<()> {
+pub(crate) fn delete_hkcu_value(subkey: &str, name: &str) -> Result<()> {
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS};
     use windows::Win32::System::Registry::{RegDeleteKeyValueW, HKEY_CURRENT_USER};
 
@@ -320,6 +320,113 @@ fn delete_hkcu_tree(subkey: &str) -> Result<()> {
             "RegDeleteTreeW({subkey}) 失败：{rc:?}"
         )))
     }
+}
+
+// ── 给同 crate 的其他模块用的注册表小工具 ─────────────────────────────
+// `startup` 要读/写 HKCU 与 HKLM 下的具名值。这里集中一份，
+// 免得每个模块各自抄一遍 RegSetValueExW 的 UTF-16 字节重解释——
+// 那种抄写最容易漏的是"删值不能删键"这条。
+
+/// 写一个 REG_SZ。
+pub(crate) fn set_hkcu_str(subkey: &str, name: &str, value: &str) -> Result<()> {
+    set_hkcu(subkey, name, &RegValue::Sz(value.to_string()))
+}
+
+/// 读一个 HKCU 下的 REG_SZ / REG_EXPAND_SZ；值或键不存在时 `Ok(None)`。
+#[cfg(windows)]
+pub(crate) fn get_hkcu_str(subkey: &str, name: &str) -> Result<Option<String>> {
+    read_value(
+        windows::Win32::System::Registry::HKEY_CURRENT_USER,
+        subkey,
+        name,
+    )
+}
+
+#[cfg(not(windows))]
+pub(crate) fn get_hkcu_str(_subkey: &str, _name: &str) -> Result<Option<String>> {
+    Ok(None)
+}
+
+/// 同上，但读 HKLM。只读——写机器级要管理员，本程序不提权。
+#[cfg(windows)]
+pub(crate) fn get_hklm_str(subkey: &str, name: &str) -> Result<Option<String>> {
+    read_value(
+        windows::Win32::System::Registry::HKEY_LOCAL_MACHINE,
+        subkey,
+        name,
+    )
+}
+
+#[cfg(not(windows))]
+pub(crate) fn get_hklm_str(_subkey: &str, _name: &str) -> Result<Option<String>> {
+    Ok(None)
+}
+
+/// `RegGetValueW` 两步取：先问长度，再按长度取值。
+///
+/// 长度用 `div_ceil(2)`：`pcbData` 报的是**字节**数（含结尾那个 UTF-16 NUL），
+/// 直接除 2 会在奇数字节时少留一格，`from_utf16_lossy` 就会吞掉半个码元。
+#[cfg(windows)]
+fn read_value(
+    hive: windows::Win32::System::Registry::HKEY,
+    subkey: &str,
+    name: &str,
+) -> Result<Option<String>> {
+    use std::ffi::c_void;
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use windows::Win32::System::Registry::{RegGetValueW, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ};
+
+    let sub = wide(subkey);
+    let val = wide(name);
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
+
+    let mut len: u32 = 0;
+    let rc = unsafe {
+        RegGetValueW(
+            hive,
+            windows::core::PCWSTR(sub.as_ptr()),
+            windows::core::PCWSTR(val.as_ptr()),
+            flags,
+            None,
+            None,
+            Some(&mut len),
+        )
+    };
+    if rc == ERROR_FILE_NOT_FOUND {
+        return Ok(None);
+    }
+    if rc != ERROR_SUCCESS {
+        return Err(Error::Other(format!(
+            "RegGetValueW 问长度({subkey}\\{name}) 失败：{rc:?}"
+        )));
+    }
+    let mut buf: Vec<u16> = vec![0u16; (len as usize).div_ceil(2) + 1];
+    let mut out_len = len;
+    let rc = unsafe {
+        RegGetValueW(
+            hive,
+            windows::core::PCWSTR(sub.as_ptr()),
+            windows::core::PCWSTR(val.as_ptr()),
+            flags,
+            None,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            Some(&mut out_len),
+        )
+    };
+    if rc == ERROR_FILE_NOT_FOUND {
+        return Ok(None);
+    }
+    if rc != ERROR_SUCCESS {
+        return Err(Error::Other(format!(
+            "RegGetValueW({subkey}\\{name}) 失败：{rc:?}"
+        )));
+    }
+    let chars = (out_len as usize).div_ceil(2).min(buf.len());
+    Ok(Some(
+        String::from_utf16_lossy(&buf[..chars])
+            .trim_end_matches('\0')
+            .to_string(),
+    ))
 }
 
 #[cfg(test)]
