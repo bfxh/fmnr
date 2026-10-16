@@ -26,7 +26,13 @@ fn real_output_reads_every_row() {
     assert_eq!(rows.len(), 11, "整份表格的行数");
     assert_eq!(
         rows[0],
-        row("AlphaTool", "vendor-a.alphatool", "0.5.2", "0.5.7", "winget")
+        row(
+            "AlphaTool",
+            "vendor-a.alphatool",
+            "0.5.2",
+            "0.5.7",
+            "winget"
+        )
     );
     assert_eq!(
         rows[10],
@@ -69,7 +75,13 @@ fn names_with_spaces_and_overflowed_version_columns() {
     );
     assert_eq!(
         rows[5],
-        row("Helper 0.4.8", "vendor-e.helper", "0.4.8", "1.106.3", "winget")
+        row(
+            "Helper 0.4.8",
+            "vendor-e.helper",
+            "0.4.8",
+            "1.106.3",
+            "winget"
+        )
     );
 }
 
