@@ -173,7 +173,20 @@ fn copy_file(src: &Path, dest: &Path, progress: &Progress) -> Result<()> {
 
     let mut reader = std::fs::File::open(src).map_err(Error::Io)?;
     let mut writer = std::fs::File::create(dest).map_err(Error::Io)?;
-    let mut buf = vec![0u8; BUF_SIZE];
+
+    // 缓冲区按**文件大小**封顶，不无脑开满 BUF_SIZE。
+    // 实测判据（`cargo run -p fmnr-bench --bin io_throughput`）：原先每个文件都
+    // `vec![0u8; 1 MiB]`，而 `vec![0u8; n]` 会把 n 字节**全部清零**，
+    // 于是拷 2000 个 64 KiB 小文件要先白刷约 2 GiB —— 吞吐 51 MiB/s，
+    // 而同盘 `std::fs::copy` 参照是 114 MiB/s（慢 2.24×）。
+    // 大文件那一档改前改后都贴着盘的上限（113.8 vs 113.5），所以这不是白调参数。
+    let len = reader.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+    let cap = if len == 0 {
+        BUF_SIZE
+    } else {
+        len.min(BUF_SIZE)
+    };
+    let mut buf = vec![0u8; cap];
 
     loop {
         if progress.is_cancelled() {
@@ -210,6 +223,47 @@ pub fn dest_inside_source(src: &Path, dest_dir: &Path) -> bool {
 }
 
 /// 批量拷贝/移动的共享实现。`remove_src=true` 即移动。
+/// 同卷移动走 `rename`：一次元数据操作，**不搬数据**。
+///
+/// 为什么专门加这条：实测原先 move 一棵 256 MiB 子树要 1.32 s（193 MiB/s），
+/// 那就是「整树逐字节拷一份 + 再删源」——数据被搬了两遍，
+/// 而操作系统本来一次 rename 就能做完，且耗时与体积无关。
+///
+/// 返回 `Ok(Some(_))` 表示已由快速路径处理完；`Ok(None)` 表示**不适用**，
+/// 调用方走原来的整树拷贝。不适用的几种情况都要保守判定，因为这条路径
+/// 一旦误用，症状是「文件凭空消失」：
+/// - 源是符号链接：`copy_tree` 对符号链接返回 `Skipped`（不跟随），
+///   而 `rename` 会把链接本身搬走 ⇒ 语义变了，不能快。
+/// - 目标已存在：`rename` 在 Windows 上对已存在目录直接失败，
+///   在 Unix 上可能把两个目录**合并**，两边都不是我们要的。
+/// - `rename` 本身失败（跨卷 `ERROR_NOT_SAME_DEVICE`、权限等）：退回拷贝。
+fn try_rename_move(src: &Path, dest: &Path, progress: &Progress) -> Result<Option<ItemOutcome>> {
+    let meta = std::fs::symlink_metadata(src).map_err(Error::Io)?;
+    if meta.is_symlink() {
+        return Ok(None);
+    }
+    if dest.exists() {
+        return Ok(None);
+    }
+
+    // rename 失败**不是错误**，是「这条快速路径不适用」的信号：
+    // 跨卷移动时它必然失败（Windows `ERROR_NOT_SAME_DEVICE` / Unix `EXDEV`），
+    // 那时正确行为就是退回整树拷贝。这里若把错误 `?` 抛出去，
+    // 症状会是「往 U 盘移动文件直接报错」，而不是安静地走慢路径。
+    if std::fs::rename(src, dest).is_err() {
+        return Ok(None);
+    }
+
+    // 数据没搬，但进度要照实结清：分母是 transfer 预先算好的总量，
+    // 这里按同一口径把字节与文件数补上，否则进度条会停在 0。
+    let (bytes, files) = dir_stats(dest);
+    progress.add_bytes(bytes);
+    for _ in 0..files {
+        progress.add_file();
+    }
+    Ok(Some(ItemOutcome::Done))
+}
+
 pub fn transfer(
     sources: &[PathBuf],
     dest_dir: &Path,
@@ -266,10 +320,20 @@ pub fn transfer(
         }
 
         let before = progress.snapshot().bytes_done;
-        let outcome = match copy_tree(src, &dest, progress, remove_src) {
-            Ok(o) => o,
-            Err(Error::Other(msg)) if msg == "cancelled" => ItemOutcome::Aborted,
-            Err(e) => return Err(e),
+        // move 才试快速路径；copy 没有「源消失」这条退路可换。
+        // rename 失败不致命：跨卷时它必然失败，那时退回整树拷贝就是正确行为。
+        let fast = if remove_src {
+            try_rename_move(src, &dest, progress)?
+        } else {
+            None
+        };
+        let outcome = match fast {
+            Some(o) => o,
+            None => match copy_tree(src, &dest, progress, remove_src) {
+                Ok(o) => o,
+                Err(Error::Other(msg)) if msg == "cancelled" => ItemOutcome::Aborted,
+                Err(e) => return Err(e),
+            },
         };
         let delta = progress.snapshot().bytes_done.saturating_sub(before);
         outcome.merge_into(&mut report, delta);
@@ -535,6 +599,103 @@ mod tests {
         assert_eq!(snap.bytes_total, snap.bytes_done);
         assert_eq!(snap.files_total, snap.files_done);
         assert_eq!(snap.fraction(), 1.0);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 移动一棵子树：源消失、目标内容完整、进度结清。
+    ///
+    /// 这条钉的是**加了 rename 快速路径之后**语义没变。
+    /// 快速路径误用的症状是「文件凭空消失」，所以内容也要逐字节比。
+    #[test]
+    fn move_tree_relocates_content_and_removes_source() {
+        let d = tmpdir("mvfast");
+        let src = d.join("tree");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"AAA").unwrap();
+        std::fs::write(src.join("sub/b.txt"), b"BBBB").unwrap();
+        let dst = d.join("out");
+
+        let progress = Progress::new();
+        let report = transfer(
+            std::slice::from_ref(&src),
+            &dst,
+            ConflictPolicy::Skip,
+            &progress,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(report.done, 1);
+        assert!(!src.exists(), "移动后源不该还在");
+        assert_eq!(std::fs::read(dst.join("tree/a.txt")).unwrap(), b"AAA");
+        assert_eq!(std::fs::read(dst.join("tree/sub/b.txt")).unwrap(), b"BBBB");
+        // 走 rename 时数据没被搬运，但进度必须照实结清，否则 UI 停在 0%。
+        let snap = progress.snapshot();
+        assert_eq!(snap.bytes_total, snap.bytes_done, "rename 路径也要结清字节");
+        assert_eq!(
+            snap.files_total, snap.files_done,
+            "rename 路径也要结清文件数"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 快速路径**不该**改变冲突策略的行为：目标已存在时仍按 Skip/Rename 处理。
+    #[test]
+    fn move_respects_conflict_policy_with_rename_path() {
+        let d = tmpdir("mvconflict");
+        let src = d.join("s");
+        let dst = d.join("d");
+        std::fs::create_dir_all(&src).unwrap();
+        // 目标侧要预先存在 `d/s/x.txt`，才构成「同名冲突」这个场景。
+        std::fs::create_dir_all(dst.join("s")).unwrap();
+        std::fs::write(src.join("x.txt"), b"new").unwrap();
+        std::fs::write(dst.join("s").join("x.txt"), b"old").unwrap();
+
+        // Skip：目标已存在 ⇒ 跳过，且**源必须保留**（不能先 rename 再发现冲突）
+        let progress = Progress::new();
+        let report = transfer(
+            std::slice::from_ref(&src),
+            &dst,
+            ConflictPolicy::Skip,
+            &progress,
+            true,
+        )
+        .unwrap();
+        assert_eq!(report.skipped, 1, "同名目标存在时 Skip 应跳过：{report:?}");
+        assert!(src.exists(), "被跳过的源不该消失");
+        assert_eq!(
+            std::fs::read(dst.join("s/x.txt")).unwrap(),
+            b"old",
+            "不该覆盖"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 符号链接**不能**走 rename：`copy_tree` 对它的语义是「不跟随、跳过」，
+    /// 而 rename 会把链接本身搬走 —— 那是行为改变。
+    #[test]
+    fn move_does_not_relocate_symlinks() {
+        let d = tmpdir("mvlink");
+        let target = d.join("real.txt");
+        std::fs::write(&target, b"data").unwrap();
+        let link = d.join("link.txt");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &link).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let progress = Progress::new();
+        let report = transfer(
+            std::slice::from_ref(&link),
+            &d.join("out"),
+            ConflictPolicy::Skip,
+            &progress,
+            true,
+        )
+        .unwrap();
+        // 与加快速路径之前一致：符号链接被 Skipped，链接本身留在原地。
+        assert_eq!(report.done, 0, "符号链接不该被搬走：{report:?}");
+        assert!(link.exists(), "符号链接必须留在原地（copy_tree 不跟随它）");
         std::fs::remove_dir_all(&d).ok();
     }
 
