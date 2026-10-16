@@ -86,6 +86,10 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
 下一步的实测盘点与取舍见 [`docs/UI-NEXT.md`](docs/UI-NEXT.md)
 （缺口清单按 grep 证据列、顺带查出两个真缺陷、磁盘占用视图与包更新提示的可行性数字）。
 
+[`docs/NEXT-BATCH.md`](docs/NEXT-BATCH.md)：跨设备连接、7z 与"比它更强"、重复文件、
+加密与文件锁、卸载残留、MCP 是不是瓶颈——每条标了一手来源/推断/未找到，
+并写明哪三条我不同意提法本身（§6 尤其）。
+
 ---
 
 ## 里程碑
