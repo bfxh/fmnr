@@ -76,10 +76,44 @@ impl ArchiveVolume {
     }
 
     /// 卷内路径的**规范化**key：以 `/` 分隔、无前导斜杠。
+    ///
+    /// 三种入法都要认（少一种就有一条入口暗断）：
+    /// - 纯卷内相对路径 `sub/dir`（UI 面包屑就是这么传的）；
+    /// - 带卷前缀的完整路径 `archive:<archive_path>/sub/dir`（MCP 客户端、
+    ///   CLI 卷路由都按卷 id 前缀传）；
+    /// - `archive:` 本身 = 卷根。
+    ///
+    /// 老实现只认 `archive:/` 前缀，在 **Windows 盘符**下剥不掉
+    /// （`archive:D:/x.zip` 不以 `archive:/` 开头），整个归档路径漏进 key
+    /// ⇒ 必挂 NotFound（实测 `fmnr ls archive:D:\x.zip` 报 not found 即此）。
+    /// 用大小写敏感的 `strip_prefix`：入参前缀来自卷 id，与 archive_path
+    /// 出自同一串必然一致；折叠大小写再切片反而有长度变化的 panic 风险。
     fn key_of(&self, path: &VPath) -> String {
         let raw = path.0.to_string_lossy().replace('\\', "/");
-        let stripped = raw.strip_prefix("archive:/").unwrap_or(&raw);
-        stripped.trim_start_matches('/').to_string()
+        let Some(rest) = raw.strip_prefix("archive:") else {
+            return raw.trim_start_matches('/').to_string();
+        };
+        let rest = rest.trim_start_matches('/');
+        if rest.is_empty() {
+            return String::new();
+        }
+        let ap = self
+            .archive_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_start_matches('/')
+            .to_string();
+        if let Some(tail) = rest.strip_prefix(&ap) {
+            if tail.is_empty() {
+                return String::new();
+            }
+            // 归档路径后必须紧跟子路径分隔；`x.zip2` 这种同前缀名不算。
+            if let Some(sub) = tail.strip_prefix('/') {
+                return sub.to_string();
+            }
+        }
+        // 其余情况按纯卷内相对路径（与旧行为一致，不把存量契约测红）。
+        rest.to_string()
     }
 }
 

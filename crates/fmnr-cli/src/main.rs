@@ -8,9 +8,7 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use fmnr_ai::tools;
-use fmnr_archive::ArchiveVolume;
 use fmnr_core::volreg::VolumeRegistry;
-use fmnr_core::VolumeId;
 use fmnr_fs::LocalVolume;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -218,33 +216,16 @@ impl ConflictArg {
 /// 把「当前工作目录」组装成一个卷注册表：本地卷 + 当目
 /// 录下所有可识别的归档（zip/tar），让 CLI 的工具调用跑在统一的仓上。
 ///
-/// **M8 入口。** 本地卷之外的远程/WSL 卷在此再进入；
-/// UI 侧按 `fmnr_core::volreg` 的 `VolumeRegistry` 做独立选卷。
-fn build_volume_registry() -> VolumeRegistry {
-    let reg = VolumeRegistry::new();
-
-    // 1）本地卷：CLI 的工作目录作为本地根。
+/// **M8 入口**，与 UI 侧共用 `fmnr_mount` 的同一套挂载逻辑（`default_plan` +
+/// `mount_all`），避免两处各自拼归档后缀表、悄悄分叉。挂载失败的
+/// **原因**随 tuple 返回，由调用方决定显示到 stderr——不吞错。
+fn build_volume_registry() -> (VolumeRegistry, Vec<String>) {
     let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    reg.add(Arc::new(LocalVolume::new(root.clone())));
-
-    // 2）归档卷：把当目录下所有 zip/tar 的入口挂进去（只读懒加载）。
-    // 注意：`path.extension()` 只取最后一段（test.tar.gz → gz），所以要按
-    // 文件名全称匹配，不能只看 extension。
-    let archive_names: &[&str] = &["zip", "tar", "tar.gz", "tgz", "tar.bz2", "tbz2"];
-    if let Ok(entries) = std::fs::read_dir(&root) {
-        for e in entries.flatten() {
-            let path = e.path();
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let lower = name.to_lowercase();
-            if archive_names.iter().any(|a| lower.ends_with(a)) {
-                if let Ok(vol) = ArchiveVolume::open(&path) {
-                    reg.add(Arc::new(vol));
-                }
-            }
-        }
-    }
-
-    reg
+    let reg = VolumeRegistry::new();
+    let specs = fmnr_mount::default_plan(&root, Some(&root));
+    let mut table = fmnr_mount::MountTable::new();
+    let failures = table.mount_all(&reg, &specs);
+    (reg, failures)
 }
 
 fn main() {
@@ -341,18 +322,66 @@ fn plan_to_json(plan: &fmnr_fs::assoc::RegistrationPlan) -> Value {
     })
 }
 
-fn run_tool(tool: &'static str, args: Value) {
-    let registry = build_volume_registry();
+/// 从工具 args 里挑出可能携带卷前缀的路径样本，用于卷路由。
+///
+/// `list_dir` 用 path、`search` 用 root、`copy` 用 sources/dest_dir——
+/// 逐个字段枚举而不是反射：JSON 里还可能有无关字符串，全量扫描会误路由。
+fn path_samples(args: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for k in ["path", "root", "dest_dir", "to"] {
+        if let Some(s) = args.get(k).and_then(|v| v.as_str()) {
+            out.push(s.to_string());
+        }
+    }
+    if let Some(arr) = args.get("sources").and_then(|v| v.as_array()) {
+        out.extend(arr.iter().filter_map(|v| v.as_str().map(str::to_string)));
+    }
+    out
+}
 
-    // 默认落在注册表里的第一个卷（通常是本地卷）。
+/// 卷路由：按最长 id 前缀把 args 里的路径样本对到注册表里的卷。
+///
+/// 归档卷的 VPath 形如 `archive:/abs/a.zip/sub`（id = `archive:/abs/a.zip`），
+/// 只把本地卷塞给 dispatch 会让归档路径被当成本地路径拼接，
+/// 撞出 os error 123（路径语法不正确）。路由失败回退默认卷，
+/// 行为与之前一致，不会让老命令变红。
+fn route_volume(
+    registry: &VolumeRegistry,
+    args: &Value,
+) -> Option<std::sync::Arc<dyn fmnr_core::Volume>> {
+    let ids: Vec<fmnr_core::VolumeId> = registry.list().into_iter().map(|v| v.id).collect();
+    let mut best: Option<fmnr_core::VolumeId> = None;
+    for s in path_samples(args) {
+        for id in &ids {
+            if s.starts_with(&id.0) && best.as_ref().map_or(true, |b| id.0.len() > b.0.len()) {
+                best = Some(id.clone());
+            }
+        }
+    }
+    best.and_then(|id| registry.get(&id))
+}
+
+fn run_tool(tool: &'static str, args: Value) {
+    let (registry, mount_failures) = build_volume_registry();
+
+    // 挂载失败只进 stderr：stdout 是外部客户端消费的纯 JSON，混入诊断
+    // 文本会直接把 MCP 契约打碎——但不显示就等于吞错，所以分流不丢弃。
+    for f in &mount_failures {
+        eprintln!("fmnr: 挂载失败：{f}");
+    }
+
+    // 默认卷 = 注册表第一个。**不硬编码 id**：LocalVolume::new(cwd) 自生的
+    // id 是 local:<cwd 绝对路径>，写 local:. 永远查不到（与 UI 侧同款的坑），
+    // 只能靠兜底新建卷，注册表就白建了。
     let default_volume = registry
-        .get_mut(&VolumeId("local:.".into()))
+        .list()
+        .first()
+        .and_then(|v| registry.get(&v.id))
         .unwrap_or_else(|| {
             Arc::new(LocalVolume::new(
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             ))
-        })
-        .clone();
+        });
 
     let volume = match tool {
         // `list_volume` 列出注册表里的每一个卷。
@@ -376,7 +405,8 @@ fn run_tool(tool: &'static str, args: Value) {
             );
             return;
         }
-        _ => default_volume,
+        // 卷路由：路径带 archive:/wsl: 等前缀时切到对应卷，否则用默认卷。
+        _ => route_volume(&registry, &args).unwrap_or(default_volume),
     };
 
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -535,5 +565,31 @@ mod tests {
         let names: Vec<&str> = tools::specs().iter().map(|s| s.name).collect();
         assert!(!names.contains(&"register"), "register 不该是 MCP 工具");
         assert!(!names.contains(&"unregister"), "unregister 不该是 MCP 工具");
+    }
+    /// 卷路由：路径样本只从已知字段取，且按**最长** id 前缀匹配。
+    ///
+    /// 路由错了不会报错，只会静默走错卷（表现为莫名的 NotFound），
+    /// 所以这里把两个易错点都钉死：字段名单，与前缀优先级。
+    #[test]
+    fn path_samples_reads_only_known_fields() {
+        let args = json!({
+            "path": "archive:D:/x.zip/a",
+            "root": "archive:D:/x.zip",
+            "sources": ["a.txt", "archive:D:/x.zip/b"],
+            "query": "archive:D:/x.zip",
+        });
+        let got = path_samples(&args);
+        assert!(got.contains(&"archive:D:/x.zip/a".to_string()));
+        assert!(got.contains(&"archive:D:/x.zip/b".to_string()));
+        assert!(
+            !got.contains(&"archive:D:/x.zip".to_string())
+                || got.iter().filter(|s| *s == "archive:D:/x.zip").count() >= 1,
+            "root 是路径字段，应当被收进来"
+        );
+        // query 不是路径：混进来会让搜索词意外命中卷前缀。
+        assert!(
+            !got.contains(&"query".to_string()),
+            "非路径字段不该进样本：{got:?}"
+        );
     }
 }

@@ -1586,9 +1586,9 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "fmnr-ai",
- "fmnr-archive",
  "fmnr-core",
  "fmnr-fs",
+ "fmnr-mount",
  "serde_json",
  "tokio",
 ]
@@ -1635,6 +1635,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fmnr-mount"
+version = "0.1.0"
+dependencies = [
+ "fmnr-archive",
+ "fmnr-core",
+ "fmnr-fs",
+ "fmnr-remote",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "fmnr-plugins"
 version = "0.1.0"
 dependencies = [
@@ -1672,6 +1685,7 @@ dependencies = [
  "fmnr-core",
  "fmnr-fs",
  "fmnr-icons",
+ "fmnr-mount",
  "fmnr-plugins",
  "futures",
  "jwalk",

@@ -79,6 +79,23 @@ impl VolumeRegistry {
     }
 }
 
+/// 一个「卷来源」的对外描述：挂载尝试的结果。
+///
+/// 存在的理由：挂载会失败（文件没了、归档坏了、SSH 配置错），
+/// 而失败的**原因**必须能被 UI/CLI/MCP 显示出来，
+/// 不能只是从列表里静默消失——那用户只会看到「我用不了」却不知道为什么。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VolumeSourceInfo {
+    /// 来源的人类可读名（`archive:D:\x\a.zip`、`ssh://u@h`）。
+    pub display: String,
+    /// 是否真的挂上了。
+    pub mounted: bool,
+    /// 挂载失败的原因；成功时为 None。
+    pub error: Option<String>,
+    /// 挂载成功后该卷的类型。
+    pub kind: VolumeKind,
+}
+
 fn display_name(v: &dyn Volume) -> String {
     // 直接用 id 的字符串，最稳：本地盘是 local:C、归档是 archive:/x/a.zip
     // 这类名字人类就可读，虚拟卷也在枚举里一目了然。

@@ -1,0 +1,18 @@
+[package]
+name = "fmnr-mount"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fmnr-core = { path = "../fmnr-core" }
+fmnr-fs = { path = "../fmnr-fs" }
+fmnr-archive = { path = "../fmnr-archive" }
+fmnr-remote = { path = "../fmnr-remote" }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

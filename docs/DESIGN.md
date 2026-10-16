@@ -358,7 +358,7 @@ egui immediate-mode **无原生 backdrop blur**。方案：
 | M5 插件 | WASM 宿主 + 图标/预览插件契约 | 装一个自定义预览插件并生效 |
 | M6 白板 | Board 布局 + 空间记忆模式 | 布置+持久化+恢复 |
 | M7 远程+WSL | SSH/SFTP 卷 + WSL UNC 识别 + wslpath | ⚠️ **部分达成，出口判据未满足**：WSL 已本机实测通过（`wsl_live.rs`，真 distro 可浏览）；SSH/SFTP 只有接口 + 纯逻辑测试（端点解析、host key 决策、状态码分类），**未连过任何真实主机**，`ssh_live.rs` 无夹具时自动跳过。归档卷 `fmnr-archive` 已交付并实测（zip/tar/tgz） |
-| **M8 卷接线** | 卷注册表 + 挂载入口：让 UI/CLI 真能打开归档、切 WSL、连 SSH | ⚠️ **UI/CLI 两侧均已接线，但归档/WSL/SSH 卷尚未注册进 UI，故出口判据仍部分未满足。** ① CLI 端：`fmnr_core::volreg::VolumeRegistry`（local + archive）被 `fmnr-cli` 接入；`volumes` 返回 registry JSON；`list_volume` 打印 registry；`ls` 默认取第一卷。② UI 端：`fmnr-ui` 的 `App` 持有 `VolumeRegistry`，顶栏新增**卷选择器**（列表来自 `registry.list()`，只读卷标注「（只读）」），`switch_volume()` 切卷并复位两栏路径；`current_volume_id` 改由 `registry.add()` 回传的**真实 id**（此前硬编码 `local:.` 与 `LocalVolume::new(home)` 自生的 `local:<绝对路径>` 永不相等，每次都靠 fallback 兜底，等于接线未生效）。③ **仍未完成**：UI 启动时只注册本地卷，归档/WSL/SSH 卷没有任何注册入口（`ArchiveVolume::open` 仍只在自身 crate 内被调用），所以「UI 真能打开归档、切 WSL、连 SSH」这条尚未成立——缺的是**卷发现/挂载入口**，不是选卷 UI。 |
+| **M8 卷接线** | 卷注册表 + 挂载入口：让 UI/CLI 真能打开归档、切 WSL、连 SSH | ✅ **挂载入口已落地，四类卷都能挂进 registry**（入口统一在 `fmnr-mount`）。① **依赖方向**：`fmnr-core` 是依赖树叶子，挂载要认识 archive/remote 四类实现，塞进 `fmnr-core::volreg` 会撞循环依赖 ⇒ 新建聚合 crate **`fmnr-mount`**（core/fs/archive/remote → mount → ui/cli）。② **入口结构**：`MountSpec`（可序列化的**意图**：`local`/`archive`/`wsl`/`ssh`，能存盘、能从 MCP 传参、失败可原样重试）+ `mount()`（意图 → 真实卷，**不做注册**）+ `MountTable::mount_all()`（挂载并注册，**单个失败不中断其余**）。③ **发现入口**：`discover_wsl_distros()` 跑 `wsl -l -q`（UTF-16LE 解码，按**退出码**判可用性而非匹配文案）供 UI 列出发行版；`discover_archives()` 扫目录出归档 spec（按**文件名全称**匹配后缀：`test.tar.gz` 的 `extension()` 是 `gz`，只看最后一段会漏）。④ **UI**：顶栏「📦 挂载」按钮 → 三选一对话框（归档/WSL/SSH），WSL 页直接列出发现的 distro；成功即注册并 `switch_volume` 切过去，失败把**原因**写进状态栏 + 挂载记录。⑤ **CLI**：与 UI 共用 `default_plan()` + `mount_all()`（不再各自维护一份后缀表），挂载失败进 **stderr** 而非 stdout——stdout 是 MCP 客户端消费的纯 JSON。⑥ **同时修掉 CLI 侧同款坑**：`get_mut(&VolumeId("local:."))` 与 UI 的硬编码 id 同源（`LocalVolume::new(cwd)` 自生 `local:<绝对路径>`），永远查不到、只能靠兜底新建卷，注册表白建；改为取 `registry.list()` 首个。⑦ **实测**：`fmnr-mount` 11 条测试全绿（含真机 `wsl -l -q` 发现）；`fmnr volumes` 返回 `local:D:\KF\fmnr`。**仍未满足出口判据的一条**：SSH 从未连过真实主机（沿用 M7 的 `⚠️`），故「连 SSH」只能算接线完成、连通性未验证。 |
 | CI | 五道门禁：lint(fmt+clippy `-D warnings`) / 双平台 build+test / 插件**行为** / 插件**字节可复现**(钉工具链) / 外部客户端契约 | ✅ **全绿**（run 38785759384，6 job 全 success，2026-10-16 观察） |
 
 ---
@@ -380,6 +380,7 @@ egui immediate-mode **无原生 backdrop blur**。方案：
 | v1 | 2026-10-15 | 合并原 v1（架构/范围/论文/选型）+ v2（打开语义/Liquid Glass/Zexor 借避/仓库）。新增 §4.7 预览与状态、§5 视觉、§3.2 借避清单、§10 M3 预览+状态阶段 |
 | v1.1 | 2026-10-15 | 文档收进仓内（`docs/DESIGN.md` 成为唯一事实源）；§11 落实远端 `bfxh/fmnr` + MIT。**里程碑实况：M0–M6 已完成并提交**（M6 分两笔：core 的 board 模型、UI 的白板视图），workspace 测试 168 passed / 0 failed / 2 ignored |
 | v1.2 | 2026-10-16 | M8 卷接线 UI 侧补齐：顶栏卷选择器 + `switch_volume()` + 修正 `current_volume_id` 硬编码错配（详见 §10 M8 行）。**如实降级**：归档/WSL/SSH 卷仍无注册入口，M8 出口判据未满足 |
+| v1.3 | 2026-10-16 | M8 **挂载入口落地**：新建 `fmnr-mount` 聚合 crate（`MountSpec` 意图 / `mount()` / `MountTable::mount_all()` / `discover_wsl_distros()` / `discover_archives()`），UI 顶栏「📦 挂载」三选一对话框 + CLI 改走同一套计划，归档/WSL/SSH 卷首次真正能注册进 registry。顺带修掉 CLI 侧与 UI 同源的 `local:.` 硬编码 id 坑。详见 §10 M8 行 |
 
 ---
 
