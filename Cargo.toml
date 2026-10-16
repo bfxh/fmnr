@@ -6,6 +6,7 @@ members = [
     "crates/fmnr-archive",
     "crates/fmnr-remote",
     "crates/fmnr-mount",
+    "crates/fmnr-pkg",
     "crates/fmnr-icons",
     "crates/fmnr-plugins",
     "crates/fmnr-ui",

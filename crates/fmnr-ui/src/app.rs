@@ -109,6 +109,8 @@ pub struct App {
     plugin_warnings: Vec<fmnr_plugins::registry::LoadWarning>,
     /// 目录树（左侧常驻侧栏的模型；契约见 tree 模块与 docs/UI-NEXT.md §8.1）
     tree: crate::tree::Tree,
+    /// 包更新盘点（只读，入口在目录树那一排的「更新」）
+    pkg: PkgPanel,
     /// M6 空间白板（布局层，与双栏视图互斥显示）
     board: fmnr_core::board::Board,
     /// 当前视图：双栏 or 白板
@@ -166,6 +168,19 @@ enum RowAction {
 #[derive(Debug, Clone)]
 struct DragPayload {
     paths: Vec<PathBuf>,
+}
+
+/// 包更新盘点的状态。**只读**：这里只列"有什么可升"，不代跑升级。
+///
+/// 不代跑有三个理由（见 `fmnr-pkg` 模块注释）：winget 的表格输出是本地化的、
+/// .NET 这类运行时"点了第一次只是排队"、以及代跑就要替用户决定 MSI 的作用域。
+#[derive(Default)]
+struct PkgPanel {
+    open: bool,
+    rows: Vec<fmnr_pkg::Upgrade>,
+    error: Option<String>,
+    /// 在途的盘点。`Some` 表示已经跑起来了，别再起第二个。
+    rx: Option<std::sync::mpsc::Receiver<Result<Vec<fmnr_pkg::Upgrade>, String>>>,
 }
 
 /// 冲突弹窗：已把请求暂存，等用户选策略。
@@ -310,6 +325,7 @@ impl App {
             plugins: fmnr_plugins::registry::PluginSet::new(),
             plugin_warnings: Vec::new(),
             tree: crate::tree::Tree::default(),
+            pkg: PkgPanel::default(),
             board: fmnr_core::board::Board::new("default"),
             view: ViewMode::Panes,
             board_cam: crate::board_view::Camera::default(),
@@ -1086,6 +1102,111 @@ impl App {
             ctx.request_repaint();
         }
     }
+
+    /// 起一次包更新盘点。重复点不会起第二个：在途就只把面板带出来。
+    fn start_pkg_scan(&mut self) {
+        if self.pkg.rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(fmnr_pkg::list_upgrades().map_err(|e| e.to_string()));
+        });
+        self.pkg.rx = Some(rx);
+        self.pkg.error = None;
+        self.pkg.rows.clear();
+    }
+
+    /// 每帧收一次盘点结果。
+    ///
+    /// `request_repaint_after` 而不是 `request_repaint`：winget 冷跑要好几秒，
+    /// 连续重绘等于把 CPU 白烧在等一个外部进程上。
+    fn poll_pkg(&mut self, ctx: &egui::Context) {
+        // 先把结果取成owned值：`Receiver` 不可克隆，而后面要写 self 的别的字段。
+        let got = self.pkg.rx.as_ref().map(|rx| rx.try_recv());
+        match got {
+            Some(Ok(Ok(rows))) => {
+                let n = rows.len();
+                self.pkg.rows = rows;
+                self.pkg.rx = None;
+                self.pkg.error = None;
+                self.status = format!("包更新盘点完成：{n} 项可升级（只列出，不代跑）");
+            }
+            Some(Ok(Err(msg))) => {
+                self.pkg.rx = None;
+                self.pkg.error = Some(msg.clone());
+                self.status = format!("包更新盘点失败：{msg}");
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.pkg.rx = None;
+                self.pkg.error = Some("盘点线程没给结果就结束了".into());
+                self.status = "包更新盘点失败：线程没给结果".into();
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            None => {}
+        }
+    }
+
+    /// 包更新面板：列条目 + 说清"这里不动手"。
+    fn render_pkg_panel(&mut self, ctx: &egui::Context) {
+        if !self.pkg.open {
+            return;
+        }
+        let mut copy_cmd: Option<String> = None;
+        let mut open = self.pkg.open;
+        egui::Window::new("可升级的包")
+            .id(egui::Id::new("pkg"))
+            .default_size([560.0, 360.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if self.pkg.rx.is_some() {
+                    ui.label("正在问 winget…（冷跑要几秒）");
+                }
+                if let Some(err) = &self.pkg.error {
+                    let c = ui.visuals().error_fg_color;
+                    ui.colored_label(c, err);
+                    ui.label("这一步只是读 winget 的表格，没装任何东西。");
+                }
+                if !self.pkg.rows.is_empty() {
+                    ui.label(format!("{} 项可升级", self.pkg.rows.len()));
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            for r in &self.pkg.rows {
+                                ui.horizontal(|ui| {
+                                    ui.label(&r.name);
+                                    ui.weak(format!("{} → {}", r.installed, r.available));
+                                    ui.label(format!("({})", r.source));
+                                    if ui
+                                        .button("复制命令")
+                                        .on_hover_text(format!("winget upgrade --id {}", r.id))
+                                        .clicked()
+                                    {
+                                        copy_cmd = Some(format!("winget upgrade --id {}", r.id));
+                                    }
+                                });
+                            }
+                        });
+                }
+                ui.separator();
+                // 边界要写在界面上，不能只写在源码注释里：
+                // 用户看到一排"可升级"最自然的预期就是点一下能升。
+                ui.label(
+                    egui::RichText::new(
+                        "这里只列清单，不代跑升级。要更新请在 winget 或 UniGetUI 里执行；\
+                         .NET 运行时这类包通常要再点一次才真正装上。",
+                    )
+                    .size(12.0),
+                );
+            });
+        self.pkg.open = open;
+        if let Some(cmd) = copy_cmd {
+            self.clipboard_text = Some(cmd);
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -1098,6 +1219,7 @@ impl eframe::App for App {
         self.handle_dropped_files(ctx);
         self.poll_running();
         self.poll_search(ctx);
+        self.poll_pkg(ctx);
         // 拖拽目标每帧重算：它是"这一帧指针悬在哪个目录上"的结论。
         self.drop_target = None;
 
@@ -1538,6 +1660,7 @@ impl App {
         }
 
         self.render_mount_dialog(ctx);
+        self.render_pkg_panel(ctx);
     }
 
     /// 挂载对话框：类型三选一 + 入参 + 结果反馈。
@@ -2312,11 +2435,31 @@ impl App {
         let selected = self.tree.selected().map(|p| p.to_path_buf());
         let mut toggle_to: Option<PathBuf> = None;
         let mut open_to: Option<PathBuf> = None;
+        let mut want_pkg = false;
 
         egui::SidePanel::left("tree")
             .default_width(220.0)
             .width_range(150.0..=460.0)
             .show(ctx, |ui| {
+                // 「更新」和目录树同一排：这一排是"这台机器上有什么"的入口，
+                // 包盘点问的正是"有什么该动了"。它不列文件，所以不放栏头工具条。
+                ui.horizontal(|ui| {
+                    let n = self.pkg.rows.len();
+                    let label = if self.pkg.rx.is_some() {
+                        "更新 · 盘点中…".to_string()
+                    } else if n > 0 {
+                        format!("更新 {n}")
+                    } else {
+                        "更新".to_string()
+                    };
+                    if ui
+                        .button(label)
+                        .on_hover_text("问一次 winget 有哪些包可升级。只列清单，不代跑升级。")
+                        .clicked()
+                    {
+                        want_pkg = true;
+                    }
+                });
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -2378,6 +2521,10 @@ impl App {
         if let Some(path) = open_to {
             self.tree.select(Some(path.clone()));
             self.navigate(self.active_pane, path);
+        }
+        if want_pkg {
+            self.pkg.open = true;
+            self.start_pkg_scan();
         }
     }
 

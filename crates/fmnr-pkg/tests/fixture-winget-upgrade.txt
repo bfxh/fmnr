@@ -1,0 +1,14 @@
+名称                                  ID                                      版本          可用          源
+----------------------------------------------------------------------------------------------------------------
+AlphaTool                             vendor-a.alphatool                      0.5.2         0.5.7         winget
+Contoso Runtime - 8.0.31 (x64)        contoso.runtime.8                       8.0.31        8.0.32        winget
+Sample Browser                        vendor-b.samplebrowser                  155.0.4283.45 155.0.4283.60 winget
+Sample Editor (User)                  vendor-c.sampleeditor                   1.141.1       1.142.0       winget
+Lumen Streaming Client                vendor-d.lumen                          6.1.0.0       6.2.0.0       winget
+Helper 0.4.8                          vendor-e.helper                         0.4.8         1.106.3       winget
+Tunnel VPN 2.0.9                      vendor-f.tunnelvpn                      2.0.4899.9    2.1.4951.1    winget
+Forge CN (User)                       vendor-g.forge.cn                       3.4.2         3.4.3         winget
+AB远程                                vendor-h.exampleremote                  4.42.1.2835   4.43.1.3614   winget
+Editor                                vendor-i.editor                         1.22.0        1.24.2        winget
+示例输入法                            vendor-j.exampleinput                   2.1.4.6       3.0.0.37      winget
+11 升级可用。

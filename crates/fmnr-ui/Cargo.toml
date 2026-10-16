@@ -11,6 +11,7 @@ fmnr-fs = { path = "../fmnr-fs" }
 fmnr-icons = { path = "../fmnr-icons" }
 fmnr-plugins = { path = "../fmnr-plugins" }
 fmnr-mount = { path = "../fmnr-mount" }
+fmnr-pkg = { path = "../fmnr-pkg" }
 eframe.workspace = true
 egui.workspace = true
 egui_extras.workspace = true

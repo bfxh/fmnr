@@ -1648,6 +1648,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fmnr-pkg"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "fmnr-plugins"
 version = "0.1.0"
 dependencies = [
@@ -1686,6 +1693,7 @@ dependencies = [
  "fmnr-fs",
  "fmnr-icons",
  "fmnr-mount",
+ "fmnr-pkg",
  "fmnr-plugins",
  "futures",
  "jwalk",
