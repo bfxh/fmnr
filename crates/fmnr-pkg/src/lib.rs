@@ -10,6 +10,10 @@
 //!
 //! 所以这里只负责"看清楚有什么可升"，动作交回 `winget upgrade --id <ID>` 或 UniGetUI。
 
+pub mod github;
+pub mod lnk;
+pub mod registry;
+
 /// 一行可升级条目。字段按 winget 表格的五列（名称 / ID / 版本 / 可用 / 源）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Upgrade {

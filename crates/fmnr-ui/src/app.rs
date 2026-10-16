@@ -178,6 +178,14 @@ struct DragPayload {
     paths: Vec<PathBuf>,
 }
 
+/// 包面板的两个页签。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PkgTab {
+    #[default]
+    Upgrades,
+    Ledger,
+}
+
 /// 包更新盘点的状态。**只读**：这里只列"有什么可升"，不代跑升级。
 ///
 /// 不代跑有三个理由（见 `fmnr-pkg` 模块注释）：winget 的表格输出是本地化的、
@@ -185,10 +193,23 @@ struct DragPayload {
 #[derive(Default)]
 struct PkgPanel {
     open: bool,
+    tab: PkgTab,
     rows: Vec<fmnr_pkg::Upgrade>,
     error: Option<String>,
     /// 在途的盘点。`Some` 表示已经跑起来了，别再起第二个。
     rx: Option<std::sync::mpsc::Receiver<Result<Vec<fmnr_pkg::Upgrade>, String>>>,
+    /// 已装底账（注册表那三棵树）。它和"可升级"是两件事：
+    /// 底账回答"这台机器装了什么、谁装的"，可升级只覆盖包管理器看得见的那部分。
+    ledger: Vec<fmnr_pkg::registry::InstalledApp>,
+    ledger_error: Option<String>,
+    ledger_rx:
+        Option<std::sync::mpsc::Receiver<Result<Vec<fmnr_pkg::registry::InstalledApp>, String>>>,
+    filter: String,
+    /// 详情面板看的是底账里第几条（过滤后的下标）。
+    detail: Option<usize>,
+    /// 拖进来的快捷方式。解析要等底账，所以存路径而不是存结论——
+    /// 底账晚一点读出来，这里的结果就自己变准了。
+    shortcuts: Vec<PathBuf>,
 }
 
 /// 冲突弹窗：已把请求暂存，等用户选策略。
@@ -589,6 +610,20 @@ impl App {
         if dropped.is_empty() {
             return;
         }
+
+        // 快捷方式不是"要搬进来的文件"，是"要认一下的入口"。
+        // 分流之后：.lnk 只被读取，原件留在原处（用户要的"自动放回去"
+        // 靠的是**根本不动它**，而不是搬进来再搬回去）；其余走原来的拷贝。
+        let (shortcuts, files): (Vec<PathBuf>, Vec<PathBuf>) = dropped
+            .into_iter()
+            .partition(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")));
+        if !shortcuts.is_empty() {
+            self.inspect_shortcuts(&shortcuts);
+        }
+        if files.is_empty() {
+            return;
+        }
+        let dropped = files;
 
         let dest = self.active_path().clone();
         match plan_drop(&dropped, &dest) {
@@ -1129,7 +1164,20 @@ impl App {
         self.pkg.rows.clear();
     }
 
-    /// 每帧收一次盘点结果。
+    /// 起一次已装底账读取（注册表三棵树）。同样只起一个。
+    fn start_ledger_load(&mut self) {
+        if self.pkg.ledger_rx.is_some() || !self.pkg.ledger.is_empty() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(fmnr_pkg::registry::list_installed().map_err(|e| e.to_string()));
+        });
+        self.pkg.ledger_rx = Some(rx);
+        self.pkg.ledger_error = None;
+    }
+
+    /// 每帧收一次盘点/底账结果。
     ///
     /// `request_repaint_after` 而不是 `request_repaint`：winget 冷跑要好几秒，
     /// 连续重绘等于把 CPU 白烧在等一个外部进程上。
@@ -1159,62 +1207,278 @@ impl App {
             }
             None => {}
         }
+
+        let got_ledger = self.pkg.ledger_rx.as_ref().map(|rx| rx.try_recv());
+        match got_ledger {
+            Some(Ok(Ok(apps))) => {
+                let n = apps.len();
+                self.pkg.ledger = apps;
+                self.pkg.ledger_rx = None;
+                self.pkg.ledger_error = None;
+                self.status = format!("已装底账读好了：{n} 条");
+            }
+            Some(Ok(Err(msg))) => {
+                self.pkg.ledger_rx = None;
+                self.pkg.ledger_error = Some(msg.clone());
+                self.status = format!("已装底账读失败：{msg}");
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.pkg.ledger_rx = None;
+                self.pkg.ledger_error = Some("底账线程没给结果就结束了".into());
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(120));
+            }
+            None => {}
+        }
     }
 
-    /// 包更新面板：列条目 + 说清"这里不动手"。
+    /// 把拖进来的 `.lnk` 认成"哪个应用的入口"。
+    ///
+    /// **不复制也不移动**：快捷方式只是被读了一下，原件留在它原来的地方——
+    /// 这正是用户要的"会自动放回去"，而"先搬进来再搬回去"是更差的做法
+    /// （中途失败就把用户的桌面弄乱了）。
+    fn inspect_shortcuts(&mut self, paths: &[PathBuf]) {
+        for p in paths {
+            if !self.pkg.shortcuts.contains(p) {
+                self.pkg.shortcuts.push(p.clone());
+            }
+        }
+        self.pkg.open = true;
+        self.pkg.tab = PkgTab::Ledger;
+        self.start_ledger_load();
+        self.status = format!("检查 {} 个快捷方式（原件未移动）", paths.len());
+    }
+
+    /// 包面板：两个页签（可升级 / 已装清单）+ 拖进来的快捷方式 + 详情。
     fn render_pkg_panel(&mut self, ctx: &egui::Context) {
         if !self.pkg.open {
             return;
         }
         let mut copy_cmd: Option<String> = None;
+        let mut want_scan = false;
+        let mut want_ledger = false;
+        let mut drop_shortcut: Option<PathBuf> = None;
         let mut open = self.pkg.open;
-        egui::Window::new("可升级的包")
+        let shortcuts = self.pkg.shortcuts.clone();
+        let ledger = self.pkg.ledger.clone();
+        let rows = self.pkg.rows.clone();
+        let tab = self.pkg.tab;
+
+        egui::Window::new("包管理器")
             .id(egui::Id::new("pkg"))
-            .default_size([560.0, 360.0])
+            .default_size([620.0, 420.0])
             .open(&mut open)
             .show(ctx, |ui| {
-                if self.pkg.rx.is_some() {
-                    ui.label("正在问 winget…（冷跑要几秒）");
-                }
-                if let Some(err) = &self.pkg.error {
-                    let c = ui.visuals().error_fg_color;
-                    ui.colored_label(c, err);
-                    ui.label("这一步只是读 winget 的表格，没装任何东西。");
-                }
-                if !self.pkg.rows.is_empty() {
-                    ui.label(format!("{} 项可升级", self.pkg.rows.len()));
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .max_height(240.0)
-                        .show(ui, |ui| {
-                            for r in &self.pkg.rows {
-                                ui.horizontal(|ui| {
-                                    ui.label(&r.name);
-                                    ui.weak(format!("{} → {}", r.installed, r.available));
-                                    ui.label(format!("({})", r.source));
-                                    if ui
-                                        .button("复制命令")
-                                        .on_hover_text(format!("winget upgrade --id {}", r.id))
-                                        .clicked()
-                                    {
-                                        copy_cmd = Some(format!("winget upgrade --id {}", r.id));
-                                    }
-                                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(tab == PkgTab::Upgrades, format!("可升级 {}", rows.len()))
+                        .clicked()
+                    {
+                        self.pkg.tab = PkgTab::Upgrades;
+                    }
+                    if ui
+                        .selectable_label(
+                            tab == PkgTab::Ledger,
+                            format!("已装清单 {}", ledger.len()),
+                        )
+                        .clicked()
+                    {
+                        self.pkg.tab = PkgTab::Ledger;
+                        want_ledger = true;
+                    }
+                });
+
+                if !shortcuts.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new("拖进来的快捷方式").strong());
+                    for s in &shortcuts {
+                        let name = s
+                            .file_stem()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        ui.horizontal(|ui| {
+                            let text = match shortcut_verdict(s, &ledger, &rows) {
+                                Verdict::Loading(t) => t,
+                                Verdict::Ok(t) => t,
+                                Verdict::Bad(t) => t,
+                            };
+                            let lbl = egui::RichText::new(format!("{name}：{text}"));
+                            match shortcut_verdict(s, &ledger, &rows) {
+                                Verdict::Bad(_) => {
+                                    let c = ui.visuals().error_fg_color;
+                                    ui.colored_label(c, lbl);
+                                }
+                                _ => {
+                                    ui.label(lbl);
+                                }
+                            }
+                            if ui.button("移除").clicked() {
+                                drop_shortcut = Some(s.clone());
                             }
                         });
+                    }
                 }
+
+                ui.separator();
+                match self.pkg.tab {
+                    PkgTab::Upgrades => {
+                        if self.pkg.rx.is_some() {
+                            ui.label("正在问 winget…（冷跑要几秒）");
+                        }
+                        if let Some(err) = &self.pkg.error {
+                            let c = ui.visuals().error_fg_color;
+                            ui.colored_label(c, err);
+                            ui.label("这一步只是读 winget 的表格，没装任何东西。");
+                        }
+                        if rows.is_empty()
+                            && self.pkg.rx.is_none()
+                            && self.pkg.error.is_none()
+                            && ui.button("问一次 winget").clicked()
+                        {
+                            want_scan = true;
+                        }
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .max_height(200.0)
+                            .show(ui, |ui| {
+                                for r in &rows {
+                                    ui.horizontal(|ui| {
+                                        ui.label(&r.name);
+                                        ui.weak(format!("{} → {}", r.installed, r.available));
+                                        ui.label(format!("({})", r.source));
+                                        if ui
+                                            .button("复制命令")
+                                            .on_hover_text(format!("winget upgrade --id {}", r.id))
+                                            .clicked()
+                                        {
+                                            copy_cmd =
+                                                Some(format!("winget upgrade --id {}", r.id));
+                                        }
+                                    });
+                                }
+                            });
+                    }
+                    PkgTab::Ledger => {
+                        if self.pkg.ledger_rx.is_some() {
+                            ui.label("正在读注册表…");
+                        }
+                        if let Some(err) = &self.pkg.ledger_error {
+                            let c = ui.visuals().error_fg_color;
+                            ui.colored_label(c, err);
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label("过滤");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.pkg.filter)
+                                        .desired_width(200.0)
+                                        .hint_text("名称 / 发布者"),
+                                )
+                                .changed()
+                            {
+                                // 详情按下标记住选中项，列表一变这个下标就指向
+                                // 另一个应用了——那不是"选中丢了"，是"显示错数据"。
+                                self.pkg.detail = None;
+                            }
+                        });
+                        let f = self.pkg.filter.to_lowercase();
+                        let shown: Vec<(usize, &fmnr_pkg::registry::InstalledApp)> = ledger
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, a)| {
+                                f.is_empty()
+                                    || a.name.to_lowercase().contains(&f)
+                                    || a.publisher
+                                        .as_deref()
+                                        .is_some_and(|p| p.to_lowercase().contains(&f))
+                            })
+                            .collect();
+                        let detail = self.pkg.detail;
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .max_height(180.0)
+                            .show(ui, |ui| {
+                                for (i, a) in &shown {
+                                    if ui
+                                        .selectable_label(
+                                            detail == Some(*i),
+                                            format!(
+                                                "{} — {} — {} — {}",
+                                                a.name,
+                                                a.publisher.as_deref().unwrap_or("（无发布者）"),
+                                                a.version.as_deref().unwrap_or("（无版本）"),
+                                                a.family.label()
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.pkg.detail = Some(*i);
+                                    }
+                                }
+                            });
+                        if let Some(i) = self.pkg.detail {
+                            if let Some(a) = shown.get(i) {
+                                let a = a.1;
+                                ui.separator();
+                                ui.label(egui::RichText::new(&a.name).strong());
+                                field(ui, "发布者", a.publisher.as_deref());
+                                field(ui, "版本", a.version.as_deref());
+                                field(ui, "来源", Some(a.family.label()));
+                                field(ui, "作用域", Some(a.hive.label()));
+                                field(ui, "安装位置", a.install_location.as_deref());
+                                field(ui, "卸载串", a.uninstall_string.as_deref());
+                                field(ui, "注册表键", a.reg_key.as_deref());
+                                if let Some(g) = &a.github {
+                                    ui.label(format!("上游 GitHub 仓：{g}（还没接联网查询）"));
+                                }
+                                if let Some(u) = &a.url {
+                                    ui.horizontal(|ui| {
+                                        ui.label("官网");
+                                        if ui.button("复制链接").clicked() {
+                                            copy_cmd = Some(u.clone());
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
                 ui.separator();
                 // 边界要写在界面上，不能只写在源码注释里：
                 // 用户看到一排"可升级"最自然的预期就是点一下能升。
+                // 数字一律取现场读到的，不写死本机测出来的那 273/74——
+                // 换台机器那句话就成了假声称。
                 ui.label(
-                    egui::RichText::new(
+                    egui::RichText::new(format!(
                         "这里只列清单，不代跑升级。要更新请在 winget 或 UniGetUI 里执行；\
-                         .NET 运行时这类包通常要再点一次才真正装上。",
-                    )
-                    .size(12.0),
+                         .NET 运行时这类包通常要再点一次才真正装上。\n\
+                         「可升级」只覆盖 winget 看得见的那部分（本机会报 {} 项）；\
+                         「已装清单」读注册表，是全量底账（本机 {} 条，其中 {} 条写了安装位置，\
+                         没写安装位置的只能按卸载器所在目录认）。",
+                        rows.len(),
+                        ledger.len(),
+                        ledger
+                            .iter()
+                            .filter(|a| a.install_location.is_some())
+                            .count()
+                    ))
+                    .size(12.0)
+                    .weak(),
                 );
             });
+
         self.pkg.open = open;
+        if want_scan {
+            self.start_pkg_scan();
+        }
+        if want_ledger {
+            self.start_ledger_load();
+        }
+        if let Some(s) = drop_shortcut {
+            self.pkg.shortcuts.retain(|p| p != &s);
+        }
         if let Some(cmd) = copy_cmd {
             self.clipboard_text = Some(cmd);
         }
@@ -3175,6 +3439,77 @@ fn highlight_hit(hit: &crate::search::Hit, style: &egui::Style) -> egui::WidgetT
     egui::WidgetText::from(job)
 }
 
+/// 详情里的一行：没有值就干脆不写这行，不写"（无）"占满屏。
+fn field(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
+    if let Some(v) = value {
+        ui.label(format!("{label}：{v}"));
+    }
+}
+
+/// 快捷方式检查结论。分三色是因为"底账里没有"和"文件读不了"
+/// 对用户的下一步完全不同：前者正常，后者要修。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Verdict {
+    Loading(String),
+    Ok(String),
+    Bad(String),
+}
+
+/// 一个 `.lnk` → 目标 exe → 底账里的哪条 → 那条在不在可升级清单里。
+fn shortcut_verdict(
+    path: &Path,
+    ledger: &[fmnr_pkg::registry::InstalledApp],
+    rows: &[fmnr_pkg::Upgrade],
+) -> Verdict {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => return Verdict::Bad(format!("读不了这个快捷方式：{e}")),
+    };
+    let target = match fmnr_pkg::lnk::target_of(&bytes) {
+        Ok(t) => t,
+        Err(e) => return Verdict::Bad(e.to_string()),
+    };
+    match fmnr_pkg::registry::match_target(ledger, &target) {
+        None if ledger.is_empty() => Verdict::Loading(format!("{target} → 底账还没读好，稍等")),
+        None => Verdict::Ok(format!(
+            "{target} → 底账里没有这条（绿色版/解包副本就是这样）"
+        )),
+        Some(a) => {
+            // 优先按注册表键名对 winget 的包 ID：那是精确匹配。
+            // 名字匹配只在键名对不上时兜底，并说明是"按名字"——
+            // 否则用户会以为这个结论和精确匹配一样硬。
+            let by_key = a
+                .reg_key
+                .as_deref()
+                .is_some_and(|k| rows.iter().any(|r| r.id.eq_ignore_ascii_case(k)));
+            let hit = rows.iter().find(|r| {
+                (by_key
+                    && a.reg_key
+                        .as_deref()
+                        .is_some_and(|k| r.id.eq_ignore_ascii_case(k)))
+                    || (!by_key && r.name.eq_ignore_ascii_case(&a.name))
+            });
+            let base = format!(
+                "{target} → {} {}",
+                a.name,
+                a.version.as_deref().unwrap_or("")
+            );
+            match hit {
+                Some(r) => Verdict::Ok(format!(
+                    "{base}：可升到 {}（{}）",
+                    r.available,
+                    if by_key {
+                        "按包 ID 对上"
+                    } else {
+                        "按名字对上"
+                    }
+                )),
+                None => Verdict::Ok(format!("{base}：{}，winget 没报可升", a.family.label())),
+            }
+        }
+    }
+}
+
 /// 这个卷的条目能不能用「遍历本地文件系统」的方式搜到。
 ///
 /// 搜索线程走的是 `jwalk`，它只认本地路径。归档卷的根是**包内虚拟路径**：
@@ -3595,5 +3930,92 @@ mod mount_dialog_tests {
                 endpoint: "me@host:22".to_string(),
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod shortcut_check_tests {
+    use super::*;
+
+    /// 造一个结构正确的最小 `.lnk`：76 字节头 + DESCRIPTION 空格 + LOCALBASE。
+    /// 字节布局按 MS-SHLLINK 手拼，和 `fmnr-pkg` 那边的解析器各写一遍——
+    /// 两边共用一个 builder 的话，builder 错了就两边一起错，测不出东西。
+    fn make_lnk(target: &str) -> Vec<u8> {
+        let mut d = vec![0u8; 76];
+        d[0..4].copy_from_slice(&76u32.to_le_bytes());
+        d[4..20].copy_from_slice(&[
+            0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x46,
+        ]);
+        // LinkFlags = HasTargetPrefix(0x40) ⇒ 只有 LOCALBASE 那格有用
+        d[20..24].copy_from_slice(&0x40u32.to_le_bytes());
+        for s in ["", target] {
+            let units: Vec<u8> = s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+            d.extend_from_slice(&(s.encode_utf16().count() as u16).to_le_bytes());
+            d.extend_from_slice(&units);
+        }
+        d
+    }
+
+    fn tmp_lnk(bytes: &[u8], tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fmnr-lnk-test-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.lnk");
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    fn led(name: &str, loc: &str) -> Vec<fmnr_pkg::registry::InstalledApp> {
+        let mut v = std::collections::BTreeMap::new();
+        v.insert("DisplayName".to_string(), name.to_string());
+        v.insert("InstallLocation".to_string(), loc.to_string());
+        vec![fmnr_pkg::registry::app_from_values(
+            fmnr_pkg::registry::Hive::Machine,
+            Some(name.to_string()),
+            &v,
+        )
+        .unwrap()]
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_shortcut_is_reported_as_bad() {
+        let p = tmp_lnk(b"plain text, definitely not a lnk", "bad");
+        assert!(
+            matches!(shortcut_verdict(&p, &[], &[]), Verdict::Bad(_)),
+            "读不懂的文件要说读不懂，不能装作没这个应用"
+        );
+    }
+
+    /// 底账还没读出来时要说"稍等"，不能报"底账里没有"——
+    /// 那是把"还不知道"说成"知道没有"，正是这类面板最容易撒的谎。
+    #[test]
+    fn empty_ledger_is_loading_not_absent() {
+        let p = tmp_lnk(&make_lnk(r"D:\Apps\Foo\foo.exe"), "loading");
+        match shortcut_verdict(&p, &[], &[]) {
+            Verdict::Loading(s) => assert!(s.contains("底账还没读好"), "{s}"),
+            other => panic!("期望 Loading，拿到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matched_app_is_named_with_its_family() {
+        let p = tmp_lnk(&make_lnk(r"D:\Apps\Foo\foo.exe"), "hit");
+        match shortcut_verdict(&p, &led("Foo", r"D:\Apps\Foo"), &[]) {
+            Verdict::Ok(s) => {
+                assert!(s.contains("Foo"), "{s}");
+                assert!(s.contains("winget 没报可升"), "{s}");
+            }
+            other => panic!("期望 Ok，拿到 {other:?}"),
+        }
+    }
+
+    /// 底账读好了、里面确实没有 ⇒ 说"没有"，并且不把它算成错误。
+    #[test]
+    fn loaded_ledger_without_a_match_is_ok_not_bad() {
+        let p = tmp_lnk(&make_lnk(r"D:\Portable\bar.exe"), "miss");
+        match shortcut_verdict(&p, &led("Foo", r"D:\Apps\Foo"), &[]) {
+            Verdict::Ok(s) => assert!(s.contains("底账里没有这条"), "{s}"),
+            other => panic!("期望 Ok，拿到 {other:?}"),
+        }
     }
 }

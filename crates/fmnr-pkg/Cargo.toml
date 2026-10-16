@@ -8,3 +8,12 @@ rust-version = { workspace = true }
 
 [dependencies]
 thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# 按 target 门控（和 fmnr-fs 同一个理由）：不门控的话 Linux 上会去编
+# windows → windows-future，那个 crate 在非 Windows 目标下编不过，CI 直接红。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+] }
