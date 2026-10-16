@@ -197,6 +197,19 @@ impl Volume for LocalVolume {
         if !full.exists() {
             return Err(Error::NotFound(full.display().to_string()));
         }
+        // 空程序 = 调用方希望"用系统默认程序"。默认程序的注册表解析还没做
+        // （见 docs/UI-NEXT.md §2.1 的 P0b），所以这里**明确报错**。
+        //
+        // 以前这条会回退到 COMSPEC，于是静默起一个永不退出的 cmd.exe：
+        // 文件没打开、角标谎报"已在 cmd.exe 中打开"、还连带把 MCP 测试的
+        // 临时目录钉在 %TEMP% 里删不掉。报错比"看起来做了点什么"值钱。
+        if program.trim().is_empty() {
+            return Err(Error::Unsupported(format!(
+                "没有为 {} 配置默认程序，也没指定要用哪个程序。系统默认程序的解析尚未实现；\
+                 请显式传 program，或在实现后重试。",
+                full.display()
+            )));
+        }
 
         #[cfg(windows)]
         {

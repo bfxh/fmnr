@@ -34,16 +34,23 @@ pub fn is_previewable(path: &Path) -> bool {
     }
 }
 
-/// 默认外部程序。Windows 用 `%COMSPEC%`，类 Unix 用 `$SHELL`，都取不到时给平台兜底值。
+/// 默认外部程序：**内核不猜**。返回空串表示"交给卷去解析系统默认程序"。
+///
+/// 这里原本返回 `%COMSPEC%`（unix 侧是 `$SHELL`），于是"打开一个没有内置预览的
+/// 文件"实际执行的是 `cmd.exe "<那个文件>"`。cmd 拿到路径参数但**没有 `/c`**，
+/// 既不会打开它、也不会退出 ⇒ 三件事同时发生：
+/// - 用户视角"双击没反应"，且没有任何提示（静默失败）；
+/// - 每次泄漏一个永不退出的 `cmd.exe`（实测本机 14 个里 5 个是这么来的孤儿）；
+/// - 角标显示"已在 cmd.exe 中打开"且永不消失——而"进程退出角标就消失"是 M3 的
+///   核心承诺，等于角标在说谎。
+///
+/// 还有一个连带后果：MCP 契约测试把 server 的工作目录设在自己的临时 fixture 里，
+/// 孤儿 cmd 继承了它 ⇒ fixture 删不掉（`%TEMP%` 下 46 个残留目录）。
+/// 所以**清临时目录不是第二个 bug**，是同一个根因的症状。
+///
+/// 解析不到默认程序时必须**报错**，不许回退到任何 shell。
 pub fn default_external_program() -> String {
-    #[cfg(windows)]
-    {
-        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
-    }
-    #[cfg(not(windows))]
-    {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
-    }
+    String::new()
 }
 
 /// 打开决策表。`force_external` = 用户显式要求「用默认程序打开」，
@@ -88,6 +95,26 @@ mod tests {
         }
     }
 
+    /// 🔴 内核**不许**拿一个 shell 当默认程序。
+    ///
+    /// 空串的含义是"交给卷去解析系统默认程序，解析不到就报错"。
+    /// 这条锁的是实测出来的缺陷：以前这里返回 `%COMSPEC%`，于是
+    /// "打开一个没内置预览的文件"实际执行 `cmd.exe "<那个文件>"`——
+    /// cmd 没有 `/c`，既不开文件也不退出，留下永不退出的孤儿进程，
+    /// 角标还谎报"已在 cmd.exe 中打开"（而"进程退出角标消失"是 M3 的承诺）。
+    #[test]
+    fn default_program_asks_the_volume_to_resolve_it() {
+        let p = PathBuf::from("/x/thing.xyzzy");
+        let prog = match route_open(&p, false) {
+            OpenRoute::External(prog) => prog,
+            OpenRoute::Preview => panic!("未知扩展名不该走内置预览"),
+        };
+        assert!(
+            prog.is_empty(),
+            "默认程序必须是「未指定、交给卷解析」，实际拿到 {prog:?}"
+        );
+    }
+
     #[test]
     fn unknown_extension_routes_to_external() {
         let p = PathBuf::from("/x/thing.xyzzy");
@@ -105,10 +132,5 @@ mod tests {
     fn force_external_overrides_previewable() {
         let p = PathBuf::from("/x/notes.md");
         assert!(matches!(route_open(&p, true), OpenRoute::External(_)));
-    }
-
-    #[test]
-    fn default_program_is_non_empty() {
-        assert!(!default_external_program().is_empty());
     }
 }

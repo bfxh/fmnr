@@ -140,7 +140,15 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            // 删不掉几乎总是"还有进程把这个目录当工作目录"——
+            // 上一轮就是这样在 %TEMP% 里攒下 46 个残留目录的，
+            // 而 `let _ =` 把它洗成了零信号。
+            eprintln!(
+                "fixture 清理失败（有进程占着这个目录当 CWD？）{}: {e}",
+                self.0.display()
+            );
+        }
     }
 }
 
@@ -472,17 +480,45 @@ fn open_routes_text_to_preview_and_unknown_to_external() {
 
     #[cfg(windows)]
     {
-        let p = tool_payload(&resp);
-        assert_eq!(p["route"], json!("external"), "未知类型应走外部程序：{p}");
-        assert!(p["program"].is_string());
-
-        // 角标状态应能查到
+        // 🔴 这里原本断言 `route == external` 且角标 `count == 1`——
+        // 那是把缺陷钉成了契约：没指定 program 时内核回退到 COMSPEC，
+        // 于是起一个 `cmd.exe "<文件>"`（没有 /c，既不开文件也不退出），
+        // 角标谎报"已在 cmd.exe 中打开"，孤儿进程还把自己的工作目录
+        // （就是这个 fixture）钉住，导致 %TEMP% 里留下删不掉的目录。
+        //
+        // 现在的契约是：**没把握就报错**，不许假装打开了。
+        assert!(
+            resp["error"].is_object(),
+            "未知类型且未指定 program 时必须报错，不能假装打开了：{resp}"
+        );
         let opens = mcp.call(
             "tools/call",
             json!({"name": "external_opens", "arguments": {}}),
         );
-        let op = tool_payload(&opens);
-        assert_eq!(op["count"], json!(1), "外置打开后应有一条角标：{op}");
+        assert_eq!(
+            tool_payload(&opens)["count"],
+            json!(0),
+            "报错那次不该留下角标"
+        );
+
+        // 显式给 program 的正路仍要通，否则上面那条只是在断"什么都不工作"。
+        // 不再断角标数量：`cmd.exe /c exit` 秒退，看门狗什么时候摘掉是竞态。
+        // 角标的挂载与摘除由 fmnr-fs 的单元测试负责（remove_by_handle 那几条）。
+        let ok = mcp.call(
+            "tools/call",
+            json!({
+                "name": "open",
+                "arguments": {
+                    "path": unknown.to_string_lossy(),
+                    "program": "cmd.exe /c exit"
+                }
+            }),
+        );
+        assert_eq!(
+            tool_payload(&ok)["route"],
+            json!("external"),
+            "显式指定 program 时应当真能打开：{ok}"
+        );
     }
 
     #[cfg(not(windows))]

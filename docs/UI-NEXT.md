@@ -66,16 +66,39 @@
 3. 角标会显示"已在 cmd.exe 中打开"，而那个 cmd 永远不死 ⇒ **角标在说谎**，
    而"进程退出角标消失"是 M3 的核心承诺。
 
-**三种修法**：
+🔴 **两处我先前判断错了，留在这里：**
 
-| 方案 | 做法 | 代价 | 判据 |
-|---|---|---|---|
-| A（推荐） | 没有可用关联程序时**不 spawn**，返回明确错误 + 界面提示"没有默认可打开它的程序，右键→打开方式" | 小（改 `route_open` 的默认程序解析 + 一个错误分支） | 打开 `thing.xyzzy` 后：无新进程、状态栏说清原因、角标不出现 |
-| B | 用 `ShellExecuteW` + `SEE_MASK_NOCLOSEPROCESS` 走系统关联，仍拿得到进程句柄 | 中；且**与 DESIGN §198"不用 ShellExecute"的约束冲突**——那条约束的初衷是"要拿 PID 做存活检测"，而 ShellExecute 其实也给句柄，值得重新读一遍原文再决定 | 同上 + 角标随真实进程退出消失 |
-| C | 保留 COMSPEC 但加 `/c start "" "<文件>"` | 小，但 `start` 会立刻退出 ⇒ 存活检测失去意义，角标变成一闪而过 | 不推荐 |
+- 我写过"顺带：契约测试要自己清临时目录"。**不对**——`Fixture` 本来就有 `Drop`
+  在清。清不掉是因为**孤儿 cmd.exe 继承了 MCP server 的工作目录**
+  （`Mcp::start` 用 `.current_dir(fixture目录)`），目录被占着，
+  `remove_dir_all` 失败又被 `let _ =` 吞掉。
+  ⇒ 残留目录和孤儿进程**是同一个根因的两个症状**，不是两个 bug。
+  实证：杀掉那 7 个 cmd.exe 之后，54 个残留目录**一次全删干净、0 失败**。
+- 更难看的一条：`fmnr-core/src/open.rs` 里原本有个
+  `default_program_is_non_empty` 测试，**断言的正是这个缺陷行为**
+  （`assert!(!default_external_program().is_empty())`）。
+  所以"回退到 cmd.exe"不是漏网，是被测试钉成契约的——这也是为什么一直没人发现。
+  我把它删了，换成 `default_program_asks_the_volume_to_resolve_it`
+  （断空串 = "交给卷解析"，并写明为什么不许回退到 shell）。
 
-顺带：MCP 契约测试要**自己清临时目录**，否则每跑一次 `cargo test --workspace`
-就在 `%TEMP%` 留一个目录 + 一个孤儿 cmd.exe（本轮我就跑了一次，多了一个）。
+**修法（本轮已做的部分）**：`default_external_program()` 不再返回 `$COMSPEC`
+而是返回**空串**，含义是"交给卷去解析系统默认程序"；`LocalVolume` 拿到空程序时
+**明确报 `Unsupported`**，不再猜。`Fixture::drop` 改成把清理失败
+`eprintln!` 出来——静默的 `let _ =` 就是这次攒下 54 个目录的原因。
+
+**验证（A/B 同尺）**：跑一整轮 `cargo test --workspace --locked`，
+跑前 54 个 `fmnr-mcp-*` 目录 / 7 个 fmnr 造的 `cmd.exe`，
+跑后 **54 / 7，增量为 0**；测试全绿。
+
+**还没做的（P0b）**：真正去解析系统默认程序，让"双击一个 .docx"能开起来。
+`MCP open` 工具的说明写的是"省略则用系统默认"，**这句今天是不真的**。
+解析要处理的比想象中多，所以单独一步做，别顺手塞进 P0：
+`HKCU\...\Applications\...UserChoice\ProgId` → `HKLM\SOFTWARE\Classes\<progid>\shell\open\command`
+三级回落之外，还要 ① 展开 `%ProgramFiles%` 这类环境变量；
+② 剥掉 `%1` / `%*` / `%l` 占位符（`spawn_external_open` 自己会追加目标文件，
+不剥就会把字面量 `%1` 传给程序）；③ 拒绝 `rundll32`/UWP 激活器这类
+"不是普通 exe + 参数"的命令；④ 无扩展名与未知扩展名分开报。
+
 
 ### 2.2 子树搜索没走卷抽象（已挂号 #26）
 
