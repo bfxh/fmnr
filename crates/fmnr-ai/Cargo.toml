@@ -16,6 +16,12 @@ fmnr-core = { path = "../fmnr-core" }
 fmnr-fs = { path = "../fmnr-fs" }
 serde.workspace = true
 serde_json.workspace = true
+futures = "0.3"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# 只为测试里的 ReadOnly 包装卷能 impl `Volume`（trait 用 async_trait 声明）。
+# 它已由 fmnr-core 在锁文件里，不引入新的下载或跨端 C 编译。
+async-trait = "0.1"

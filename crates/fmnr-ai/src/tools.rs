@@ -7,11 +7,12 @@
 //! 缺字段/类型错会得到 -32602 且带**具体哪个字段**，而不是笼统的 "invalid params"。
 
 use fmnr_core::{ConflictPolicy, ListOpts, SortOrder, VPath, Volume};
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::protocol::{RpcError, INVALID_PARAMS};
+use crate::protocol::{RpcError, INTERNAL_ERROR, INVALID_PARAMS};
 
 /// 工具的静态描述，用于 `tools/list`。
 pub struct ToolSpec {
@@ -124,6 +125,61 @@ pub fn specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
         },
+        // ↓ 这四条是内核早就有、但一直没上工具表的能力。
+        //   补在这里而不是另开通路：三条入口（MCP/HTTP/CLI）共用同一个
+        //   dispatch_payload，一处补齐三处就有，反之会分叉成"CLI 能读、MCP 不能"。
+        ToolSpec {
+            name: "read_file",
+            description: "读一个文件的文本内容。超过 max_bytes 会截断并在 truncated 里说明；非 UTF-8 内容不返回正文，只报 binary=true 与字节数。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "绝对文件路径"},
+                    "max_bytes": {"type": "integer", "minimum": 1, "default": 262144,
+                        "description": "读取上限，默认 256 KiB"}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "write_file",
+            description: "写一个 UTF-8 文本文件（整体覆盖）。只读卷会报错而不是静默失败。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "绝对文件路径"},
+                    "text": {"type": "string", "description": "要写入的完整内容"}
+                },
+                "required": ["path", "text"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "rename",
+            description: "重命名/移动单个条目。to 是同一卷内的绝对路径。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "from": {"type": "string"},
+                    "to": {"type": "string"}
+                },
+                "required": ["from", "to"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "create_dir",
+            description: "新建目录（绝对路径）。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -181,6 +237,40 @@ struct TransferArgs {
     dest_dir: String,
     #[serde(default)]
     conflict: ConflictArg,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadArgs {
+    path: String,
+    #[serde(default = "default_max_bytes")]
+    max_bytes: usize,
+}
+
+/// 256 KiB。默认值存在的理由是"别把一个 4 GB 的文件读进内存"，
+/// 不是"够不够"——所以它可被参数覆盖，且截断一定会在返回里说明。
+fn default_max_bytes() -> usize {
+    256 * 1024
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteArgs {
+    path: String,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameArgs {
+    from: String,
+    to: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MkdirArgs {
+    path: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -332,6 +422,103 @@ pub async fn dispatch_payload(
                 "skipped": report.skipped,
                 "aborted": report.aborted,
             }))
+        }
+
+        "read_file" => {
+            let a: ReadArgs = parse(args)?;
+            let path = VPath(a.path.clone().into());
+            let mut buf: Vec<u8> = Vec::new();
+            let mut stream = volume.read_stream(&path).await.map_err(to_rpc)?;
+            // 按块读到上限就停，而不是先整读再截断：
+            // 后者读一个 4 GB 文件时会先把机器打满。
+            let mut truncated = false;
+            while buf.len() < a.max_bytes {
+                let chunk = match stream.next().await {
+                    None => break,
+                    Some(Err(e)) => return Err(RpcError::new(INTERNAL_ERROR, e.to_string())),
+                    Some(Ok(b)) => b,
+                };
+                let room = a.max_bytes - buf.len();
+                if chunk.len() > room {
+                    buf.extend_from_slice(&chunk[..room]);
+                    truncated = true;
+                    break;
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            if !truncated && buf.len() == a.max_bytes {
+                // 正好停在边界：再问一块确认后面真的没有了，
+                // 否则会把"截断了"和"刚好读完整个文件"混成一种。
+                if let Some(Ok(extra)) = stream.next().await {
+                    if !extra.is_empty() {
+                        truncated = true;
+                    }
+                }
+            }
+            match String::from_utf8(buf.clone()) {
+                Ok(text) => Ok(json!({
+                    "path": a.path,
+                    "binary": false,
+                    "bytes": buf.len(),
+                    "truncated": truncated,
+                    "text": text,
+                })),
+                Err(_) => Ok(json!({
+                    // 不是 UTF-8 就不硬塞：调用方拿到一屏乱码比拿到 binary=true 更难办。
+                    // 要二进制内容请走 native_path + 自己读，这里不装。
+                    "path": a.path,
+                    "binary": true,
+                    "bytes": buf.len(),
+                    "truncated": truncated,
+                })),
+            }
+        }
+
+        "write_file" => {
+            let a: WriteArgs = parse(args)?;
+            if !volume.writable() {
+                // 与 copy/delete 同一条错误路径：只读在契约里就是卷返回 Unsupported
+                // （fmnr-core::Volume 文档注释），错误码由 to_rpc 统一给。
+                return Err(to_rpc(fmnr_core::Error::Unsupported(format!(
+                    "这个卷是只读的，不能写：{:?}",
+                    volume.kind()
+                ))));
+            }
+            volume
+                .write(&VPath(a.path.clone().into()), a.text.as_bytes())
+                .await
+                .map_err(to_rpc)?;
+            Ok(json!({ "path": a.path, "bytes": a.text.len() }))
+        }
+
+        "rename" => {
+            let a: RenameArgs = parse(args)?;
+            if !volume.writable() {
+                return Err(to_rpc(fmnr_core::Error::Unsupported(format!(
+                    "这个卷是只读的，不能改名：{:?}",
+                    volume.kind()
+                ))));
+            }
+            volume
+                .rename(&VPath(a.from.clone().into()), &VPath(a.to.clone().into()))
+                .await
+                .map_err(to_rpc)?;
+            Ok(json!({ "from": a.from, "to": a.to }))
+        }
+
+        "create_dir" => {
+            let a: MkdirArgs = parse(args)?;
+            if !volume.writable() {
+                return Err(to_rpc(fmnr_core::Error::Unsupported(format!(
+                    "这个卷是只读的，不能建目录：{:?}",
+                    volume.kind()
+                ))));
+            }
+            volume
+                .create_dir(&VPath(a.path.clone().into()))
+                .await
+                .map_err(to_rpc)?;
+            Ok(json!({ "path": a.path, "created": true }))
         }
 
         "open" => {
@@ -500,5 +687,280 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e.code, INVALID_PARAMS);
+    }
+
+    /// 声明表与分发表必须一致：`tools/list` 里出现的每个名字，
+    /// 都要能在 `dispatch_payload` 里走到自己的分支。
+    /// 少了这一步就会出现"客户端看得见、一调就 Method not found"——
+    /// 那种问题只在集成时才暴露，而这里一条测试就能钉住。
+    #[tokio::test]
+    async fn every_spec_is_dispatchable() {
+        for s in specs() {
+            // 空参数对有些工具是**合法的**（list_volume / external_opens 不收参数），
+            // 所以这里不能期待报错，只能期待"不是没实现"。
+            let outcome = dispatch_payload(vol(), s.name, json!({})).await;
+            if let Err(e) = &outcome {
+                assert_ne!(
+                    e.code,
+                    crate::protocol::METHOD_NOT_FOUND,
+                    "工具「{}」在 specs() 里声明了，却没在分发表里实现",
+                    s.name
+                );
+            }
+        }
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("fmnr-tools-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn write_then_read_roundtrips() {
+        let d = tmp_dir("roundtrip");
+        let p = d.join("note.txt").display().to_string();
+        let w = dispatch_payload(vol(), "write_file", json!({"path": p, "text": "第一条\n"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            w["bytes"], 10,
+            "UTF-8 下中文每字 3 字节，bytes 要给字节数不是字数"
+        );
+        let r = dispatch_payload(vol(), "read_file", json!({"path": p}))
+            .await
+            .unwrap();
+        assert_eq!(r["text"], "第一条\n");
+        assert_eq!(r["binary"], false);
+        assert_eq!(r["truncated"], false);
+        assert!(std::fs::read_to_string(&p).unwrap() == "第一条\n");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 截断必须**说出来**。半截内容看起来和完整内容一模一样，
+    /// 客户端会拿它当全文去改再写回去——那是能毁文件的错法。
+    #[tokio::test]
+    async fn read_file_truncates_and_says_so() {
+        let d = tmp_dir("trunc");
+        let p = d.join("big.txt");
+        std::fs::write(&p, vec![b'a'; 5000]).unwrap();
+        let r = dispatch_payload(
+            vol(),
+            "read_file",
+            json!({"path": p.display().to_string(), "max_bytes": 100}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["bytes"], 100);
+        assert_eq!(r["truncated"], true);
+        assert_eq!(r["text"].as_str().unwrap().len(), 100);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 正好读到上限：不能因为"读满了"就谎报截断。
+    #[tokio::test]
+    async fn exact_size_boundary_is_not_reported_as_truncated() {
+        let d = tmp_dir("edge");
+        let p = d.join("exact.txt");
+        std::fs::write(&p, vec![b'b'; 100]).unwrap();
+        let r = dispatch_payload(
+            vol(),
+            "read_file",
+            json!({"path": p.display().to_string(), "max_bytes": 100}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["bytes"], 100);
+        assert_eq!(r["truncated"], false, "刚好读完不是截断");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 非 UTF-8 不硬塞正文：给一屏乱码比给 `binary: true` 更难办。
+    #[tokio::test]
+    async fn binary_content_is_reported_not_dumped() {
+        let d = tmp_dir("bin");
+        let p = d.join("raw.bin");
+        // 一个非法 UTF-8 序列（0xFF 不是任何合法起始字节）
+        std::fs::write(&p, [0xff_u8, 0xfe, 0x00, 0x41]).unwrap();
+        let r = dispatch_payload(vol(), "read_file", json!({"path": p.display().to_string()}))
+            .await
+            .unwrap();
+        assert_eq!(r["binary"], true);
+        assert!(r.get("text").is_none(), "二进制不该带 text 字段");
+        assert_eq!(r["bytes"], 4);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn create_dir_and_rename_work_on_disk() {
+        let d = tmp_dir("ops");
+        let sub = d.join("made").display().to_string();
+        let r = dispatch_payload(vol(), "create_dir", json!({"path": sub}))
+            .await
+            .unwrap();
+        assert_eq!(r["created"], true);
+        assert!(d.join("made").is_dir());
+
+        let from = d.join("made\\a.txt");
+        std::fs::write(&from, "x").unwrap();
+        let to = d.join("made\\b.txt").display().to_string();
+        dispatch_payload(
+            vol(),
+            "rename",
+            json!({"from": from.display().to_string(), "to": to}),
+        )
+        .await
+        .unwrap();
+        assert!(!from.exists(), "改名后旧路径不该还在");
+        assert!(d.join("made\\b.txt").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 读不存在的路径要报错，不能返回"空文件"——
+    /// 空文件和读不到在用户眼里是两件事。
+    #[tokio::test]
+    async fn read_missing_file_errors_instead_of_returning_empty() {
+        let d = tmp_dir("missing");
+        let p = d.join("nope.txt").display().to_string();
+        let e = dispatch_payload(vol(), "read_file", json!({"path": p}))
+            .await
+            .expect_err("不存在的路径必须报错");
+        assert_ne!(e.code, crate::protocol::METHOD_NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // -------------------------------------------- 只读卷：新三条写路径必须一样拒绝
+
+    // 这些名字里有一半没被 `super::*` 带进来（tools.rs 只用到它们的全路径写法），
+    // 而 `Result` 必须是 fmnr_core 的单参数别名，不是 std 的双参数版本。
+    use fmnr_core::{
+        Entry, ExternalOpen, ExternalOpens, OpReport, Progress, Result, VolumeId, VolumeKind,
+    };
+
+    /// 把本地卷包一层，只把 `writable()` 翻成 false，其余全转发。
+    ///
+    /// 为什么不拿 fmnr-archive 的真只读卷当夹具：那会把 zstd-sys 的跨端 C 编译器
+    /// 拽进 fmnr-ai 的依赖图（本机与 CI 各多背一份编译成本），而这条测试要的
+    /// 只是「卷说自己不可写」这一个布尔。
+    struct ReadOnly(LocalVolume);
+
+    #[async_trait::async_trait]
+    impl Volume for ReadOnly {
+        fn id(&self) -> VolumeId {
+            self.0.id()
+        }
+        fn kind(&self) -> VolumeKind {
+            self.0.kind()
+        }
+        async fn list(&self, path: &VPath, opts: &ListOpts) -> Result<Vec<Entry>> {
+            self.0.list(path, opts).await
+        }
+        async fn read_stream(
+            &self,
+            path: &VPath,
+        ) -> Result<Box<dyn futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + Unpin>>
+        {
+            self.0.read_stream(path).await
+        }
+        async fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
+            self.0.write(path, data).await
+        }
+        fn writable(&self) -> bool {
+            false
+        }
+        fn native_path(&self, path: &VPath) -> Option<std::path::PathBuf> {
+            self.0.native_path(path)
+        }
+        async fn spawn_external_open(
+            &self,
+            file_path: &VPath,
+            program: &str,
+        ) -> Result<ExternalOpen> {
+            self.0.spawn_external_open(file_path, program).await
+        }
+        fn external_opens(&self) -> &ExternalOpens {
+            self.0.external_opens()
+        }
+        async fn copy(
+            &self,
+            sources: &[VPath],
+            dest_dir: &VPath,
+            policy: ConflictPolicy,
+            progress: Arc<Progress>,
+        ) -> Result<OpReport> {
+            self.0.copy(sources, dest_dir, policy, progress).await
+        }
+        async fn move_entries(
+            &self,
+            sources: &[VPath],
+            dest_dir: &VPath,
+            policy: ConflictPolicy,
+            progress: Arc<Progress>,
+        ) -> Result<OpReport> {
+            self.0
+                .move_entries(sources, dest_dir, policy, progress)
+                .await
+        }
+        async fn delete(&self, targets: &[VPath], progress: Arc<Progress>) -> Result<OpReport> {
+            self.0.delete(targets, progress).await
+        }
+        async fn rename(&self, from: &VPath, to: &VPath) -> Result<()> {
+            self.0.rename(from, to).await
+        }
+        async fn create_dir(&self, path: &VPath) -> Result<()> {
+            self.0.create_dir(path).await
+        }
+        async fn search(&self, root: &VPath, needle: String, limit: usize) -> Result<Vec<VPath>> {
+            self.0.search(root, needle, limit).await
+        }
+    }
+
+    fn ro_vol() -> Arc<dyn Volume> {
+        Arc::new(ReadOnly(LocalVolume::new(std::env::temp_dir())))
+    }
+
+    /// 三条写路径在只读卷上必须在**落盘之前**被拦下，且报的是 INVALID_PARAMS
+    /// 而不是内部错误——归档卷/远程卷挂进 UI 之后，这就是唯一的护栏。
+    #[tokio::test]
+    async fn readonly_volume_rejects_each_write_tool() {
+        for (tool, args) in [
+            ("write_file", json!({"path": "x.txt", "text": "hi"})),
+            ("rename", json!({"from": "a", "to": "b"})),
+            ("create_dir", json!({"path": "d"})),
+        ] {
+            let e = dispatch_payload(ro_vol(), tool, args)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("只读卷上 {tool} 竟然成功了"));
+            assert_eq!(
+                e.code,
+                crate::protocol::INTERNAL_ERROR,
+                "{tool} 错误码：{}",
+                e.message
+            );
+            // 钉住的是"跟兄弟工具同一条映射"，不是"这个码最合适"：
+            // 只读现在统一落到 Unsupported → to_rpc → INTERNAL_ERROR。
+            // 该不该给客户端一个更可辨的码是独立的契约改动，见任务清单。
+            assert!(
+                e.message.contains("只读"),
+                "{tool} 应说明是只读卷拦的：{}",
+                e.message
+            );
+        }
+    }
+
+    /// 只读卷的读路径不受影响：拦写不等于拦读。
+    #[tokio::test]
+    async fn readonly_volume_still_reads() {
+        let d = tmp_dir("ro-read");
+        std::fs::write(d.join("in.txt"), b"abc").unwrap();
+        let p = d.join("in.txt").display().to_string();
+        let v = dispatch_payload(ro_vol(), "read_file", json!({"path": p}))
+            .await
+            .expect("只读卷应能读");
+        assert_eq!(v["text"], json!("abc"));
+        assert_eq!(v["bytes"], json!(3));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

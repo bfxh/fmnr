@@ -219,3 +219,57 @@ fn register_dry_run_leaves_registry_untouched() {
         "干跑后不该存在 HKCU\\Software\\Classes\\fmnr，但 reg query 找到了"
     );
 }
+
+/// 新上表的四条能力走完整 argv → 分发 → 磁盘 这条路。
+/// 单测（tools.rs 里）只证明分发表认得它们；这条证明**命令行真能用**，
+/// 也正是"内核有但入口调不到"那个缺口的验收。
+#[test]
+fn put_cat_mkdir_rename_roundtrip_through_argv() {
+    let fx = Fixture::new("newtools");
+    let target = fx.0.join("note.txt");
+
+    let p = run_json(
+        &fx.0,
+        &[
+            "put",
+            "note.txt",
+            "第一行
+",
+        ],
+    );
+    assert_eq!(p["bytes"], serde_json::json!(10), "UTF-8 中文字节数：{p}");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "第一行
+"
+    );
+
+    let p = run_json(&fx.0, &["cat", "note.txt"]);
+    assert_eq!(
+        p["text"],
+        serde_json::json!(
+            "第一行
+"
+        )
+    );
+    assert_eq!(p["binary"], serde_json::json!(false));
+    assert_eq!(p["truncated"], serde_json::json!(false));
+
+    run_json(&fx.0, &["mkdir", "made"]);
+    assert!(fx.0.join("made").is_dir(), "mkdir 应真建出目录");
+
+    run_json(&fx.0, &["rename", "note.txt", "made/renamed.txt"]);
+    assert!(!target.exists(), "改名后旧路径不该还在");
+    assert!(fx.0.join("made").join("renamed.txt").exists());
+}
+
+/// 上限要能在命令行上表达，且**截断必须说出来**——
+/// 客户端拿半截内容当全文再写回去会毁文件。
+#[test]
+fn cat_reports_truncation_from_cli() {
+    let fx = Fixture::new("catcut");
+    std::fs::write(fx.0.join("big.txt"), vec![b'z'; 400]).unwrap();
+    let p = run_json(&fx.0, &["cat", "big.txt", "--max-bytes", "50"]);
+    assert_eq!(p["bytes"], serde_json::json!(50));
+    assert_eq!(p["truncated"], serde_json::json!(true), "必须报截断：{p}");
+}

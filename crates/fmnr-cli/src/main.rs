@@ -53,6 +53,37 @@ enum Cmd {
         limit: usize,
     },
 
+    /// 读文件的文本内容（非 UTF-8 只报 binary，不吐乱码）
+    Cat {
+        /// 文件路径
+        path: String,
+        /// 读取上限（字节）
+        #[arg(long, default_value_t = 262144)]
+        max_bytes: usize,
+    },
+
+    /// 写一个 UTF-8 文本文件（整体覆盖）
+    Put {
+        /// 文件路径
+        path: String,
+        /// 完整内容
+        text: String,
+    },
+
+    /// 重命名/移动单个条目（同卷内）
+    Rename {
+        /// 现路径
+        from: String,
+        /// 新路径
+        to: String,
+    },
+
+    /// 新建目录
+    Mkdir {
+        /// 目录路径
+        path: String,
+    },
+
     /// 拷贝条目到目标目录
     Cp {
         /// 源条目（至少一个）
@@ -194,6 +225,14 @@ impl Cmd {
                 Action::Tool("open", a)
             }
             Cmd::Opens => Action::Tool("external_opens", json!({})),
+            Cmd::Cat { path, max_bytes } => {
+                Action::Tool("read_file", json!({ "path": path, "max_bytes": max_bytes }))
+            }
+            Cmd::Put { path, text } => {
+                Action::Tool("write_file", json!({ "path": path, "text": text }))
+            }
+            Cmd::Rename { from, to } => Action::Tool("rename", json!({ "from": from, "to": to })),
+            Cmd::Mkdir { path } => Action::Tool("create_dir", json!({ "path": path })),
             Cmd::Register { exe, dry_run } => Action::Register {
                 exe: exe.clone(),
                 dry_run: *dry_run,

@@ -259,7 +259,7 @@ CLI/HTTP 直接用 payload。当初这么设计就是为了不出现"CLI 能删�
 | N6 | CDC 去重式归档卷（§5.3） | 改 1 MB 后重写量 ≈ 一个 chunk（基准进 CI，可回归） |
 | 待拍板 | 跨设备（§3）——要不要改产品定位 | 见 §9 |
 
-## 9. 需要你拍的三件事
+## 9. 需要你拍的三件事（现在四件，第 4 件是 N1 做出来的）
 
 1. **跨设备同步要不要做**？它撞 `DESIGN.md` 第 70 行的非目标。做 ⇒ 定位从"单机文件管理器
    + 远程卷"变成"含同步的文件系统工具"，且要接受"发现自动、信任必须配对、跨网要 relay"
@@ -276,3 +276,48 @@ CLI/HTTP 直接用 payload。当初这么设计就是为了不出现"CLI 能删�
 `cafb2b3` 磁盘占用视图；`5f3e896`/`47a301a` 本地门禁 + 夹具形状守卫 + 跨平台修复；
 `25455fe` 自启动搬到顶栏 + 全量列出。
 CI：`47a301a` 六个 job 全绿（双平台 + 插件行为 + 字节可复现 + 客户端契约）。
+
+## 11. N1 做完了哪一半（2026-10-17）
+
+**§6.1 内核能力上表：做完了。** `read_file` / `write_file` / `rename` / `create_dir`
+进了 `tools::specs()` 与 `dispatch_payload`，CLI 加了 `cat` / `put` / `rename` / `mkdir`
+四个子命令。两条值得写下来的实现取向：
+
+- `read_file` **按块读到上限就停**，不"先整读再截断"——后者读一个 4 GB 文件会先把机器打满；
+  正好停在边界时再问一块，用来分清"截断了"和"刚好读完整个文件"。
+- 非 UTF-8 的内容返回 `binary: true` 而不硬塞文本：调用方拿到一屏乱码比拿到一个布尔更难办。
+
+**判据兑现**：`crates/fmnr-ai/tests/entry_parity.rs` 让三条腿各跑同一串五个动作
+（MCP 走真子进程 stdin/stdout、HTTP 走真套接字、CLI 走真二进制），
+逐步比对返回的 JSON **整份相等**（不是"关键字段相等"）。
+反证打过：给 CLI 腿的 `cat` 偷偷加一个 `--max-bytes 3`，第 3 步立刻判红。
+参数一律用相对路径——卷根就是各条腿自己的工作目录，所以返回体回显的 `path`
+与绝对路径无关，三条腿才可能字节级相等。
+
+**§6.2 MCP/HTTP 接多卷：没做。** 现在只有 CLI 会按路径前缀路由到归档/远程卷
+（`build_volume_registry` + `route_volume`），MCP server 与 HTTP router 各拿**一个**卷。
+所以"从 MCP 读压缩包里的文件"今天仍然做不到——这是覆盖问题，不是协议问题，
+但它不在本轮已完成的那一半里，别把它记成已完成。
+
+**顺带钉住的一条安全边界**：三条写路径在 `volume.writable() == false` 时
+先拒再落盘，错误走 `Error::Unsupported → to_rpc`，与 `copy`/`delete` 同一条映射
+（因此今天落在 `INTERNAL_ERROR`）。**没**给它另发明一个错误码——那是 whole-surface
+的契约改动，单列为待拍板（下面第 4 条）。
+
+**只读错误码（新增第 4 件待拍板）**：只读卷上写文件回 `-32603 内部错误`，
+MCP 客户端会当成服务端故障而重试。要不要给一个可辨的码（并顺带改 `copy`/`delete`/`move`）
+需要拍板，因为它改的是已有对外契约。
+
+## 12. 门禁第 5 步的可覆盖面是量出来的，不是推的
+
+本机 `x86_64-unknown-linux-gnu` 的 clippy **编不过全工作区**：`ring`（←russh←fmnr-remote）
+和 `zstd-sys`（←fmnr-archive）的构建脚本要 `x86_64-linux-gnu-gcc`，这台机器没有跨端 C 编译器。
+逐包实跑后的分档写进了 `scripts/gate.sh`：
+
+- 跑得动、必须绿：`fmnr-core fmnr-fs fmnr-pkg fmnr-icons fmnr-plugins fmnr-ai fmnr-bench`
+- 跑不动、点名说没判：`fmnr-ui fmnr-cli fmnr-mount fmnr-remote fmnr-archive`
+  （它们的非 Windows 编译只有 CI 的 ubuntu job 判得动）
+
+上一版脚本对第 5 步用 `--workspace`，我删掉 `target/x86_64-unknown-linux-gnu` 之后
+它就从"绿"变成了"环境判红"——**缓存能掩盖环境缺口**。所以分档必须显式列包名，
+不能靠"上次它过了"。
