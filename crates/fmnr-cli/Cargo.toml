@@ -14,6 +14,7 @@ path = "src/main.rs"
 fmnr-core = { path = "../fmnr-core" }
 fmnr-fs = { path = "../fmnr-fs" }
 fmnr-ai = { path = "../fmnr-ai" }
+fmnr-archive = { path = "../fmnr-archive" }
 serde_json.workspace = true
 tokio.workspace = true
 clap = { version = "4", features = ["derive"] }

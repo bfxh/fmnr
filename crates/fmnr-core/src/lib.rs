@@ -1,6 +1,7 @@
 pub mod board;
 pub mod open;
 pub mod search;
+pub mod volreg;
 pub mod wsl;
 
 use serde::{Deserialize, Serialize};

@@ -8,6 +8,9 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use fmnr_ai::tools;
+use fmnr_archive::ArchiveVolume;
+use fmnr_core::volreg::VolumeRegistry;
+use fmnr_core::VolumeId;
 use fmnr_fs::LocalVolume;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -212,6 +215,38 @@ impl ConflictArg {
     }
 }
 
+/// 把「当前工作目录」组装成一个卷注册表：本地卷 + 当目
+/// 录下所有可识别的归档（zip/tar），让 CLI 的工具调用跑在统一的仓上。
+///
+/// **M8 入口。** 本地卷之外的远程/WSL 卷在此再进入；
+/// UI 侧按 `fmnr_core::volreg` 的 `VolumeRegistry` 做独立选卷。
+fn build_volume_registry() -> VolumeRegistry {
+    let reg = VolumeRegistry::new();
+
+    // 1）本地卷：CLI 的工作目录作为本地根。
+    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    reg.add(Arc::new(LocalVolume::new(root.clone())));
+
+    // 2）归档卷：把当目录下所有 zip/tar 的入口挂进去（只读懒加载）。
+    // 注意：`path.extension()` 只取最后一段（test.tar.gz → gz），所以要按
+    // 文件名全称匹配，不能只看 extension。
+    let archive_names: &[&str] = &["zip", "tar", "tar.gz", "tgz", "tar.bz2", "tbz2"];
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for e in entries.flatten() {
+            let path = e.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let lower = name.to_lowercase();
+            if archive_names.iter().any(|a| lower.ends_with(a)) {
+                if let Ok(vol) = ArchiveVolume::open(&path) {
+                    reg.add(Arc::new(vol));
+                }
+            }
+        }
+    }
+
+    reg
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -307,8 +342,42 @@ fn plan_to_json(plan: &fmnr_fs::assoc::RegistrationPlan) -> Value {
 }
 
 fn run_tool(tool: &'static str, args: Value) {
-    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let volume = Arc::new(LocalVolume::new(root));
+    let registry = build_volume_registry();
+
+    // 默认落在注册表里的第一个卷（通常是本地卷）。
+    let default_volume = registry
+        .get_mut(&VolumeId("local:.".into()))
+        .unwrap_or_else(|| {
+            Arc::new(LocalVolume::new(
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            ))
+        })
+        .clone();
+
+    let volume = match tool {
+        // `list_volume` 列出注册表里的每一个卷。
+        "list_volume" => {
+            let items: Vec<Value> = registry
+                .list()
+                .iter()
+                .map(|v| {
+                    json!({
+                        "id": v.id.0,
+                        "kind": format!("{:?}", v.kind),
+                        "writable": v.writable,
+                        "name": v.name,
+                        "note": v.note,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "volumes": items })).unwrap()
+            );
+            return;
+        }
+        _ => default_volume,
+    };
 
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()

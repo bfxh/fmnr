@@ -1,6 +1,7 @@
 use eframe::egui::{self, Color32, Key, Modifiers};
 use fmnr_core::open::{route_open as core_route_open, OpenRoute};
-use fmnr_core::{ListOpts, SortOrder, VPath, Volume};
+use fmnr_core::volreg::VolumeRegistry;
+use fmnr_core::{ListOpts, SortOrder, VPath, Volume, VolumeId};
 use fmnr_fs::LocalVolume;
 use futures::StreamExt;
 use std::path::{Path, PathBuf};
@@ -33,7 +34,8 @@ fn color_for(program: &str) -> Color32 {
 }
 
 pub struct App {
-    volume: Arc<dyn Volume>,
+    volume_registry: VolumeRegistry,
+    current_volume_id: Option<VolumeId>,
     /// 左栏当前目录
     left_path: PathBuf,
     /// 右栏当前目录
@@ -107,10 +109,17 @@ struct ConflictPrompt {
 
 impl App {
     pub fn new(cjk_font_ok: bool) -> Self {
+        // M8 卷接线：本地卷注册进 `VolumeRegistry`，UI 靠 `current_volume_id`
+        // 选中卷；远程/WSL/归档卷后续注册进同一个 registry 就能被 UI 选中。
         let home = dirs_home();
-        let volume = Arc::new(LocalVolume::new(home.clone()));
+        let registry = VolumeRegistry::new();
+        // 用 add 回传的真实 id，而不是硬编码 local:. —— LocalVolume::new(home)
+        // 自生的 id 是 local:<home 绝对路径>，写死 local:. 会永远查不到，
+        // 让 current_volume() 每次都走 fallback，等于卷接线没生效。
+        let current_volume_id = Some(registry.add(Arc::new(LocalVolume::new(home.clone()))));
         let mut app = Self {
-            volume,
+            volume_registry: registry,
+            current_volume_id,
             left_path: home.clone(),
             right_path: home,
             left_entries: Vec::new(),
@@ -173,10 +182,61 @@ impl App {
     fn refresh(&mut self) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let opts = self.opts();
-        let l = rt.block_on(self.volume.list(&VPath(self.left_path.clone()), &opts));
-        let r = rt.block_on(self.volume.list(&VPath(self.right_path.clone()), &opts));
+        // 空仓不 panic：UI 启动即注册本地卷，正常路径下 `current_volume()`
+        // 必定有值；但注册表被清空时不该让整个界面崩掉，留两栏空列表即可。
+        let Some(volume) = self.current_volume() else {
+            self.left_entries = Vec::new();
+            self.right_entries = Vec::new();
+            return;
+        };
+        let l = rt.block_on(volume.list(&VPath(self.left_path.clone()), &opts));
+        let r = rt.block_on(volume.list(&VPath(self.right_path.clone()), &opts));
         self.left_entries = l.unwrap_or_default();
         self.right_entries = r.unwrap_or_default();
+    }
+
+    /// 当前选中的卷（Registry 查表）。
+    ///
+    /// 查不到时回落到「仓里的第一个卷」而不是新建一个临时 `LocalVolume`：
+    /// 临时卷会让 `external_opens()`（外部打开角标）落在没人读的登记表上，
+    /// 角标从此永远不亮——这个 bug 不会报错，只会静默失灵。
+    fn current_volume(&self) -> Option<Arc<dyn Volume>> {
+        let by_id = self
+            .current_volume_id
+            .as_ref()
+            .and_then(|id| self.volume_registry.get(id));
+        by_id.or_else(|| {
+            self.volume_registry
+                .list()
+                .first()
+                .and_then(|v| self.volume_registry.get(&v.id))
+        })
+    }
+
+    /// 切换当前卷：换卷要同时把两栏路径复位到该卷根，
+    /// 否则会拿上一卷的绝对路径去问新卷要条目（归档/WSL 卷上必然失败）。
+    fn switch_volume(&mut self, id: VolumeId) {
+        if self.current_volume_id.as_ref() == Some(&id) {
+            return;
+        }
+        self.current_volume_id = Some(id);
+        let kind = self.current_volume().map(|v| v.kind());
+        // 本地/WSL 卷用 home 当起点（这是用户最常去的地方）；
+        // 归档等虚拟卷没有「home」概念，从卷根开始。
+        let start = match kind {
+            Some(fmnr_core::VolumeKind::Local) => dirs_home(),
+            _ => PathBuf::new(),
+        };
+        self.left_path = start.clone();
+        self.right_path = start;
+        self.left_selected = None;
+        self.right_selected = None;
+        self.preview = None;
+        self.status = format!(
+            "已切换到卷 {}",
+            short_volume_name(&self.current_volume_id.as_ref().unwrap().0)
+        );
+        self.refresh();
     }
 
     fn active_path(&self) -> &PathBuf {
@@ -249,14 +309,18 @@ impl App {
         };
         let program_for_status = program.clone();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let volume = self.volume.clone();
+        let volume = self.current_volume().as_ref().unwrap().clone();
         let vpath = VPath(path.to_path_buf());
         let result = rt.block_on(async move { volume.spawn_external_open(&vpath, &program).await });
         match result {
             Ok(open) => {
                 // 登记进角标表：看门狗线程会在该进程退出时自动摘掉。
                 let key = path.display().to_string();
-                self.volume.external_opens().insert(key, open);
+                self.current_volume()
+                    .as_ref()
+                    .unwrap()
+                    .external_opens()
+                    .insert(key, open);
                 self.status = format!(
                     "已在 {} 中打开，关闭该程序后角标自动消失",
                     program_for_status
@@ -284,7 +348,7 @@ impl App {
     fn open_preview(&mut self, path: &Path) {
         let cap = crate::preview::cap_for(path);
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let volume = self.volume.clone();
+        let volume = self.current_volume().as_ref().unwrap().clone();
         let vpath = VPath(path.to_path_buf());
         let bytes = rt.block_on(async move {
             let mut stream = volume.read_stream(&vpath).await?;
@@ -445,7 +509,7 @@ impl App {
             dest_dir,
             policy,
         };
-        match crate::ops::spawn_op(self.volume.clone(), req) {
+        match crate::ops::spawn_op(self.current_volume().as_ref().unwrap().clone(), req) {
             Ok(running) => {
                 self.status = running.label.clone();
                 self.running = Some(running);
@@ -537,7 +601,7 @@ impl App {
             return;
         }
         let rt = tokio::runtime::Runtime::new().unwrap();
-        match rt.block_on(self.volume.rename(&from, &to)) {
+        match rt.block_on(self.current_volume().as_ref().unwrap().rename(&from, &to)) {
             Ok(()) => {
                 self.status = format!("已重命名为 {name}");
                 self.refresh();
@@ -560,7 +624,7 @@ impl App {
         }
         let target = VPath(self.active_path().join(name));
         let rt = tokio::runtime::Runtime::new().unwrap();
-        match rt.block_on(self.volume.create_dir(&target)) {
+        match rt.block_on(self.current_volume().as_ref().unwrap().create_dir(&target)) {
             Ok(()) => {
                 self.status = format!("已新建 {name}");
                 self.refresh();
@@ -653,6 +717,34 @@ impl eframe::App for App {
                     self.fit_board();
                 }
                 ui.checkbox(&mut self.show_hidden, "隐藏项");
+                // M8 卷接线：卷列表来自 VolumeRegistry，不是写死的本地盘。
+                // 注册进 registry 的卷（归档/WSL/SSH）会自动出现在这里。
+                let volumes = self.volume_registry.list();
+                if !volumes.is_empty() {
+                    let current = self
+                        .current_volume_id
+                        .as_ref()
+                        .map(|id| id.0.clone())
+                        .unwrap_or_default();
+                    let mut picked: Option<VolumeId> = None;
+                    egui::ComboBox::from_label("卷")
+                        .selected_text(short_volume_name(&current))
+                        .show_ui(ui, |ui| {
+                            for v in &volumes {
+                                let label = format!(
+                                    "{}{}",
+                                    short_volume_name(&v.id.0),
+                                    if v.writable { "" } else { "（只读）" }
+                                );
+                                if ui.selectable_label(v.id.0 == current, label).clicked() {
+                                    picked = Some(v.id.clone());
+                                }
+                            }
+                        });
+                    if let Some(id) = picked {
+                        self.switch_volume(id);
+                    }
+                }
                 egui::ComboBox::from_label("排序")
                     .selected_text(format!("{:?}", self.sort))
                     .show_ui(ui, |ui| {
@@ -1369,7 +1461,9 @@ impl App {
                 let badges: Vec<Option<fmnr_core::ExternalOpen>> = entries
                     .iter()
                     .map(|e| {
-                        self.volume
+                        self.current_volume()
+                            .as_ref()
+                            .unwrap()
                             .external_opens()
                             .get(base.join(&e.name).display().to_string())
                     })
@@ -1567,6 +1661,19 @@ fn truncate_label(s: &str, max_chars: usize) -> String {
         out.push('…');
     }
     out
+}
+
+/// 卷 id 的显示短名：顶栏和状态栏放不下完整路径。
+///
+/// `local:C:\Users\lbx13` 这种在顶栏会撑爆布局，显示成 `local:C:`；
+/// 归档卷本身较短（`archive:D:\x\a.zip`），保留中段以便区分同名 zip。
+fn short_volume_name(id: &str) -> String {
+    if let Some(rest) = id.strip_prefix("local:") {
+        // 本地卷取盘符/根段；取不到就退回原样（相对路径、UNC 等）。
+        let head: String = rest.chars().take(3).collect();
+        return format!("local:{}", head);
+    }
+    truncate_label(id, 40)
 }
 
 fn dirs_home() -> PathBuf {

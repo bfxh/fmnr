@@ -1586,6 +1586,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "fmnr-ai",
+ "fmnr-archive",
  "fmnr-core",
  "fmnr-fs",
  "serde_json",
