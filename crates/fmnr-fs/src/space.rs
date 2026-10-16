@@ -76,6 +76,10 @@ pub fn of(path: &std::path::Path) -> Result<Space, String> {
 /// 走到第一个存在的祖先。`GetDiskFreeSpaceExW` 要的是"卷上的一个路径"，
 /// 路径本身不存在时它会失败——而"看一个还没建的目录会在哪卷上有多少空间"
 /// 是个合理问题。
+///
+/// 跟着唯一的调用方一起门控：非 Windows 上 `of()` 是桩实现，不门控
+/// 会让 ubuntu 的 lib 构建判 `dead_code`（本机跑 clippy 看不见这条）。
+#[cfg(windows)]
 fn existing_ancestor(path: &std::path::Path) -> std::path::PathBuf {
     let mut cur = path;
     loop {
@@ -136,6 +140,7 @@ mod tests {
         assert!(s.total > 0);
     }
 
+    #[cfg(windows)]
     #[test]
     fn existing_ancestor_terminates_on_a_root() {
         // 盘根没有可去的父目录；这里不能无限循环

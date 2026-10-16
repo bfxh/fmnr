@@ -12,16 +12,16 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-echo "── 1/4 fmt ──"
+echo "── 1/5 fmt ──"
 cargo fmt --all --check
 
-echo "── 2/4 clippy（--keep-going：不带它时第一个判红的 crate 会挡住所有下游）──"
+echo "── 2/5 clippy（--keep-going：不带它时第一个判红的 crate 会挡住所有下游）──"
 cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
 
-echo "── 3/4 test ──"
+echo "── 3/5 test ──"
 cargo test --workspace --locked
 
-echo "── 4/4 暂存区内容自己过得了 fmt ──"
+echo "── 4/5 暂存区内容自己过得了 fmt ──"
 TMPD=$(mktemp -d)
 trap 'rm -rf "$TMPD"' EXIT
 git checkout-index -a -f --prefix="$TMPD/"
@@ -32,4 +32,18 @@ if ! (cd "$TMPD" && cargo fmt --all --check); then
     exit 1
 fi
 
-echo "gate: 全绿"
+echo "── 5/5 跨平台编译（抓 cfg 门控漏出来的死代码）──"
+# 本机是 windows-gnu，第 2 步看不见"只在非 Windows 上成为 dead_code"这类错——
+# `space::existing_ancestor` 就是这么让 CI 的 ubuntu lint 门判红、而本地全绿的。
+# 装了 linux 目标就真跑；没装就**明说没跑**，不伪装成绿。
+LT=x86_64-unknown-linux-gnu
+if rustup target list --installed | grep -q "^$LT\$"; then
+    cargo clippy --workspace --all-targets --locked --target "$LT" --keep-going -- -D warnings
+    echo "跨平台 clippy：跑过 $LT"
+else
+    echo "跳过：本机没装 $LT 目标，所以「非 Windows 上才出现的错」这一类**本地判不出来**。"
+    echo "      要补上这条能力：rustup target add $LT"
+    echo "      （只 cargo check 级别的产物，不需要 linux 链接器。）"
+fi
+
+echo "gate: 全绿（第 5 步若显示跳过，则跨平台那一类未覆盖）"
