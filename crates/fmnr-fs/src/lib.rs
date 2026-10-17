@@ -146,34 +146,40 @@ impl Volume for LocalVolume {
                 Err(_) => continue,
             };
 
+            // 属性**总是**算出来，再按开关决定要不要把隐藏项剔掉。
+            // 原来整块写在 `if !opts.show_hidden` 里面，于是勾上「显示隐藏项」之后
+            // Hidden/System/ReadOnly 三个标记会一起消失，而 `Attr::Hidden` 那一行
+            // 前面就摆着一个同条件的 `continue` —— 它在 Windows 上根本到不了。
+            // 归档卷（`fmnr-archive`）用的是"先算再筛"，这里对齐成同一套口径。
             let mut attrs = Vec::new();
-            if !opts.show_hidden {
-                #[cfg(windows)]
-                {
-                    use std::os::windows::fs::MetadataExt;
-                    let fa = meta.file_attributes();
-                    if fa & 0x2 != 0 {
-                        // FILE_ATTRIBUTE_HIDDEN
-                        if !opts.show_hidden {
-                            continue;
-                        }
-                        attrs.push(Attr::Hidden);
-                    }
-                    if fa & 0x4 != 0 {
-                        attrs.push(Attr::System);
-                    }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                let fa = meta.file_attributes();
+                if fa & 0x1 != 0 {
+                    attrs.push(Attr::ReadOnly); // FILE_ATTRIBUTE_READONLY
                 }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    let mode = meta.mode();
-                    if name.starts_with('.') {
-                        continue;
-                    }
-                    if mode & 0o400 == 0 {
-                        attrs.push(Attr::ReadOnly);
-                    }
+                if fa & 0x2 != 0 {
+                    attrs.push(Attr::Hidden); // FILE_ATTRIBUTE_HIDDEN
                 }
+                if fa & 0x4 != 0 {
+                    attrs.push(Attr::System); // FILE_ATTRIBUTE_SYSTEM
+                }
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if name.starts_with('.') {
+                    attrs.push(Attr::Hidden);
+                }
+                if meta.mode() & 0o200 == 0 {
+                    // 属主没有**写**位才叫只读。原来判的是 0o400（读位），
+                    // 会把"能改但谁都不许读"的文件报成只读、把真只读的漏掉。
+                    attrs.push(Attr::ReadOnly);
+                }
+            }
+            if !opts.show_hidden && attrs.contains(&Attr::Hidden) {
+                continue;
             }
 
             let symlink = item.path().is_symlink();
@@ -910,5 +916,166 @@ mod watch_tests {
             "句柄数增长 {growth}（{before} → {after}），疑似泄漏"
         );
         std::fs::remove_file(&file).ok();
+    }
+}
+
+#[cfg(test)]
+mod attr_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("fmnr-attr-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn opts(show_hidden: bool) -> ListOpts {
+        ListOpts {
+            show_hidden,
+            sort: SortOrder::Name,
+        }
+    }
+
+    #[cfg(windows)]
+    fn set_attrs(p: &Path, attrs: windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES) {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = p
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            windows::Win32::Storage::FileSystem::SetFileAttributesW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                attrs,
+            )
+        }
+        .expect("SetFileAttributesW");
+    }
+
+    /// 造一个"隐藏"文件并返回条目名：Windows 打属性位，unix 走点开头约定。
+    fn make_hidden(dir: &Path, stem: &str) -> String {
+        #[cfg(windows)]
+        let name = format!("{stem}.txt");
+        #[cfg(unix)]
+        let name = format!(".{stem}.txt");
+        let p = dir.join(&name);
+        std::fs::write(&p, b"x").unwrap();
+        #[cfg(windows)]
+        set_attrs(
+            &p,
+            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN,
+        );
+        name
+    }
+
+    /// 造一个只读文件。Windows 打属性位，unix 去掉属主写位。
+    fn make_readonly(dir: &Path, stem: &str) -> String {
+        let name = format!("{stem}.txt");
+        let p = dir.join(&name);
+        std::fs::write(&p, b"x").unwrap();
+        #[cfg(windows)]
+        set_attrs(
+            &p,
+            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY,
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        name
+    }
+
+    /// 「显示隐藏项」不许把属性一起关掉。
+    ///
+    /// 修前整段属性计算写在 `if !show_hidden` 里面：勾上显示之后
+    /// Hidden/System/ReadOnly 三个标记一起变空，而 `Attr::Hidden` 那一行
+    /// 前面还摆着一个同条件的 `continue` —— 它在 Windows 上根本到不了。
+    #[test]
+    fn hidden_entry_still_carries_its_attrs_when_shown() {
+        let d = tmp("hidden");
+        let name = make_hidden(&d, "secret");
+        let plain = {
+            std::fs::write(d.join("plain.txt"), b"x").unwrap();
+            "plain.txt".to_string()
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let vol = LocalVolume::new(&d);
+
+        let shown = rt
+            .block_on(vol.list(&VPath(PathBuf::from(".")), &opts(true)))
+            .unwrap();
+        let e = shown
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("开了「显示隐藏项」却没列出 {name}：{:?}", names(&shown)));
+        assert!(
+            e.attrs.contains(&Attr::Hidden),
+            "隐藏项列出来了却没带 Hidden 标记：{:?}",
+            e.attrs
+        );
+        // 对照组：普通文件不许也带 Hidden，否则上面那条断言等于什么都没判
+        let p = shown
+            .iter()
+            .find(|e| e.name == plain)
+            .expect("普通文件要列出来");
+        assert!(
+            !p.attrs.contains(&Attr::Hidden),
+            "普通文件被判成隐藏：{:?}",
+            p.attrs
+        );
+
+        let off = rt
+            .block_on(vol.list(&VPath(PathBuf::from(".")), &opts(false)))
+            .unwrap();
+        assert!(
+            !off.iter().any(|e| e.name == name),
+            "没开「显示隐藏项」却列出了隐藏项"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 只读位要真的报出来（`stat` 工具的描述里写了"只读"这一位）。
+    #[test]
+    fn read_only_bit_is_reported_and_not_for_everyone() {
+        let d = tmp("readonly");
+        let locked = make_readonly(&d, "locked");
+        std::fs::write(d.join("normal.txt"), b"x").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let vol = LocalVolume::new(&d);
+        let got = rt
+            .block_on(vol.list(&VPath(PathBuf::from(".")), &opts(true)))
+            .unwrap();
+        let e = got
+            .iter()
+            .find(|e| e.name == locked)
+            .unwrap_or_else(|| panic!("没列出 {locked}：{:?}", names(&got)));
+        assert!(
+            e.attrs.contains(&Attr::ReadOnly),
+            "只读文件没带 ReadOnly：{:?}",
+            e.attrs
+        );
+        let n = got
+            .iter()
+            .find(|e| e.name == "normal.txt")
+            .expect("普通文件要列出来");
+        assert!(
+            !n.attrs.contains(&Attr::ReadOnly),
+            "普通文件被判成只读：{:?}",
+            n.attrs
+        );
+        // 只读文件在 Windows 上删不掉，先清属性再收工
+        #[cfg(windows)]
+        set_attrs(
+            &d.join(&locked),
+            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn names(v: &[Entry]) -> Vec<String> {
+        v.iter().map(|e| e.name.clone()).collect()
     }
 }
