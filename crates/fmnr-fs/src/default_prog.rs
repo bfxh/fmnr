@@ -72,9 +72,14 @@ fn drop_placeholders(args: &str) -> String {
     if !cur.is_empty() {
         out.push(cur);
     }
+    // 凡是裸形以 `%` 开头的 token 一律摘掉：Windows 命令行里 `%1`…`%9`、`%*`、
+    // `%L`/`%l`（长路径）、`%U`/`%u`（URL）、`%V`/`%v`（verb）都是占位符，
+    // 而真实参数没有以 `%` 开头的写法。
+    // 判据写成"以 % 开头"而不是"等于 %1"，是 CI 的 windows runner 教我的：
+    // 它上面 `.txt` 的参数模板里留下了一个带尾巴的 `%1` 变体，精确匹配漏掉了它。
     out.retain(|t| {
         let bare = t.trim_matches('"');
-        !(bare.eq_ignore_ascii_case("%1") || bare.eq_ignore_ascii_case("%*") || bare.is_empty())
+        !(bare.is_empty() || bare.starts_with('%'))
     });
     out.join(" ")
 }
@@ -191,6 +196,26 @@ mod tests {
             parse_open_command(r#""C:\py\python.exe" "C:\py\script.py" "%1" --view %*"#).unwrap();
         assert_eq!(d.program, r"C:\py\python.exe");
         assert_eq!(d.args, r#""C:\py\script.py" --view"#, "实得 {:?}", d.args);
+    }
+
+    /// 占位符的**变体**也要摘干净。CI 的 windows runner 上 `.txt` 的参数模板
+    /// 里留下过一个带尾巴的 `%1` 写法，精确匹配漏掉了它——这条把整类钉住。
+    #[test]
+    fn placeholder_variants_all_go() {
+        for cmd in [
+            r#""C:\x\a.exe" "%1" "%1\01" %2 %* %L %V"#,
+            r#""C:\x\a.exe" -flag %1"#,
+        ] {
+            let d = parse_open_command(cmd).unwrap();
+            assert!(
+                !d.args.contains('%'),
+                "{cmd:?} 解析后参数里还留着占位符：{:?}",
+                d.args
+            );
+        }
+        // 反向：普通参数必须留下，别把"摘占位符"写成"清空参数"
+        let d = parse_open_command(r#""C:\x\a.exe" --view "%1""#).unwrap();
+        assert_eq!(d.args, "--view", "实得 {:?}", d.args);
     }
 
     #[test]

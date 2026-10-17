@@ -531,12 +531,15 @@ fn open_routes_text_to_preview_and_unknown_to_external() {
         );
         // Unsupported 映射到 INTERNAL_ERROR（能力缺失不是客户端可修正的 4xx）。
         assert_eq!(resp["error"]["code"], json!(-32603));
+        // 文案要说的是"这台机器上没有这个默认程序"，不是"打开了"。
+        // （原来锚的是"未实现"三个字——P0b 把解析接上之后，非 Windows 上
+        //  变成"没找到/本平台不解析"，语义没变：仍然是明确的做不到。）
         assert!(
             resp["error"]["message"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("未实现"),
-            "文案要说清是未实现：{}",
+                .contains("没找到"),
+            "文案要说清是拿不到默认程序：{}",
             resp["error"]["message"]
         );
         assert!(
