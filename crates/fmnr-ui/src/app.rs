@@ -1105,14 +1105,6 @@ impl App {
     /// 原来工具栏按钮直接调 `start_search()`，而空搜索词会让它把
     /// `search` 置回 None，于是**点按钮什么也不会发生**：面板根本没开过。
     fn open_search(&mut self) {
-        let kind = self.current_volume().map(|v| v.kind());
-        if !local_walkable(kind) {
-            // 不是"搜不到"，是"还没接上"——两句话必须分开说。
-            self.status =
-                "这个卷还搜不了：子树搜索目前只走本地文件系统（归档/远程卷未接进 Volume）"
-                    .to_string();
-            return;
-        }
         if self.search_open {
             self.search_focus = true;
             return;
@@ -1141,11 +1133,23 @@ impl App {
             self.search = None;
             return;
         }
-        self.search = Some(crate::search::spawn_search(crate::search::Query {
-            text,
-            root: self.search_root.clone(),
-            case_sensitive: false,
-        }));
+        let root = self.search_root.clone();
+        let case_sensitive = false;
+        // 本地/UNC/WSL 走 jwalk（一次遍历，快）；归档与远程卷的子树只有卷自己
+        // 看得见，必须改走 `Volume::list` 的逐层遍历——否则搜的是进程 CWD。
+        let kind = self.current_volume().map(|v| v.kind());
+        let volume = self.current_volume();
+        self.search = Some(match (volume, local_walkable(kind)) {
+            (Some(v), false) => crate::search::spawn_volume_search(v, root, text, case_sensitive),
+            // 本地/UNC/WSL，以及"根本没有卷"：后者走本地那条会立刻返回空，
+            // 界面显示"没有匹配项"——此时列不出东西的原因是"没卷"，
+            // 而这件事状态栏里已经写过了，不在这里重复一遍。
+            (_, _) => crate::search::spawn_search(crate::search::Query {
+                text,
+                root,
+                case_sensitive,
+            }),
+        });
     }
 
     /// 每帧拉一次搜索增量；有新结果就催重绘。
@@ -2620,11 +2624,16 @@ impl App {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let started = self
-                .search
-                .as_ref()
-                .map(|s| (s.hits.clone(), s.total, s.done, s.elapsed_ms));
-            let Some((hits, total, done, ms)) = started else {
+            let started = self.search.as_ref().map(|s| {
+                (
+                    s.hits.clone(),
+                    s.total,
+                    s.done,
+                    s.elapsed_ms,
+                    s.error.clone(),
+                )
+            });
+            let Some((hits, total, done, ms, err)) = started else {
                 ui.label(
                     egui::RichText::new("输入即搜：不用回车，也不用等整棵树扫完才看到第一批结果。")
                         .weak(),
@@ -2642,22 +2651,11 @@ impl App {
             ui.separator();
 
             if done && hits.is_empty() {
-                // 归档/远程卷上"0 个结果"是**假**的：搜索线程走的是 jwalk，
-                // 只能走本地文件系统，包内条目它根本看不见。
-                // 报"没有匹配项"等于把"我搜不了"说成"这里没有"。
-                let searchable = matches!(
-                    self.current_volume().map(|v| v.kind()),
-                    None | Some(fmnr_core::VolumeKind::Local)
-                        | Some(fmnr_core::VolumeKind::Unc)
-                        | Some(fmnr_core::VolumeKind::Wsl)
-                );
-                let msg = if searchable {
-                    format!("「{}」在这个子树里没有匹配项", self.search_text.trim())
-                } else {
-                    format!(
-                        "「{}」：这个卷的子树搜索还没接上（搜索目前只走本地文件系统），                         所以这里说的是\"搜不了\"，不是\"没有\"",
-                        self.search_text.trim()
-                    )
+                // 遍历失败要说成失败：报"没有匹配项"会把用户引去改关键词，
+                // 而真正该看的是挂载还在不在、网络通不通。
+                let msg = match err {
+                    Some(e) => format!("搜不动：{e}"),
+                    None => format!("「{}」在这个子树里没有匹配项", self.search_text.trim()),
                 };
                 ui.label(egui::RichText::new(msg).weak());
                 return;

@@ -40,8 +40,19 @@ pub struct SearchState {
     pub done: bool,
     /// 命中总数（可能大于 hits.len()，后者只收了已到达的部分）
     pub total: usize,
-    rx: Receiver<Vec<Hit>>,
+    /// 搜不动的原因（卷读不了、远程断了）。
+    ///
+    /// 必须有这个字段：没有它，"我搜不了"和"这里没有匹配"在界面上是同一句话，
+    /// 而后者会把用户引去改关键词，前者才是要他去看挂载/网络。
+    pub error: Option<String>,
+    rx: Receiver<Chunk>,
     started: Instant,
+}
+
+/// 后台线程往回送的东西：一批命中，或者一个失败原因。
+enum Chunk {
+    Batch(Vec<Hit>),
+    Failed(String),
 }
 
 impl SearchState {
@@ -50,9 +61,13 @@ impl SearchState {
         let mut got = false;
         loop {
             match self.rx.try_recv() {
-                Ok(batch) => {
+                Ok(Chunk::Batch(batch)) => {
                     self.total += batch.len();
                     self.hits.extend(batch);
+                    got = true;
+                }
+                Ok(Chunk::Failed(e)) => {
+                    self.error = Some(e);
                     got = true;
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -98,7 +113,10 @@ pub fn spawn_search(query: Query) -> SearchState {
             for entry in walker.filter_map(|e| e.ok()) {
                 if batch.len() >= BATCH
                     && tx
-                        .send(std::mem::replace(&mut batch, Vec::with_capacity(BATCH)))
+                        .send(Chunk::Batch(std::mem::replace(
+                            &mut batch,
+                            Vec::with_capacity(BATCH),
+                        )))
                         .is_err()
                 {
                     return;
@@ -117,7 +135,7 @@ pub fn spawn_search(query: Query) -> SearchState {
                 });
             }
             if !batch.is_empty() {
-                let _ = tx.send(batch);
+                let _ = tx.send(Chunk::Batch(batch));
             }
         })
         .expect("spawn search thread");
@@ -127,6 +145,107 @@ pub fn spawn_search(query: Query) -> SearchState {
         elapsed_ms: 0,
         done: false,
         total: 0,
+        error: None,
+        rx,
+        started,
+    }
+}
+
+/// 走**卷抽象**的搜索：归档卷、远程卷的子树只有卷自己看得见。
+///
+/// 为什么不能沿用上面那条 jwalk 路径：它遍历的是本地文件系统，
+/// 而归档卷里的 `docs/readme.txt` 在本地根本不存在（它在一个 zip 里）。
+/// 实测那条路会去遍历**进程的当前目录**——相对虚拟路径被当成相对本地路径解析，
+/// 于是"包内搜不到"变成"把 CWD 的子树搜了一遍"，报出来的还是"没有匹配项"。
+///
+/// 代价与本地那条不同，说清楚：这里是逐层 `list()` 的广度遍历，
+/// 每一层一次卷调用。归档卷的清单在内存里（中央目录），所以便宜；
+/// 远程卷是真 IO，慢到什么程度**没在真实主机上量过**，所以只做单线程、
+/// 支持随时被丢弃（接收端一断，线程下一个 `send` 就退出）。
+pub fn spawn_volume_search(
+    volume: std::sync::Arc<dyn fmnr_core::Volume>,
+    root: PathBuf,
+    needle: String,
+    case_sensitive: bool,
+) -> SearchState {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    let needle = needle.trim().to_string();
+
+    std::thread::Builder::new()
+        .name("fmnr-search-volume".into())
+        .spawn(move || {
+            if needle.is_empty() {
+                return;
+            }
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(Chunk::Failed(format!("起不了异步运行时：{e}")));
+                    return;
+                }
+            };
+            let opts = fmnr_core::ListOpts {
+                show_hidden: true,
+                sort: fmnr_core::SortOrder::Name,
+            };
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back(PathBuf::from(&root));
+            let mut batch: Vec<Hit> = Vec::with_capacity(BATCH);
+            while let Some(dir) = queue.pop_front() {
+                let entries = match rt.block_on(volume.list(&fmnr_core::VPath(dir.clone()), &opts))
+                {
+                    Ok(e) => e,
+                    Err(e) => {
+                        // 根读不了要说出来；深处的单层失败跳过（权限/软链环），
+                        // 否则一个坏目录就把整次搜索判死，用户看不到已经搜到的东西。
+                        if dir == root {
+                            let _ = tx.send(Chunk::Failed(format!("{}：{e}", root.display())));
+                        }
+                        continue;
+                    }
+                };
+                for entry in entries {
+                    if entry.is_dir {
+                        queue.push_back(dir.join(&entry.name));
+                    }
+                    let Some(range) = find_range(&entry.name, &needle, case_sensitive) else {
+                        continue;
+                    };
+                    batch.push(Hit {
+                        path: dir.join(&entry.name),
+                        name: entry.name,
+                        is_dir: entry.is_dir,
+                        size: entry.size.unwrap_or(0),
+                        range,
+                    });
+                    if batch.len() >= BATCH
+                        && tx
+                            .send(Chunk::Batch(std::mem::replace(
+                                &mut batch,
+                                Vec::with_capacity(BATCH),
+                            )))
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                let _ = tx.send(Chunk::Batch(batch));
+            }
+        })
+        .expect("spawn volume search thread");
+
+    SearchState {
+        hits: Vec::new(),
+        elapsed_ms: 0,
+        done: false,
+        total: 0,
+        error: None,
         rx,
         started,
     }
@@ -197,5 +316,56 @@ mod tests {
         assert_eq!(st.hits[0].name, "beta.txt");
         assert!(st.hits[0].path.ends_with("beta.txt"));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 走卷抽象的那条路：嵌套命中必须搜得到。
+    #[test]
+    fn volume_walk_search_finds_nested_hits() {
+        let root = tmp_tree("vol");
+        let vol = std::sync::Arc::new(fmnr_fs::LocalVolume::new(root.clone()));
+        let mut st = spawn_volume_search(vol, root.clone(), "beta".into(), false);
+        wait_done(&mut st);
+        assert_eq!(st.hits.len(), 1, "实得 {:?}", st.hits);
+        assert_eq!(st.hits[0].name, "beta.txt");
+        assert_eq!(st.error, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 根读不了要说成"搜不动"，不能报 0 命中——
+    /// "这里没有"和"我看不到"是两件事，后者才是要用户去处理的。
+    #[test]
+    fn volume_walk_search_says_so_when_the_root_is_unreadable() {
+        let missing =
+            std::env::temp_dir().join(format!("fmnr-volsearch-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let vol = std::sync::Arc::new(fmnr_fs::LocalVolume::new(missing.clone()));
+        let mut st = spawn_volume_search(vol, missing.clone(), "anything".into(), false);
+        wait_done(&mut st);
+        assert!(st.hits.is_empty());
+        assert!(
+            st.error.is_some(),
+            "根读不了却没有任何错误——界面上就会显示成\"没有匹配项\""
+        );
+    }
+
+    fn tmp_tree(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("fmnr-volsearch-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("alpha.txt"), b"1").unwrap();
+        std::fs::write(root.join("sub/beta.txt"), b"2").unwrap();
+        root
+    }
+
+    /// 轮询等到收尾。**预算给得宽**：workspace 级并行会把遍历线程挤慢，
+    /// 那时失败的是机器不是代码；超时要把已等多久说出来。
+    fn wait_done(st: &mut SearchState) {
+        let t0 = Instant::now();
+        while !st.done && t0.elapsed() < std::time::Duration::from_secs(30) {
+            st.drain();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(st.done, "搜索未在 30s 内收尾（已等 {:?}）", t0.elapsed());
     }
 }
