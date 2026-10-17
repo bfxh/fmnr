@@ -111,7 +111,7 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
 | 设置 | 顶栏「⚙ 设置」：开机自启动开关（HKCU `Run\fmnr`，可逆）、显示隐藏项、本机卷/插件计数 | ✅ 真机往返点过：开→注册表多出 1 个值、关→回到原样且**别人的 9 个自启动项一个没动** |
 | 三入口一致 | 内核能力上表：`read_file` / `write_file` / `rename` / `create_dir`（CLI 有 `cat` / `put` / `rename` / `mkdir`） | ✅ `entry_parity.rs` 三条腿（MCP 真子进程 / HTTP 真套接字 / CLI 真二进制）逐步比对返回 JSON **整份相等**；反证打过（CLI 腿偷加 `--max-bytes 3` 立刻判红）；**§6.2「MCP/HTTP 接多卷」未做**，见 `docs/NEXT-BATCH.md` §11 |
 | 默认程序 | 「用默认程序打开」解析系统真值（UserChoice → Classes → shell\open\command），只读不写 | ✅ 本机 `.txt` 解析到 WindowsApps 里的 Notepad 真路径并成功起进程；`fmnr open --external` 不传 program 即走这条 |
-| 重复文件 | 阶梯筛选 + **字节比对才算判定**；只报清单，删除仍走回收站路径由 UI 逐项勾选 | ✅ 6 条测试，含"喂恒等碰撞哈希也不许把不等内容成组"（把字节门换成"全算一组"立刻判红）；**跨次运行的指纹缓存未做**（锚点要 `GetFileInformationByHandle`，见 NEXT-BATCH §18） |
+| 重复文件 | 阶梯筛选 + **字节比对才算判定**；只报清单，删除仍走回收站路径由 UI 逐项勾选 | ✅ 9 条测试，含"喂恒等碰撞哈希也不许把不等内容成组"（把字节门换成"全算一组"立刻判红）；指纹缓存按 `(卷号, 文件索引, mtime, size)` 四元组，"不记住"是真开关（ephemeral 拒绝落盘） |
 | 多卷寻址 | MCP/HTTP 每次调用按参数选卷（与 CLI 共用 `fmnr-core` 那一份规则），空表明确报错而不是列空 | ✅ 探针卷测试钉住"选错卷立刻显形"（第一版用两个本地卷的测试把路由摘掉照样过，已作废重写）；**独立 MCP 进程仍挂不了 zip**，那是依赖决定 |
 | 子树搜索 | 归档/远程卷走 `Volume::list` 逐层遍历（本地仍走 jwalk），根读不了说成"搜不动"而不是 0 命中 | ✅ 归档卷真跑：包内 `inner/deep-readme-4471.md` 搜 `deep` 命中（1 结果 · 1 ms）；**远程卷未实测**（本机无 SSH 目标） |
 | 特殊文件夹 | 目录树起点下挂 下载/文档/图片/桌面（走系统已知文件夹，不拼 `home\Downloads`） | ✅ 真跑点过：点「下载」→ 栏头/面包屑/状态栏三处都是 `C:\Users\lbx13\Downloads`；被重定向的文件夹也拿得到真实位置 |

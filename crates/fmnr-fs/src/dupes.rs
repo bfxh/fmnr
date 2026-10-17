@@ -65,6 +65,17 @@ pub fn sha256_of(bytes: &[u8]) -> [u8; 32] {
 /// 就得能喂一个故意全碰撞的哈希（比如恒返回同一个值），此时正确的实现
 /// 仍然只把**字节真相等**的文件成组。写死 sha256 的话，那条断言压根写不出来。
 pub fn find_duplicates(paths: &[PathBuf], hash: impl Fn(&[u8]) -> [u8; 32]) -> DupReport {
+    find_duplicates_cached(paths, hash, None)
+}
+
+/// 同上，但可以带一个按四元组缓存全文件哈希的 [`HashCache`](crate::fingerprint::HashCache)。
+///
+/// 缓存**只省重算，不改判定**：成不成组仍然由字节比对说了算。
+pub fn find_duplicates_cached(
+    paths: &[PathBuf],
+    hash: impl Fn(&[u8]) -> [u8; 32],
+    mut cache: Option<&mut crate::fingerprint::HashCache>,
+) -> DupReport {
     let mut report = DupReport::default();
 
     // 第 1 级：按大小分组。大小不同的文件不可能字节相等，这一刀最便宜。
@@ -89,7 +100,25 @@ pub fn find_duplicates(paths: &[PathBuf], hash: impl Fn(&[u8]) -> [u8; 32]) -> D
         for p in group {
             match read_partial(&p, size) {
                 Ok(buf) => {
-                    by_partial.entry(hash(&buf)).or_default().push(p.clone());
+                    let h = match &mut cache {
+                        Some(c) => {
+                            let fp = crate::fingerprint::fingerprint_of(&p).ok();
+                            let stage = crate::fingerprint::Stage::Partial;
+                            match fp.as_ref().filter(|f| f.cacheable()) {
+                                Some(f) => match c.get(f, stage) {
+                                    Some(hit) => hit,
+                                    None => {
+                                        let made = hash(&buf);
+                                        c.put(f, stage, made);
+                                        made
+                                    }
+                                },
+                                None => hash(&buf),
+                            }
+                        }
+                        None => hash(&buf),
+                    };
+                    by_partial.entry(h).or_default().push(p.clone());
                 }
                 Err(e) => report.skipped.push(Skipped {
                     path: p.clone(),
@@ -103,9 +132,31 @@ pub fn find_duplicates(paths: &[PathBuf], hash: impl Fn(&[u8]) -> [u8; 32]) -> D
             // 第 3 级：全文件哈希。
             let mut by_full: HashMap<[u8; 32], Vec<PathBuf>> = HashMap::new();
             for p in cand {
+                // 先取指纹，读完**再取一次比对**：两次一样才敢把哈希记在这个指纹上。
+                // 少了这一步，一个在读取途中被改写的文件会留下一条
+                // "新指纹 → 旧内容哈希"的缓存，下次扫描就把不同的内容判成相同。
+                let before = crate::fingerprint::fingerprint_of(&p).ok();
                 match read_all(&p) {
                     Ok(bytes) => {
-                        by_full.entry(hash(&bytes)).or_default().push(p.clone());
+                        let h = match (before.as_ref(), cache.as_mut()) {
+                            (Some(fp), Some(c)) if fp.cacheable() => {
+                                match c.get(fp, crate::fingerprint::Stage::Full) {
+                                    Some(hit) => hit,
+                                    None => {
+                                        let made = hash(&bytes);
+                                        if crate::fingerprint::fingerprint_of(&p)
+                                            .ok()
+                                            .is_some_and(|after| after == *fp)
+                                        {
+                                            c.put(fp, crate::fingerprint::Stage::Full, made);
+                                        }
+                                        made
+                                    }
+                                }
+                            }
+                            _ => hash(&bytes),
+                        };
+                        by_full.entry(h).or_default().push(p.clone());
                     }
                     Err(e) => report.skipped.push(Skipped {
                         path: p.clone(),
@@ -285,6 +336,78 @@ mod tests {
         );
         assert_eq!(r.skipped[0].path, gone);
         assert!(!r.skipped[0].reason.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 带上缓存之后：第二次扫描**不该再算一次哈希**，且**判定结果一模一样**。
+    /// 两半都要断——只断"变快了"可以拿"永远返回同一个哈希"糊过去，
+    /// 只断"结果相同"则可以拿"缓存根本没生效"糊过去。
+    #[test]
+    fn cache_avoids_rehashing_without_changing_the_verdict() {
+        use std::cell::Cell;
+        let d = tmp("cache");
+        let a = put(&d, "a.bin", &vec![5u8; 9000]);
+        let b = put(&d, "b.bin", &vec![5u8; 9000]);
+        let mut c = crate::fingerprint::HashCache::persistent();
+        let calls = Cell::new(0u32);
+        let counting = |bytes: &[u8]| {
+            calls.set(calls.get() + 1);
+            sha256_of(bytes)
+        };
+        let r1 = find_duplicates_cached(&[a.clone(), b.clone()], counting, Some(&mut c));
+        let after_first = calls.get();
+        assert!(after_first > 0, "第一次扫描必须真算过哈希");
+        let (hits1, misses1) = c.stats();
+        // 两级都查缓存（部分读 + 全文件），2 个文件 ⇒ 4 次查询，全 miss
+        assert_eq!((hits1, misses1), (0, 4), "第一次应当全是 miss");
+
+        calls.set(0);
+        let r2 = find_duplicates_cached(&[a, b], counting, Some(&mut c));
+        assert_eq!(calls.get(), 0, "全命中时一次哈希都不该再算");
+        assert_eq!(c.stats(), (4, 4), "第二次应当全是 hit");
+        assert_eq!(r1.groups, r2.groups, "缓存不许改变判定结果");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 头尾相同、中间不同的两个文件不许被判成重复。
+    ///
+    /// ⚠ 我原本写这条是为了抓"部分读与全文件共用一个缓存槽"，**这个说法被
+    /// 反证否掉了**：把阶段从缓存键里拿掉之后，这条测试**照样过**——因为
+    /// 两级挤同一槽只会让全文件那一查拿到"部分读的短哈希"，两个文件因此
+    /// 拿到同一个（错的）哈希而成组，接着**字节比对那一级把它们分开**。
+    /// 真正咬住那个变异的是 `cache_avoids_rehashing_without_changing_the_verdict`
+    /// 的命中/未命中计数（少一个槽位 ⇒ 第二次扫描出现 miss ⇒ 判红）。
+    /// 所以这条的实际作用是：**即使缓存喂进来一个错哈希，字节门仍然兜住**
+    /// ——那是纵深防御，不是槽位隔离的判据。
+    #[test]
+    fn partial_and_full_hashes_do_not_share_a_cache_slot() {
+        let d = tmp("stage");
+        let mut x = vec![1u8; 20000];
+        let mut y = vec![1u8; 20000];
+        // 只动中间（头尾 4096 之外），保证部分读看到的内容完全一致
+        x[10000] = 2;
+        y[10000] = 3;
+        let a = put(&d, "x.bin", &x);
+        let b = put(&d, "y.bin", &y);
+        let mut c = crate::fingerprint::HashCache::persistent();
+        let r = find_duplicates_cached(&[a, b], sha256_of, Some(&mut c));
+        assert!(
+            r.groups.is_empty(),
+            "头尾相同、中间不同的两个文件被判成重复了：{:?}",
+            r.groups
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 不带缓存（`None`）时行为与 `find_duplicates` 一致。
+    #[test]
+    fn no_cache_matches_the_plain_path() {
+        let d = tmp("nocache");
+        let a = put(&d, "a.bin", &vec![3u8; 7000]);
+        let b = put(&d, "b.bin", &vec![3u8; 7000]);
+        let plain = find_duplicates(&[a.clone(), b.clone()], sha256_of);
+        let via_api = find_duplicates_cached(&[a, b], sha256_of, None);
+        assert_eq!(plain.groups, via_api.groups);
         let _ = std::fs::remove_dir_all(&d);
     }
 
