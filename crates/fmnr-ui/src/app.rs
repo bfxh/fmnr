@@ -71,6 +71,9 @@ pub struct App {
     /// 面包屑行内过滤
     left_filter: String,
     right_filter: String,
+    /// 栏头正在被编辑的那一栏：`(哪一栏, 框里的文本)`。
+    /// 只有一栏能同时处于编辑态，所以是一个 Option 而不是每栏一份。
+    path_edit: Option<(Pane, String)>,
     /// 状态栏消息
     status: String,
     /// 待写入**系统**剪贴板的文本（"复制完整路径"用）。
@@ -382,6 +385,7 @@ impl App {
             sort: SortOrder::Name,
             left_filter: String::new(),
             right_filter: String::new(),
+            path_edit: None,
             // 没装到 CJK 字体的话，界面所有中文都是豆腐块，而用户无从知道
             // 是"程序坏了"还是"这台机没字体"。这条要说出来。
             clipboard_text: None,
@@ -549,6 +553,37 @@ impl App {
             }
         }
         self.refresh_pane(which);
+    }
+
+    /// 把用户贴进来的一条路径落到**能列它的那个卷**上，再走过去。
+    ///
+    /// 不先切卷的话，"贴一个别的盘的绝对路径"得到的是一个空列表：
+    /// 卷没换，路径却属于另一个卷——而这恰恰是地址框最自然的用法。
+    fn goto_path(&mut self, which: Pane, raw: &str) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            self.status = "路径是空的，没去".to_string();
+            return;
+        }
+        let target = PathBuf::from(trimmed);
+        if let Some(spec) = volume_for_path(&target) {
+            let already = match &spec {
+                MountSpec::Local { root } => self
+                    .current_volume_id
+                    .as_ref()
+                    .and_then(|v| local_root_of_volume_id(&v.0))
+                    .is_some_and(|r| &r == root),
+                MountSpec::Wsl { distro } => self
+                    .current_volume_id
+                    .as_ref()
+                    .is_some_and(|v| v.0 == format!("wsl:{distro}")),
+                _ => false,
+            };
+            if !already {
+                self.mount_spec(spec);
+            }
+        }
+        self.navigate(which, target);
     }
 
     /// 卷的起点路径。与 `switch_volume` 里那套一致：
@@ -3571,36 +3606,95 @@ impl App {
                 // 栏头：活动栏是实心点 + 强调色。用 Tab 在两栏间切换时，
                 // 这是唯一说明"现在操作的是哪一边"的可见信号。
                 let active = self.active_pane == which;
-                let head_text = if active {
-                    egui::RichText::new(format!("● {}", path.display()))
-                        .color(Color32::from_rgb(0, 122, 255))
-                        .strong()
+                let full = path.display().to_string();
+                // 编辑态的文本先取成 owned：输入框要 `&mut String`，
+                // 而回车之后还要写回 `self.path_edit`，两个借用不能同时活着。
+                let editing = self
+                    .path_edit
+                    .as_ref()
+                    .filter(|(p, _)| *p == which)
+                    .map(|(_, s)| s.clone());
+                let mut goto: Option<String> = None;
+                if let Some(mut buf) = editing {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut buf)
+                            .hint_text("贴一个路径，回车过去")
+                            .desired_width((width - 28.0).max(80.0)),
+                    );
+                    if !resp.has_focus() {
+                        resp.request_focus();
+                    }
+                    let (enter, esc) = ui
+                        .ctx()
+                        .input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
+                    if resp.has_focus() && esc {
+                        self.path_edit = None;
+                    } else if resp.has_focus() && enter {
+                        goto = Some(buf);
+                    } else if let Some(cur) = self.path_edit.as_mut() {
+                        cur.1 = buf;
+                    }
                 } else {
-                    egui::RichText::new(format!("○ {}", path.display())).weak()
-                };
-                let head = ui
-                    .add(
-                        egui::Label::new(head_text)
-                            .truncate()
-                            .sense(egui::Sense::click()),
-                    )
-                    .on_hover_text("设为当前栏（Tab 也可以切换）");
-                if head.clicked() {
-                    self.active_pane = which;
+                    // 中间省略：路径的尾巴才是"你在哪"，掐尾等于把最有用的那段切掉。
+                    let shown = middle_ellipsis(&full, char_budget(width));
+                    let head_text = if active {
+                        egui::RichText::new(format!("● {shown}"))
+                            .color(Color32::from_rgb(0, 122, 255))
+                            .strong()
+                    } else {
+                        egui::RichText::new(format!("○ {shown}")).weak()
+                    };
+                    let head = ui
+                        .add(
+                            egui::Label::new(head_text)
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text(format!("{full}\n单击=设为当前栏，双击=改路径"));
+                    if head.clicked() {
+                        self.active_pane = which;
+                    }
+                    if head.double_clicked() {
+                        self.path_edit = Some((which, full.clone()));
+                    }
+                }
+                if let Some(raw) = goto {
+                    self.path_edit = None;
+                    self.goto_path(which, &raw);
                 }
 
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
                     let crumbs = crumb_list(&path);
                     for (i, (label, target)) in crumbs.iter().enumerate() {
-                        if ui.small_button(label).clicked() {
+                        let resp = ui.small_button(label);
+                        if resp.clicked() {
                             let target = target.clone();
                             self.navigate(which, target);
                             self.active_pane = which;
                         }
+                        // 右键单独复制某一段：长路径里"我就想要那个盘"和"想要这一层"
+                        // 是两种需要，只给"复制整条"就得再手工删一遍。
+                        let target = target.clone();
+                        let label = label.clone();
+                        resp.context_menu(|ui| {
+                            if ui.button("复制这一段").clicked() {
+                                self.clipboard_text = Some(target.display().to_string());
+                                self.status = format!("已复制 {label}");
+                                ui.close_menu();
+                            }
+                        });
                         if i + 1 < crumbs.len() {
                             ui.label("›");
                         }
+                    }
+                    if ui
+                        .small_button("复制")
+                        .on_hover_text("复制当前目录的完整路径")
+                        .clicked()
+                    {
+                        self.clipboard_text = Some(full.clone());
+                        self.status = "已复制完整路径".to_string();
                     }
                 });
 
@@ -4386,6 +4480,85 @@ fn crumb_list(path: &Path) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
+/// 这条路径属于哪个"不先挂上就列不出来"的卷。
+///
+/// 盘符走 `Local`，`\\wsl.localhost\` 与 `\\wsl$\` 走 `Wsl`；
+/// 其余（归档卷里的相对路径、别的 UNC 共享）返回 `None` =
+/// 就在当前卷里走过去，不要瞎猜一个挂不上的卷去挂。
+fn volume_for_path(p: &Path) -> Option<MountSpec> {
+    // 用户可能用正斜杠贴路径，Windows 两种都收；但下面的判别按反斜杠写，先归一。
+    let s = p.to_string_lossy().replace('/', "\\");
+    let lower = s.to_ascii_lowercase();
+    for host in ["\\\\wsl.localhost\\", "\\\\wsl$\\"] {
+        if lower.starts_with(host) {
+            // host 全是 ASCII，按字节切不会切进多字节字符中间。
+            let distro = s[host.len()..].split('\\').next().unwrap_or("");
+            return (!distro.is_empty()).then(|| MountSpec::Wsl {
+                distro: distro.to_string(),
+            });
+        }
+    }
+    let c: Vec<char> = s.chars().collect();
+    if c.len() >= 3 && c[1] == ':' && c[2] == '\\' && c[0].is_ascii_alphabetic() {
+        // 带尾分隔符：`Path::new("C:")` 既不是绝对路径，又按**该盘当前目录**解析，
+        // 挂上去会跳进一个盘符后面没写的目录（这台机器上栽过不止一次）。
+        // 盘符一律大写：侧栏的盘按钮给的是 `C:\`，用户贴 `c:\x` 若原样保留，
+        // 同一个盘就会有两个卷 id，注册表里多出个影子卷。
+        return Some(MountSpec::Local {
+            root: PathBuf::from(format!("{}:\\", c[0].to_ascii_uppercase())),
+        });
+    }
+    None
+}
+
+/// 栏头一行大约塞得下多少个字符。
+///
+/// 7px 是"这套字体这个字号下一个西文字符"的**估**，不是量的：估少了有
+/// `.truncate()` 兜底（它只会掐尾，不会撑破布局），估多了只是白留几个字符。
+/// 真要逐字量宽度得走 `Context::fonts`，为省下半行不值。
+fn char_budget(width: f32) -> usize {
+    ((width - 28.0) / 7.0).max(12.0) as usize
+}
+
+/// 长路径的中间省略。**掐中间**是因为尾巴才是"你在哪"：
+/// 掐头看不出哪个盘，掐尾看不出哪个目录。
+/// 丢的必须是**整段**（连着它的分隔符），剩下的拼起来才不是一眼假。
+fn middle_ellipsis(s: &str, budget: usize) -> String {
+    if budget < 4 || s.chars().count() <= budget {
+        return s.to_string();
+    }
+    // 每段连着它**后面**的分隔符：一段都不丢时，拼回去必须逐字等于原串。
+    let parts: Vec<&str> = s.split_inclusive(['\\', '/']).collect();
+    if parts.len() < 3 {
+        // 没有可整段丢掉的中间段（比如一个超长目录名）：退回按字符掐中间。
+        let v: Vec<char> = s.chars().collect();
+        let head = (budget - 1) / 2;
+        let tail = budget - 1 - head;
+        let mut out: String = v[..head].iter().collect();
+        out.push('…');
+        out.extend(v[v.len() - tail..].iter());
+        return out;
+    }
+    // 首段（盘根 / UNC 前缀）和末段（当前位置）一定留着；中间段从右往左留，
+    // 因为越靠近末段的那几层越是用户要找的东西。
+    let mid = &parts[1..parts.len() - 1];
+    for keep in (0..mid.len()).rev() {
+        let mut out = String::new();
+        out.push_str(parts[0]);
+        if keep < mid.len() {
+            out.push('…');
+        }
+        for p in &mid[mid.len() - keep..] {
+            out.push_str(p);
+        }
+        out.push_str(parts[parts.len() - 1]);
+        if out.chars().count() <= budget || keep == 0 {
+            return out;
+        }
+    }
+    s.to_string()
+}
+
 #[cfg(test)]
 mod name_tests {
     use super::*;
@@ -4541,6 +4714,150 @@ mod name_tests {
         assert_eq!(fmt_size(5 * 1024 * 1024), "5.0 MB");
         // GB 封顶：再大也不会出现 TB 之外的空单位。
         assert_eq!(fmt_size(4000 * 1024 * 1024 * 1024), "4000.0 GB");
+    }
+
+    /// 放得下就**一个字都不许动**。这条钉的是"拼接层自己加戏"：
+    /// 分隔符连着段走，段与段之间再补一个 `\\` 就会把 `C:\Users` 变成 `C:\\Users`。
+    #[test]
+    fn middle_ellipsis_is_identity_when_the_path_fits() {
+        for s in [
+            "C:\\",
+            "C:\\Users\\lbx13",
+            "\\\\wsl.localhost\\Ubuntu-24.04\\home",
+            "sub/dir",
+        ] {
+            assert_eq!(middle_ellipsis(s, 200), s, "预算够用时不该改写：{s:?}");
+        }
+    }
+
+    /// 掐的是**中间**：盘和最深那一层都必须活着，中间的段**从右往左**留
+    /// （越靠近当前位置的层越是用户要找的）。
+    /// 断言写成整串而不是"包含"，是为了让"省略号放错位置"也判红。
+    #[test]
+    fn middle_ellipsis_keeps_the_drive_and_the_deepest_dir() {
+        let s = "C:\\Users\\lbx13\\AppData\\Local\\Programs\\Radmin VPN";
+        assert_eq!(middle_ellipsis(s, 25), "C:\\…Programs\\Radmin VPN");
+        assert_eq!(middle_ellipsis(s, 20), "C:\\…Radmin VPN");
+        // 预算小到连"盘 + … + 末段"都放不下时，那是地板，不再硬掐：
+        // 宁可超出去几个字，也不能把"你在哪"掐没。
+        assert_eq!(middle_ellipsis(s, 8), "C:\\…Radmin VPN");
+    }
+
+    /// 预算越小丢得越多，但**永远不反着变长**，也永远不越界（能救的时候）。
+    #[test]
+    fn middle_ellipsis_shrinks_monotonically_and_stays_in_budget() {
+        let s = "C:\\Users\\lbx13\\.codex-batch-delete-backup-20261009\\sub";
+        let mut last = String::new();
+        for b in [7usize, 9, 12, 16, 24, 40] {
+            let out = middle_ellipsis(s, b);
+            assert!(
+                out.chars().count() <= b.max(4),
+                "预算 {b} 却给出 {} 个字符：{out:?}",
+                out.chars().count()
+            );
+            assert!(out.starts_with("C:\\"), "盘符丢了：{out:?}");
+            assert!(out.ends_with("sub"), "当前位置丢了：{out:?}");
+            assert!(
+                last.is_empty() || out.chars().count() <= last.chars().count(),
+                "预算从 {} 缩到 {b}，结果反而长了",
+                last.chars().count()
+            );
+            last = out;
+        }
+    }
+
+    /// 只有一段可留（一个超长目录名）时走按字符掐的退路，两头都要还在。
+    #[test]
+    fn middle_ellipsis_falls_back_to_char_cutting_for_one_long_segment() {
+        let s = "C:\\averyveryveryverylongsinglesegmentname";
+        let out = middle_ellipsis(s, 20);
+        assert_eq!(out.chars().count(), 20, "退路没掐到预算内：{out:?}");
+        assert!(out.starts_with("C:\\avery"), "头部没保住：{out:?}");
+        assert!(out.ends_with("name"), "尾部没保住：{out:?}");
+        assert!(out.contains('…'), "中间没有省略号：{out:?}");
+    }
+
+    /// 路由到本地卷时根**必须带尾分隔符**。
+    /// `Path::new("E:")` 不是绝对路径，它按该盘当前目录解析——
+    /// 少一个 `\\` 就会跳进一个标签上没写的目录（这台机器上栽过不止一次）。
+    #[test]
+    fn a_pasted_drive_path_routes_to_the_drive_root_not_the_drive_letter() {
+        let spec = volume_for_path(Path::new("E:\\tmp\\adv-mut")).expect("盘符路径要路由到本地卷");
+        let MountSpec::Local { root } = spec else {
+            panic!("盘符路径应得到 Local 卷，实得 {spec:?}");
+        };
+        // 按**字节**比，不按 `Path` 的相等比：Windows 上 `Path` 的 Eq 会把盘符
+        // 大小写归一（`PathBuf::from("e:\\") == PathBuf::from("E:\\")` 实测为真），
+        // 用它当尺子，"盘符没大写"这一整类缺陷都量不出来——而卷 id 是
+        // `local:<路径字符串>`，大小写不一样就是两个卷。
+        assert_eq!(
+            root.to_string_lossy(),
+            "E:\\",
+            "根必须归一到盘根（含大写盘符）"
+        );
+        assert!(
+            !is_drive_relative(&root),
+            "路由出来的根 {root:?} 是盘相对写法，挂上去会跳进该盘当前目录"
+        );
+        // 正斜杠贴进来同样要认（Windows 两种都收，用户不管这个区别），
+        // 而且盘符要归一成大写：侧栏的盘按钮给的是 `E:\`，
+        // 这里若保留 `e:\`，同一个盘就会有两个卷 id。
+        for pasted in ["E:\\tmp\\x", "e:/tmp/x", "e:\\tmp\\x"] {
+            let spec = volume_for_path(Path::new(pasted))
+                .unwrap_or_else(|| panic!("{pasted:?} 没路由到卷"));
+            let MountSpec::Local { root } = spec else {
+                panic!("{pasted:?} 应得到 Local 卷，实得 {spec:?}");
+            };
+            assert_eq!(
+                root.to_string_lossy(),
+                "E:\\",
+                "{pasted:?} 归一后的根不对（要带尾分隔符、盘符大写）"
+            );
+        }
+    }
+
+    /// 两种 WSL UNC 主机名都要认，且取的是**发行版名**那一整段。
+    #[test]
+    fn both_wsl_unc_hosts_route_to_the_distro() {
+        for p in [
+            "\\\\wsl.localhost\\Ubuntu-24.04\\home\\lbx",
+            "\\\\wsl$\\Debian\\etc",
+            "\\\\WSL.LOCALHOST\\Ubuntu-24.04",
+        ] {
+            let spec = volume_for_path(Path::new(p)).unwrap_or_else(|| panic!("{p:?} 没路由到卷"));
+            let MountSpec::Wsl { distro } = spec else {
+                panic!("{p:?} 应得到 Wsl 卷，实得 {spec:?}");
+            };
+            assert!(
+                ["Ubuntu-24.04", "Debian"].contains(&distro.as_str()),
+                "{p:?} 取到的发行版名是 {distro:?}"
+            );
+        }
+    }
+
+    /// **宁可不路由，也不要瞎猜一个挂不上的卷**：
+    /// 归档卷里的相对路径、光秃秃的 `\\\\wsl.localhost\\`、别的 UNC 共享都返回 None，
+    /// 意思是"就在当前卷里走过去"。
+    #[test]
+    fn anything_that_is_not_a_local_or_wsl_root_stays_on_the_current_volume() {
+        for p in [
+            "sub/dir",
+            "",
+            "\\\\wsl.localhost\\",
+            "\\\\fileserver\\share\\docs",
+        ] {
+            assert_eq!(
+                volume_for_path(Path::new(p)),
+                None,
+                "{p:?} 不该路由到任何卷"
+            );
+        }
+        // 反证：同一个主机名，只要**带上了发行版名**就必须路由——
+        // 否则上面那四条"返回 None"可以靠"永远返回 None"蒙过去。
+        assert!(
+            volume_for_path(Path::new("\\\\wsl.localhost\\Ubuntu-24.04\\a\\b")).is_some(),
+            "带发行版名的 UNC 必须路由到卷"
+        );
     }
 }
 
