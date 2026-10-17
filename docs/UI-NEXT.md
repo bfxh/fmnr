@@ -551,34 +551,66 @@ fmnr 不代跑升级。这是这一节最重要的决定。
 
 ---
 
-## 10. 🔴 2026-10-17 新查出来的：栏头显示的路径和列出来的内容不是同一个目录
+## 10. ✅ 已确诊并修掉：栏头显示的路径和列出来的内容不是同一个目录
 
-**这条只登记测到的事实，机制没定，别当已确诊。**
+**原登记（2026-10-17 上午）**：复现条件 `USERPROFILE=E:\tmp\fmnr-ui-check`、
+进程 CWD=`E:\tmp` 起 `fmnr-ui.exe`。量到：栏头/面包屑/状态栏写着盘符，
+列出的目录行却是 `E:\tmp` 的（`adv-mut`、`arch-fixture`、`fmnr-drop-*`…，
+`ls /e` 里一个没有），而文件段是 `E:\` 根独有的 4 个
+（`cmd_start_for.ini`、`DumpStack.log`、`exp_robocopy.log`、`tmp_self.json`）；
+双击其中一个目录后右栏栏头少了一段（`E:\fmnr-drop-5748-empty`，`ls` 判不存在），
+显示的内容却是对的。当时机制没定，只留了假设位。
 
-复现条件：`USERPROFILE=E:\tmp\fmnr-ui-check`、进程 CWD=`E:\tmp` 起 `fmnr-ui.exe`。
+**机制（现已量到，不是推断）**：面包屑的两个函数各算各的——
+`breadcrumbs()` 用 `file_name()`/`parent()` 出标签，`crumbs_to_path()` 用
+`components()` **取前 N 个重拼**路径。Windows 的组件序列是
+`[Prefix("E:"), RootDir("\\"), Normal("tmp"), …]`，而标签序列里没有盘根
+（`Path::new("E:\\").file_name()` 是 `None`），两套下标差一层。
+用旧代码原样跑一遍（`E:\tmp\adv-mut`）：
 
-量到的（截图 + `ls` 对账）：
+```
+标签 = ["tmp", "adv-mut"]
+  点第 0 跳("tmp")     -> "E:"    is_absolute=false is_dir=true
+  点第 1 跳("adv-mut") -> "E:\"   is_absolute=true  is_dir=true
+```
 
-1. 左栏栏头、面包屑、状态栏三处都写 `E:\`；
-2. 但左栏列出的目录行是 `E:\tmp` 的：`adv-mut`、`arch-fixture`、`drag-dst`、
-   `fmnr-drop-5748-*`、`fmnr-mcp-open-*`、`fmnr-plugins-*` —— 这些名字
-   `ls /e` 里**一个都没有**（E 盘根实测 16 个目录）；
-3. 左栏的文件段却是 `E:\` 根独有的 4 个：`cmd_start_for.ini` 35 B、
-   `DumpStack.log` 12.0 KB、`exp_robocopy.log` 598 B、`tmp_self.json` 4.6 KB；
-4. 双击其中一个目录后，右栏栏头变成 `E:\fmnr-drop-5748-empty`——**少了 `tmp` 一段**，
-   而这条路径 `ls` 判不存在；右栏显示"这个目录是空的"而不是报错。
-   真实存在的 `E:\tmp\fmnr-drop-5748-empty` 确实是个空目录，所以内容没错、**路径串错了**。
+第一跳拿到的是 **`E:`——盘相对写法**，按该盘当前目录解析。
+所以"点 tmp"实际去的是 `E:`，而 `E:` 又解析成 `E:\tmp`（进程 CWD 所在），
+栏头写着盘符、内容是 CWD 目录；再往下双击就变成 `E:adv-mut`
+→ 解析成 `E:\tmp\adv-mut`（**内容对、路径串错**，正是登记的第 4 条）。
 
-危害按"文件管理器"判，不按"显示小瑕疵"判：用户照栏头那串走 `cd`、
-照行去删除/复制，两边指向的不是同一个目录。
+盘相对写法在枚举层的后果也量了：`fmnr ls "E:"` 在 CWD=`E:\tmp` 时返回
+**1001 条**（= `E:\tmp`），而 `fmnr ls "E:/"` 返回 **17 条**（= 盘根）。
+根因是 `PathBuf::from("E:\\tmp").join("E:") == "E:"`——`join` 把卷根整个丢掉。
 
-一条能同时解释 2/3/4 的假设是**盘相对路径**（Windows 上 `E:xxx` 按该盘当前目录解析，
-本进程 CWD 恰好在 `E:\tmp`），但我没量到 `base` 那个串的真实值，
-所以这条**留在假设位**，不许当结论往下写。
+**撤回其中一条**：上面"文件段是 `E:\` 根独有的 4 个"这半句站不住。
+按确诊的机制，那一栏列的是 `E:\tmp`，文件行也该是 tmp 的；
+那 4 个名字是盘根的。最可能是我把左边**目录树列**（根标着 `tmp`，
+子节点正是 `adv-mut`/`arch-fixture`/`fmnr-drop-*`）和中间**文件列**读串了。
+结论不变（栏头与内容确实不是同一目录），但那半条测量作废。
 
-下一步（半小时内的活）：在 `pane()` 里把 `base` 原样打到状态栏，
-按上面条件起一次，读那一串到底是 `E:`、`E:\` 还是 `E:\tmp`；
-拿到串之后再定改哪一层（`dirs_home` / `fmnr-mount::default_plan` / `LocalVolume::resolve`）。
+**修了两处**：
+1. `fmnr-ui::crumb_list()`：标签与目标路径**同源**，都从 `ancestors()` 来，
+   不再有"标签一套、下标另一套"的算法；盘根因此多出一跳（`E:\ › tmp › adv-mut`）。
+2. `fmnr-fs::LocalVolume::resolve()`：`<盘符>:` 这种写法补成盘根
+   （`E:` → `E:\`、`E:foo` → `E:\foo`）。这一处是给 MCP/HTTP/CLI 兜底的——
+   外部客户端可以直接把 `"path": "E:"` 传进来，那条腿没有面包屑可修。
+
+**没有顺手改的两处**（探针否证了它们的必要性，写了就是不可达分支）：
+`go_up()` 与空间视图的「↑ 上一级」都走 `parent()`，而
+`Path::new("E:\\").parent()` 实测是 `None`——它们在盘根就停了，产不出 `E:`。
+
+**验证**：
+- 单测 `fmnr-fs::path_tests`（3 条）与 `fmnr-ui::name_tests`（2 条面包屑）。
+  反证打过两次：摘掉 `resolve` 的补根 → 两条判红；
+  把 `crumb_list` 换回按组件重拼 → 两条判红，报的正是
+  「面包屑 "D:" 的目标 "D:" 是盘相对写法」。
+  中途一个变异活了下来（删掉 `crumb_list` 里的 `is_drive_relative` 筛子），
+  因为 `ancestors()` 的链在盘根就断，那行**永远不会真**——已经删掉了。
+- 真跑：`USERPROFILE=E:\tmp` 起窗口 → 双击进 `E:\tmp\adv-mut`
+  → 点面包屑「tmp」→ 栏头与状态栏都是 `E:\tmp`，列出的是 tmp 的内容。
+  修前同一跳给的是 `E:`（列的是该盘 CWD 的目录）。
+
 
 ## 11. 本轮做完的两件事（都真跑过）
 

@@ -3349,10 +3349,10 @@ impl App {
 
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
-                    let crumbs = breadcrumbs(&path);
-                    for (i, c) in crumbs.iter().enumerate() {
-                        if ui.small_button(c).clicked() {
-                            let target = crumbs_to_path(&path, i);
+                    let crumbs = crumb_list(&path);
+                    for (i, (label, target)) in crumbs.iter().enumerate() {
+                        if ui.small_button(label).clicked() {
+                            let target = target.clone();
                             self.navigate(which, target);
                             self.active_pane = which;
                         }
@@ -4025,36 +4025,124 @@ fn plugins_dir() -> PathBuf {
         .join("plugins")
 }
 
-fn breadcrumbs(path: &Path) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut cur = path;
-    while let Some(name) = cur.file_name() {
-        parts.push(name.to_string_lossy().to_string());
-        cur = cur.parent().unwrap_or(cur);
-        if cur == path {
-            break;
-        }
-    }
-    parts.reverse();
-    if parts.is_empty() {
-        parts.push(path.display().to_string());
-    }
-    parts
-}
-
-fn crumbs_to_path(full: &Path, upto: usize) -> PathBuf {
-    // 简化：按组件重建到第 upto 层
-    let comps: Vec<_> = full.components().collect();
-    let mut p = PathBuf::new();
-    for c in comps.iter().take(upto + 1) {
-        p.push(c.as_os_str());
-    }
-    p
+/// 面包屑：`(标签, 点它要去的真实路径)` 一对一对出来。
+///
+/// 之前这里是两个函数（`breadcrumbs` 出标签、`crumbs_to_path` 按下标重拼路径），
+/// 而重拼用的是 `components()` 取前 N 个——Windows 的组件序列是
+/// `[Prefix("E:"), RootDir("\\"), Normal("tmp"), …]`：取 1 个得到 `E:`。
+/// 实测（`E:\tmp\adv-mut`）：标签是 `["tmp","adv-mut"]`，点「tmp」拿到的却是 `E:`、
+/// 点「adv-mut」拿到 `E:\` —— 每一跳都比标签高一层，而第一跳正是盘相对写法，
+/// 于是栏头写着盘符、列出来的是该盘当前目录（UI-NEXT §10 的根因）。
+/// 现在路径只从 `ancestors()` 来（它给的就是逐级真实路径），标签与目标同源。
+fn crumb_list(path: &Path) -> Vec<(String, PathBuf)> {
+    // 不需要再筛一遍：`Path::new("E:\\").parent()` 是 None（实测），
+    // 所以 `ancestors()` 的链在盘根就停了，压根不会长出 `E:`。
+    let mut chain: Vec<PathBuf> = path.ancestors().map(|p| p.to_path_buf()).collect();
+    chain.reverse();
+    chain
+        .into_iter()
+        .map(|p| {
+            let label = match p.file_name() {
+                Some(n) => n.to_string_lossy().to_string(),
+                // 盘根没有 file_name；空路径是虚拟卷的卷根，给个能看的字
+                None if p.as_os_str().is_empty() => "卷根".to_string(),
+                None => p.display().to_string(),
+            };
+            (label, p)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod name_tests {
     use super::*;
+
+    /// Windows 上「有盘符、没有根」的写法（`E:`、`E:foo`）。
+    /// 它既不是绝对路径，也不是普通相对路径：按**该盘当前目录**解析。
+    /// 归档/远程卷的路径本来就是相对写法（卷根是空路径），所以判据不能是
+    /// `!is_absolute()`——那会把虚拟卷的正常路径一起误杀。
+    fn is_drive_relative(p: &Path) -> bool {
+        matches!(p.components().next(), Some(std::path::Component::Prefix(_))) && !p.is_absolute()
+    }
+
+    /// 回归（UI-NEXT §10）：面包屑任何一跳都不许是「盘相对」写法（`E:`）。
+    /// 它按该盘当前目录解析，点一下就跳进一个标签上没写的目录。
+    ///
+    /// 断言里带"最后一跳就是这一栏正在看的目录"：没有这条，
+    /// 一个把所有祖先都筛空的实现也能让上面那句空转通过。
+    #[test]
+    fn no_crumb_target_is_drive_relative() {
+        let cases = vec![
+            std::env::current_dir().unwrap(),
+            PathBuf::new(),
+            // 归档/远程卷的路径本来就是相对的，不能被这条判据误杀
+            PathBuf::from("sub/dir"),
+            #[cfg(unix)]
+            PathBuf::from("/data/app/x"),
+        ];
+        for c in cases {
+            let crumbs = crumb_list(&c);
+            assert!(!crumbs.is_empty(), "{c:?} 的面包屑空了——筛空的实现也能过关");
+            for (label, p) in &crumbs {
+                assert!(
+                    !is_drive_relative(p),
+                    "面包屑 {label:?} 的目标 {p:?} 是盘相对写法"
+                );
+            }
+            assert_eq!(
+                crumbs.last().map(|(_, p)| p.clone()),
+                Some(c.clone()),
+                "{c:?} 的最后一跳不是它自己"
+            );
+            if !c.as_os_str().is_empty() {
+                assert!(
+                    crumbs.len() >= 2,
+                    "{c:?} 至少该有卷根/盘根这一跳，实得 {crumbs:?}"
+                );
+            }
+        }
+    }
+
+    /// 虚拟卷的相对链要原样保留（卷根 → sub → dir），标签与路径一一对应。
+    #[test]
+    fn relative_chain_from_a_virtual_volume_keeps_every_level() {
+        let crumbs = crumb_list(&PathBuf::from("sub/dir"));
+        let labels: Vec<&str> = crumbs.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, vec!["卷根", "sub", "dir"], "实得 {crumbs:?}");
+        assert_eq!(crumbs[1].1, PathBuf::from("sub"), "点 sub 就该去 sub");
+    }
+
+    /// 标签为 `tmp` 那一跳必须真的去 `<盘符>:\tmp`，不是盘根、也不是该盘的当前目录。
+    #[cfg(windows)]
+    #[test]
+    fn crumb_label_and_target_agree_on_windows() {
+        let drive = match std::env::current_dir().unwrap().components().next() {
+            Some(std::path::Component::Prefix(p)) => match p.kind() {
+                // 这一版 std 的 `Prefix::Disk` 装 u8（盘符 ASCII），
+                // 不转成 char 会 format 出 `68:` 这种假路径（测试就是这么露的）
+                std::path::Prefix::Disk(code) => char::from(code),
+                other => panic!("这条测试要盘符开头的 CWD，实得 {other:?}"),
+            },
+            other => panic!("这条测试要盘符开头的 CWD，实得 {other:?}"),
+        };
+        let full = PathBuf::from(format!("{drive}:\\tmp\\adv-mut"));
+        let crumbs = crumb_list(&full);
+        let labels: Vec<&str> = crumbs.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![&format!("{drive}:\\")[..], "tmp", "adv-mut"],
+            "面包屑应是「盘根 › tmp › adv-mut」，实得 {labels:?}"
+        );
+        assert_eq!(crumbs[1].1, PathBuf::from(format!("{drive}:\\tmp")));
+        assert_eq!(crumbs[0].1, PathBuf::from(format!("{drive}:\\")));
+        // 反证钉死：这条链里绝不能有 `{drive}:`（不带根）那种写法
+        assert!(
+            !crumbs
+                .iter()
+                .any(|(_, p)| p.as_os_str() == format!("{drive}:").as_str()),
+            "链里混进了盘相对写法：{crumbs:?}"
+        );
+    }
 
     #[test]
     fn editing_the_stem_keeps_the_extension() {

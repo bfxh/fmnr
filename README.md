@@ -110,6 +110,7 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
 | 包更新 | 「包管理器」面板：可升级（winget）+ 已装清单（注册表底账）+ 详情 + 拖入快捷方式认应用 | ✅ 本机真跑：可升级 11 项、底账 273 条（与独立 PowerShell 计数一致）、详情/过滤/复制命令点过；**不代跑升级**；GitHub 上游只认出仓名，联网查询未接 |
 | 设置 | 顶栏「⚙ 设置」：开机自启动开关（HKCU `Run\fmnr`，可逆）、显示隐藏项、本机卷/插件计数 | ✅ 真机往返点过：开→注册表多出 1 个值、关→回到原样且**别人的 9 个自启动项一个没动** |
 | 三入口一致 | 内核能力上表：`read_file` / `write_file` / `rename` / `create_dir`（CLI 有 `cat` / `put` / `rename` / `mkdir`） | ✅ `entry_parity.rs` 三条腿（MCP 真子进程 / HTTP 真套接字 / CLI 真二进制）逐步比对返回 JSON **整份相等**；反证打过（CLI 腿偷加 `--max-bytes 3` 立刻判红）；**§6.2「MCP/HTTP 接多卷」未做**，见 `docs/NEXT-BATCH.md` §11 |
+| 路径串 | 面包屑/栏头与列出的内容必须指向同一个目录 | ✅ 已确诊并修：旧面包屑按 `components()` 取前 N 个重拼，Windows 上第一跳给的是 `E:`（盘相对，按该盘 CWD 解析）。现在标签与目标同源走 `ancestors()`，枚举层 `LocalVolume::resolve` 把 `E:` 补成 `E:\`（MCP/HTTP/CLI 那条腿客户端可以直接传 `"path":"E:"`）。真跑验过：`E:\tmp\adv-mut` 点「tmp」→ 栏头 `E:\tmp`、列的是 tmp 的内容。见 `docs/UI-NEXT.md` §10 |
 | CI | 五道门禁（lint / 双平台测试 / 插件行为 / 插件字节可复现 / 客户端契约） | ✅ `85f8ba9`（run 38979552946）全绿 |
 
 本地跑门用 [`scripts/gate.sh`](scripts/gate.sh)：按 CI 的顺序跑，最后一步
@@ -119,11 +120,6 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
 ## 已知边界
 
 写在这里的是**判据边界**，不是谦虚：
-
-- 🔴 **栏头显示的路径和列出来的内容可能不是同一个目录**（实测见
-  [`docs/UI-NEXT.md` §10](docs/UI-NEXT.md)）：特定启动条件下，栏头写 `E:\`、
-  列出的目录行却是 `E:\tmp` 的，双击进去后栏头还少一段。**机制未确诊**，
-  但按"文件管理器"判这是高危一条：照栏头走、照行删，两边不是同一个东西。
 
 - 🔴 **归档卷：界面里挂得上、列得出，但只读面没测。**
   `fmnr-ui` 启动时走 `fmnr_mount::mount_plan`（与 CLI 同一套受测逻辑），

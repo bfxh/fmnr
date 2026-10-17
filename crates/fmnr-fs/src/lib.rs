@@ -39,6 +39,8 @@ impl LocalVolume {
     fn resolve(&self, path: &VPath) -> PathBuf {
         if path.0.is_absolute() {
             path.0.clone()
+        } else if let Some(rooted) = root_drive_relative(&path.0) {
+            rooted
         } else {
             self.root.join(&path.0)
         }
@@ -47,6 +49,39 @@ impl LocalVolume {
     pub fn external_opens(&self) -> &ExternalOpens {
         &self.external_opens
     }
+}
+
+/// Windows 上「有盘符、没有根」的写法（`E:`、`E:foo`）既不算绝对路径，
+/// 也不是普通的相对路径：它按**该盘的当前目录**解析，而 `root.join("E:")`
+/// 会把 `root` 整个丢掉——实测 `PathBuf::from("E:\\tmp").join("E:") == "E:"`，
+/// 于是进程 CWD 在 `E:\tmp` 时"列 E 盘"实际列出的是 `E:\tmp`（1001 条），
+/// 而 `E:\` 只有 17 条。栏头写着一个目录、列出的是另一个目录，
+/// 用户照着栏头走 `cd`、照着行删文件，两边指向的不是同一处。
+///
+/// 这里把它补成盘根写法（`E:` → `E:\`、`E:foo` → `E:\foo`），
+/// 与资源管理器地址栏的行为一致，且不随进程 CWD 变。
+/// 非 Windows 上盘符前缀不存在，这个函数恒返回 None（不写 cfg 门控，
+/// 免得两侧各长出一份死代码）。
+fn root_drive_relative(p: &Path) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+    let mut comps = p.components();
+    let Some(Component::Prefix(pref)) = comps.next() else {
+        return None;
+    };
+    // 这一版 std 的 `Prefix::Disk` 装的是 u8（盘符的 ASCII 码），
+    // 直接 format 会打印成 `69:\`；必须先变回字符。
+    let Prefix::Disk(code) = pref.kind() else {
+        return None;
+    };
+    let drive = char::from(code);
+    // `E:\` 这种已经带根的绝对写法到不了这里（is_absolute 为真），
+    // 但防御性地再挡一次，避免哪天调用顺序变了把根吃掉。
+    if matches!(comps.clone().next(), Some(Component::RootDir)) {
+        return None;
+    }
+    let mut out = PathBuf::from(format!("{drive}:\\"));
+    out.extend(comps);
+    Some(out)
 }
 
 #[async_trait::async_trait]
@@ -574,6 +609,106 @@ pub fn search(
         }
     }
     hits
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[cfg(windows)]
+    fn opts() -> ListOpts {
+        ListOpts {
+            show_hidden: false,
+            sort: SortOrder::Name,
+        }
+    }
+
+    #[cfg(windows)]
+    fn names(v: &[Entry]) -> Vec<String> {
+        let mut n: Vec<String> = v.iter().map(|e| e.name.clone()).collect();
+        n.sort();
+        n
+    }
+
+    /// 普通相对写法照旧接在卷根后面（三条腿共用的那条正常路径不能被改坏）。
+    #[test]
+    fn relative_path_still_joins_the_volume_root() {
+        let root = std::env::temp_dir().join(format!("fmnr-rel-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let vol = LocalVolume::new(&root);
+        assert_eq!(
+            vol.resolve(&VPath(PathBuf::from("sub"))),
+            root.join("sub"),
+            "普通相对写法必须仍然接在卷根后"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    fn cwd_drive() -> char {
+        let cwd = std::env::current_dir().expect("拿不到 CWD");
+        match cwd.components().next() {
+            Some(std::path::Component::Prefix(p)) => match p.kind() {
+                std::path::Prefix::Disk(code) => char::from(code),
+                other => panic!("这条测试要一个盘符开头的 CWD，实得 {other:?}"),
+            },
+            other => panic!("这条测试要一个盘符开头的 CWD，实得 {other:?}"),
+        }
+    }
+
+    /// 回归：`<盘符>:` 这种盘相对写法**不许**跟着进程 CWD 走。
+    ///
+    /// 修前实测（CWD=`E:\tmp`）：`list("E:")` 返回 1001 条 = `E:\tmp` 的内容，
+    /// 而 `list("E:\\")` 返回 17 条 = 盘根；差别的来源就是
+    /// `root.join("E:")` 把 root 吃掉、Windows 按该盘当前目录解析 `E:`。
+    #[cfg(windows)]
+    #[test]
+    fn drive_colon_only_lists_the_drive_root_not_the_process_cwd() {
+        let d = cwd_drive();
+        // 卷根故意是一个只含一个标记文件的临时目录：
+        // 若盘相对写法还走 join 分支，列出来的就是它（1 条）而不是盘根。
+        let root = std::env::temp_dir().join(format!("fmnr-drive-rel-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = "fmnr-drive-relative-marker.txt";
+        std::fs::write(root.join(marker), b"x").unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let vol = LocalVolume::new(&root);
+        let rel = VPath(PathBuf::from(format!("{d}:")));
+        let abs = VPath(PathBuf::from(format!("{d}:\\")));
+        let got_rel = rt.block_on(vol.list(&rel, &opts())).expect("列盘根应成功");
+        let got_abs = rt.block_on(vol.list(&abs, &opts())).expect("列盘根应成功");
+
+        assert_eq!(
+            names(&got_rel),
+            names(&got_abs),
+            "`{d}:` 与 `{d}:\\` 必须列同一份内容；前者跟着 CWD 走就是本次修的缺陷"
+        );
+        assert!(
+            !names(&got_rel).iter().any(|n| n == marker),
+            "列 `{d}:` 却列到了卷根的临时目录（marker 泄漏进结果）"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 盘相对写法带子路径时也要补根：`E:ghost-…` 必须报到盘根那条路径上去，
+    /// 而不是 CWD 下的同名子目录——否则"不存在"这个结论本身就是错的。
+    #[cfg(windows)]
+    #[test]
+    fn drive_relative_subpath_is_rooted_and_errors_at_the_right_place() {
+        let d = cwd_drive();
+        let ghost = format!("fmnr-drive-relative-ghost-{}", std::process::id());
+        let vol = LocalVolume::new(std::env::temp_dir());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let e = rt
+            .block_on(vol.list(&VPath(PathBuf::from(format!("{d}:{ghost}"))), &opts()))
+            .expect_err("盘根下没有这个目录，必须报错");
+        let msg = e.to_string();
+        assert!(
+            msg.contains(&format!("{d}:\\{ghost}")),
+            "错误里要写出它去的是 `{d}:\\{ghost}`（而不是跟着 CWD），实得：{msg}"
+        );
+    }
 }
 
 #[cfg(all(test, windows))]
