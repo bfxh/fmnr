@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+sha2 = "0.10"
 fmnr-core = { path = "../fmnr-core" }
 tokio = { version = "1", features = ["full"] }
 thiserror.workspace = true
