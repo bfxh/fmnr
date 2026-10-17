@@ -111,9 +111,9 @@ pub struct App {
     tree: crate::tree::Tree,
     /// 包更新盘点（只读，入口在目录树那一排的「更新」）
     pkg: PkgPanel,
-    /// 设置窗口
+    /// 设置停靠区是否开着
     settings_open: bool,
-    /// 磁盘占用视图：在跑的扫描 + 窗口是否开着
+    /// 磁盘占用视图：在跑的扫描 + 停靠区是否开着
     usage_open: bool,
     usage: Option<crate::usage::Running>,
     /// 重复文件扫描（跟着「磁盘占用」面板走，同一个根）
@@ -135,8 +135,7 @@ pub struct App {
     /// 当前在看哪一层（点占比条会下钻，面包屑回上级）。
     /// 和扫描的 root 是同一个东西：下钻=重起一次以它为根的扫描。
     usage_root: PathBuf,
-    /// 自启动管理（顶栏常驻入口）。`None` = 还没读。
-    startup_open: bool,
+    /// 自启动管理（设置停靠区里的一节，顶栏留有直达入口）。`None` = 还没读。
     startup: Option<fmnr_fs::startup::StartupInventory>,
     startup_error: Option<String>,
     /// 自启动状态。`None` = 还没读；读失败走 `autostart_error` 而不是当成"没开"——
@@ -174,6 +173,24 @@ enum ViewMode {
 enum Pane {
     Left,
     Right,
+}
+
+/// 右侧停靠区当前放哪一个工作区视图。
+///
+/// 这一层不是摆设：停靠区是 `SidePanel`，它从中央区**扣宽度**而不是盖在上面，
+/// 所以同一帧只能有一个。两个并排就把文件列表挤没了。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Dock {
+    Pkg,
+    Settings,
+    Usage,
+}
+
+/// [App::startup_section] 想让用户做的事，攒着等闭包外再执行。
+#[derive(Default)]
+struct StartupAction {
+    reload: bool,
+    toggle: Option<(fmnr_fs::startup::StartupItem, bool)>,
 }
 
 /// 右键菜单里的一个动作。
@@ -401,7 +418,6 @@ impl App {
             dupes_dead: std::collections::HashSet::new(),
             drives: fmnr_fs::drives::list(),
             usage_root: PathBuf::new(),
-            startup_open: false,
             startup: None,
             startup_error: None,
             autostart_status: None,
@@ -1304,7 +1320,7 @@ impl App {
                 self.pkg.shortcuts.push(p.clone());
             }
         }
-        self.pkg.open = true;
+        self.open_dock(Dock::Pkg);
         self.pkg.tab = PkgTab::Ledger;
         self.start_ledger_load();
         self.status = format!("检查 {} 个快捷方式（原件未移动）", paths.len());
@@ -1319,217 +1335,208 @@ impl App {
         let mut want_scan = false;
         let mut want_ledger = false;
         let mut drop_shortcut: Option<PathBuf> = None;
-        let mut open = self.pkg.open;
         let shortcuts = self.pkg.shortcuts.clone();
         let ledger = self.pkg.ledger.clone();
         let rows = self.pkg.rows.clone();
         let tab = self.pkg.tab;
 
-        egui::Window::new("包管理器")
-            .id(egui::Id::new("pkg"))
-            .default_size([620.0, 420.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(tab == PkgTab::Upgrades, format!("可升级 {}", rows.len()))
-                        .clicked()
-                    {
-                        self.pkg.tab = PkgTab::Upgrades;
-                    }
-                    if ui
-                        .selectable_label(
-                            tab == PkgTab::Ledger,
-                            format!("已装清单 {}", ledger.len()),
-                        )
-                        .clicked()
-                    {
-                        self.pkg.tab = PkgTab::Ledger;
-                        want_ledger = true;
-                    }
-                });
-
-                if !shortcuts.is_empty() {
-                    ui.separator();
-                    ui.label(egui::RichText::new("拖进来的快捷方式").strong());
-                    for s in &shortcuts {
-                        let name = s
-                            .file_stem()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        ui.horizontal(|ui| {
-                            let text = match shortcut_verdict(s, &ledger, &rows) {
-                                Verdict::Loading(t) => t,
-                                Verdict::Ok(t) => t,
-                                Verdict::Bad(t) => t,
-                            };
-                            let lbl = egui::RichText::new(format!("{name}：{text}"));
-                            match shortcut_verdict(s, &ledger, &rows) {
-                                Verdict::Bad(_) => {
-                                    let c = ui.visuals().error_fg_color;
-                                    ui.colored_label(c, lbl);
-                                }
-                                _ => {
-                                    ui.label(lbl);
-                                }
-                            }
-                            if ui.button("移除").clicked() {
-                                drop_shortcut = Some(s.clone());
-                            }
-                        });
-                    }
+        let keep = dock(ctx, "dock_pkg", "包管理器", 620.0, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(tab == PkgTab::Upgrades, format!("可升级 {}", rows.len()))
+                    .clicked()
+                {
+                    self.pkg.tab = PkgTab::Upgrades;
                 }
+                if ui
+                    .selectable_label(tab == PkgTab::Ledger, format!("已装清单 {}", ledger.len()))
+                    .clicked()
+                {
+                    self.pkg.tab = PkgTab::Ledger;
+                    want_ledger = true;
+                }
+            });
 
+            if !shortcuts.is_empty() {
                 ui.separator();
-                match self.pkg.tab {
-                    PkgTab::Upgrades => {
-                        if self.pkg.rx.is_some() {
-                            ui.label("正在问 winget…（冷跑要几秒）");
-                        }
-                        if let Some(err) = &self.pkg.error {
-                            let c = ui.visuals().error_fg_color;
-                            ui.colored_label(c, err);
-                            ui.label("这一步只是读 winget 的表格，没装任何东西。");
-                        }
-                        if rows.is_empty()
-                            && self.pkg.rx.is_none()
-                            && self.pkg.error.is_none()
-                            && ui.button("问一次 winget").clicked()
-                        {
-                            want_scan = true;
-                        }
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .max_height(200.0)
-                            .show(ui, |ui| {
-                                for r in &rows {
-                                    ui.horizontal(|ui| {
-                                        ui.label(&r.name);
-                                        ui.weak(format!("{} → {}", r.installed, r.available));
-                                        ui.label(format!("({})", r.source));
-                                        if ui
-                                            .button("复制命令")
-                                            .on_hover_text(format!("winget upgrade --id {}", r.id))
-                                            .clicked()
-                                        {
-                                            copy_cmd =
-                                                Some(format!("winget upgrade --id {}", r.id));
-                                        }
-                                    });
-                                }
-                            });
-                    }
-                    PkgTab::Ledger => {
-                        if self.pkg.ledger_rx.is_some() {
-                            ui.label("正在读注册表…");
-                        }
-                        if let Some(err) = &self.pkg.ledger_error {
-                            let c = ui.visuals().error_fg_color;
-                            ui.colored_label(c, err);
-                        }
-                        ui.horizontal(|ui| {
-                            ui.label("过滤");
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut self.pkg.filter)
-                                        .desired_width(200.0)
-                                        .hint_text("名称 / 发布者"),
-                                )
-                                .changed()
-                            {
-                                // 详情按下标记住选中项，列表一变这个下标就指向
-                                // 另一个应用了——那不是"选中丢了"，是"显示错数据"。
-                                self.pkg.detail = None;
+                ui.label(egui::RichText::new("拖进来的快捷方式").strong());
+                for s in &shortcuts {
+                    let name = s
+                        .file_stem()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        let text = match shortcut_verdict(s, &ledger, &rows) {
+                            Verdict::Loading(t) => t,
+                            Verdict::Ok(t) => t,
+                            Verdict::Bad(t) => t,
+                        };
+                        let lbl = egui::RichText::new(format!("{name}：{text}"));
+                        match shortcut_verdict(s, &ledger, &rows) {
+                            Verdict::Bad(_) => {
+                                let c = ui.visuals().error_fg_color;
+                                ui.colored_label(c, lbl);
                             }
-                        });
-                        let f = self.pkg.filter.to_lowercase();
-                        let shown: Vec<(usize, &fmnr_pkg::registry::InstalledApp)> = ledger
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, a)| {
-                                f.is_empty()
-                                    || a.name.to_lowercase().contains(&f)
-                                    || a.publisher
-                                        .as_deref()
-                                        .is_some_and(|p| p.to_lowercase().contains(&f))
-                            })
-                            .collect();
-                        let detail = self.pkg.detail;
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .max_height(180.0)
-                            .show(ui, |ui| {
-                                for (i, a) in &shown {
+                            _ => {
+                                ui.label(lbl);
+                            }
+                        }
+                        if ui.button("移除").clicked() {
+                            drop_shortcut = Some(s.clone());
+                        }
+                    });
+                }
+            }
+
+            ui.separator();
+            match self.pkg.tab {
+                PkgTab::Upgrades => {
+                    if self.pkg.rx.is_some() {
+                        ui.label("正在问 winget…（冷跑要几秒）");
+                    }
+                    if let Some(err) = &self.pkg.error {
+                        let c = ui.visuals().error_fg_color;
+                        ui.colored_label(c, err);
+                        ui.label("这一步只是读 winget 的表格，没装任何东西。");
+                    }
+                    if rows.is_empty()
+                        && self.pkg.rx.is_none()
+                        && self.pkg.error.is_none()
+                        && ui.button("问一次 winget").clicked()
+                    {
+                        want_scan = true;
+                    }
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            for r in &rows {
+                                ui.horizontal(|ui| {
+                                    ui.label(&r.name);
+                                    ui.weak(format!("{} → {}", r.installed, r.available));
+                                    ui.label(format!("({})", r.source));
                                     if ui
-                                        .selectable_label(
-                                            detail == Some(*i),
-                                            format!(
-                                                "{} — {} — {} — {}",
-                                                a.name,
-                                                a.publisher.as_deref().unwrap_or("（无发布者）"),
-                                                a.version.as_deref().unwrap_or("（无版本）"),
-                                                a.family.label()
-                                            ),
-                                        )
+                                        .button("复制命令")
+                                        .on_hover_text(format!("winget upgrade --id {}", r.id))
                                         .clicked()
                                     {
-                                        self.pkg.detail = Some(*i);
+                                        copy_cmd = Some(format!("winget upgrade --id {}", r.id));
                                     }
+                                });
+                            }
+                        });
+                }
+                PkgTab::Ledger => {
+                    if self.pkg.ledger_rx.is_some() {
+                        ui.label("正在读注册表…");
+                    }
+                    if let Some(err) = &self.pkg.ledger_error {
+                        let c = ui.visuals().error_fg_color;
+                        ui.colored_label(c, err);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("过滤");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.pkg.filter)
+                                    .desired_width(200.0)
+                                    .hint_text("名称 / 发布者"),
+                            )
+                            .changed()
+                        {
+                            // 详情按下标记住选中项，列表一变这个下标就指向
+                            // 另一个应用了——那不是"选中丢了"，是"显示错数据"。
+                            self.pkg.detail = None;
+                        }
+                    });
+                    let f = self.pkg.filter.to_lowercase();
+                    let shown: Vec<(usize, &fmnr_pkg::registry::InstalledApp)> = ledger
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, a)| {
+                            f.is_empty()
+                                || a.name.to_lowercase().contains(&f)
+                                || a.publisher
+                                    .as_deref()
+                                    .is_some_and(|p| p.to_lowercase().contains(&f))
+                        })
+                        .collect();
+                    let detail = self.pkg.detail;
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            for (i, a) in &shown {
+                                if ui
+                                    .selectable_label(
+                                        detail == Some(*i),
+                                        format!(
+                                            "{} — {} — {} — {}",
+                                            a.name,
+                                            a.publisher.as_deref().unwrap_or("（无发布者）"),
+                                            a.version.as_deref().unwrap_or("（无版本）"),
+                                            a.family.label()
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    self.pkg.detail = Some(*i);
                                 }
-                            });
-                        if let Some(i) = self.pkg.detail {
-                            if let Some(a) = shown.get(i) {
-                                let a = a.1;
-                                ui.separator();
-                                ui.label(egui::RichText::new(&a.name).strong());
-                                field(ui, "发布者", a.publisher.as_deref());
-                                field(ui, "版本", a.version.as_deref());
-                                field(ui, "来源", Some(a.family.label()));
-                                field(ui, "作用域", Some(a.hive.label()));
-                                field(ui, "安装位置", a.install_location.as_deref());
-                                field(ui, "卸载串", a.uninstall_string.as_deref());
-                                field(ui, "注册表键", a.reg_key.as_deref());
-                                if let Some(g) = &a.github {
-                                    ui.label(format!("上游 GitHub 仓：{g}（还没接联网查询）"));
-                                }
-                                if let Some(u) = &a.url {
-                                    ui.horizontal(|ui| {
-                                        ui.label("官网");
-                                        if ui.button("复制链接").clicked() {
-                                            copy_cmd = Some(u.clone());
-                                        }
-                                    });
-                                }
+                            }
+                        });
+                    if let Some(i) = self.pkg.detail {
+                        if let Some(a) = shown.get(i) {
+                            let a = a.1;
+                            ui.separator();
+                            ui.label(egui::RichText::new(&a.name).strong());
+                            field(ui, "发布者", a.publisher.as_deref());
+                            field(ui, "版本", a.version.as_deref());
+                            field(ui, "来源", Some(a.family.label()));
+                            field(ui, "作用域", Some(a.hive.label()));
+                            field(ui, "安装位置", a.install_location.as_deref());
+                            field(ui, "卸载串", a.uninstall_string.as_deref());
+                            field(ui, "注册表键", a.reg_key.as_deref());
+                            if let Some(g) = &a.github {
+                                ui.label(format!("上游 GitHub 仓：{g}（还没接联网查询）"));
+                            }
+                            if let Some(u) = &a.url {
+                                ui.horizontal(|ui| {
+                                    ui.label("官网");
+                                    if ui.button("复制链接").clicked() {
+                                        copy_cmd = Some(u.clone());
+                                    }
+                                });
                             }
                         }
                     }
                 }
+            }
 
-                ui.separator();
-                // 边界要写在界面上，不能只写在源码注释里：
-                // 用户看到一排"可升级"最自然的预期就是点一下能升。
-                // 数字一律取现场读到的，不写死本机测出来的那 273/74——
-                // 换台机器那句话就成了假声称。
-                ui.label(
-                    egui::RichText::new(format!(
-                        "这里只列清单，不代跑升级。要更新请在 winget 或 UniGetUI 里执行；\
+            ui.separator();
+            // 边界要写在界面上，不能只写在源码注释里：
+            // 用户看到一排"可升级"最自然的预期就是点一下能升。
+            // 数字一律取现场读到的，不写死本机测出来的那 273/74——
+            // 换台机器那句话就成了假声称。
+            ui.label(
+                egui::RichText::new(format!(
+                    "这里只列清单，不代跑升级。要更新请在 winget 或 UniGetUI 里执行；\
                          .NET 运行时这类包通常要再点一次才真正装上。\n\
                          「可升级」只覆盖 winget 看得见的那部分（本机会报 {} 项）；\
                          「已装清单」读注册表，是全量底账（本机 {} 条，其中 {} 条写了安装位置，\
                          没写安装位置的只能按卸载器所在目录认）。",
-                        rows.len(),
-                        ledger.len(),
-                        ledger
-                            .iter()
-                            .filter(|a| a.install_location.is_some())
-                            .count()
-                    ))
-                    .size(12.0)
-                    .weak(),
-                );
-            });
+                    rows.len(),
+                    ledger.len(),
+                    ledger
+                        .iter()
+                        .filter(|a| a.install_location.is_some())
+                        .count()
+                ))
+                .size(12.0)
+                .weak(),
+            );
+        });
 
-        self.pkg.open = open;
+        self.pkg.open = keep;
         if want_scan {
             self.start_pkg_scan();
         }
@@ -1544,11 +1551,11 @@ impl App {
         }
     }
 
-    /// 打开设置窗口。自启动状态在**第一次打开时**读一次：
+    /// 打开设置停靠区。自启动状态在**第一次打开时**读一次：
     /// 每帧读注册表既没必要（用户不会在别的窗口里改它而期望这里立刻跟着变），
     /// 也会让"读失败"变成每帧刷新的红字。
     fn open_settings(&mut self) {
-        self.settings_open = true;
+        self.open_dock(Dock::Settings);
         if self.self_exe.as_os_str().is_empty() {
             self.autostart_error =
                 Some("拿不到本程序的路径（current_exe 失败），无法登记自启动".into());
@@ -1556,6 +1563,11 @@ impl App {
         }
         if self.autostart_status.is_none() && self.autostart_error.is_none() {
             self.read_autostart();
+        }
+        // 停靠区里就有「这台机器上的启动项」那一节，不读它就是一个空节：
+        // 空着一块还摆着标题，比没有更让人以为"这台机器没东西"。
+        if self.startup.is_none() && self.startup_error.is_none() {
+            self.reload_startup();
         }
     }
 
@@ -1584,101 +1596,105 @@ impl App {
         let mut want_disable = false;
         let mut want_reread = false;
         let mut rehidden = false;
-        let mut open = self.settings_open;
-
-        egui::Window::new("设置")
-            .id(egui::Id::new("settings"))
-            .default_size([460.0, 320.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label(egui::RichText::new("开机自启动").strong());
-                match &self.autostart_error {
-                    Some(err) => {
-                        let c = ui.visuals().error_fg_color;
-                        ui.colored_label(c, err);
-                        ui.label("这一步只读 HKCU 下我们自己的那一个值，读不到就是读不到。");
-                    }
-                    None => {
-                        // 先取成 owned 值再画按钮：闭包里还要写 self.autostart_status，
-                        // 直接 match &self.… 会让这段借用横跨整个臂体。
-                        let status = self.autostart_status.clone();
-                        let (text, enabled) = match &status {
-                            Some(fmnr_fs::autostart::Status::Off) => {
-                                ("未开启。".to_string(), false)
-                            }
-                            Some(fmnr_fs::autostart::Status::Ours) => {
-                                (format!("已开启，指向 {exe}"), true)
-                            }
-                            Some(fmnr_fs::autostart::Status::Foreign(v)) => {
-                                (format!("值名 fmnr 已被别的命令占用：{v}"), false)
-                            }
-                            None => ("（还没读）".to_string(), false),
-                        };
-                        ui.label(text);
-                        ui.horizontal(|ui| {
-                            ui.add_enabled_ui(!enabled, |ui| {
-                                if ui.button("开启").clicked() {
-                                    want_enable = true;
+        let mut startup_act = StartupAction::default();
+        let keep = dock(ctx, "dock_settings", "设置", 460.0, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("开机自启动").strong());
+                    match &self.autostart_error {
+                        Some(err) => {
+                            let c = ui.visuals().error_fg_color;
+                            ui.colored_label(c, err);
+                            ui.label("这一步只读 HKCU 下我们自己的那一个值，读不到就是读不到。");
+                        }
+                        None => {
+                            // 先取成 owned 值再画按钮：闭包里还要写 self.autostart_status，
+                            // 直接 match &self.… 会让这段借用横跨整个臂体。
+                            let status = self.autostart_status.clone();
+                            let (text, enabled) = match &status {
+                                Some(fmnr_fs::autostart::Status::Off) => {
+                                    ("未开启。".to_string(), false)
+                                }
+                                Some(fmnr_fs::autostart::Status::Ours) => {
+                                    (format!("已开启，指向 {exe}"), true)
+                                }
+                                Some(fmnr_fs::autostart::Status::Foreign(v)) => {
+                                    (format!("值名 fmnr 已被别的命令占用：{v}"), false)
+                                }
+                                None => ("（还没读）".to_string(), false),
+                            };
+                            ui.label(text);
+                            ui.horizontal(|ui| {
+                                ui.add_enabled_ui(!enabled, |ui| {
+                                    if ui.button("开启").clicked() {
+                                        want_enable = true;
+                                    }
+                                });
+                                ui.add_enabled_ui(enabled, |ui| {
+                                    if ui.button("关闭").clicked() {
+                                        want_disable = true;
+                                    }
+                                });
+                                if ui.button("重新读取").clicked() {
+                                    want_reread = true;
                                 }
                             });
-                            ui.add_enabled_ui(enabled, |ui| {
-                                if ui.button("关闭").clicked() {
-                                    want_disable = true;
-                                }
-                            });
-                            if ui.button("重新读取").clicked() {
-                                want_reread = true;
+                            if matches!(status, Some(fmnr_fs::autostart::Status::Foreign(_))) {
+                                let c = Color32::from_rgb(230, 89, 38);
+                                ui.colored_label(
+                                    c,
+                                    "这种情况这里不提供按钮：覆盖它等于替你把别人的自启动改掉。",
+                                );
                             }
-                        });
-                        if matches!(status, Some(fmnr_fs::autostart::Status::Foreign(_))) {
-                            let c = Color32::from_rgb(230, 89, 38);
-                            ui.colored_label(
-                                c,
-                                "这种情况这里不提供按钮：覆盖它等于替你把别人的自启动改掉。",
-                            );
                         }
                     }
-                }
-                ui.label(
-                    egui::RichText::new(
-                        "只写 HKCU\\...\\Run 下名为 fmnr 的那一个值；关闭时也只删这一个值，\
+                    ui.label(
+                        egui::RichText::new(
+                            "只写 HKCU\\...\\Run 下名为 fmnr 的那一个值；关闭时也只删这一个值，\
                          不删 Run 键——里面是这台机器所有程序的自启动项。",
-                    )
-                    .size(12.0)
-                    .weak(),
-                );
-
-                ui.separator();
-                ui.label(egui::RichText::new("列表").strong());
-                if ui.checkbox(&mut self.show_hidden, "显示隐藏项").changed() {
-                    rehidden = true;
-                }
-
-                ui.separator();
-                ui.label(egui::RichText::new("这台机器上 fmnr 看到的").strong());
-                ui.label(format!(
-                    "卷 {} 个 · 插件 {} 个",
-                    self.volume_registry.list().len(),
-                    self.plugins.len()
-                ));
-                ui.label(
-                    egui::RichText::new(format!("本程序：{exe}"))
+                        )
                         .size(12.0)
                         .weak(),
-                );
-                if !self.plugin_warnings.is_empty() {
-                    let c = Color32::from_rgb(230, 89, 38);
-                    ui.colored_label(
-                        c,
-                        format!(
-                            "{} 个插件没加载成功，状态栏那条会说明原因",
-                            self.plugin_warnings.len()
-                        ),
                     );
-                }
-            });
 
-        self.settings_open = open;
+                    ui.separator();
+                    ui.label(egui::RichText::new("列表").strong());
+                    if ui.checkbox(&mut self.show_hidden, "显示隐藏项").changed() {
+                        rehidden = true;
+                    }
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("这台机器上 fmnr 看到的").strong());
+                    ui.label(format!(
+                        "卷 {} 个 · 插件 {} 个",
+                        self.volume_registry.list().len(),
+                        self.plugins.len()
+                    ));
+                    ui.label(
+                        egui::RichText::new(format!("本程序：{exe}"))
+                            .size(12.0)
+                            .weak(),
+                    );
+                    if !self.plugin_warnings.is_empty() {
+                        let c = Color32::from_rgb(230, 89, 38);
+                        ui.colored_label(
+                            c,
+                            format!(
+                                "{} 个插件没加载成功，状态栏那条会说明原因",
+                                self.plugin_warnings.len()
+                            ),
+                        );
+                    }
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("这台机器上的启动项").strong());
+                    self.startup_section(ui, &mut startup_act);
+                });
+        });
+
+        self.settings_open = keep;
+        self.apply_startup_action(startup_act);
         if want_reread {
             self.autostart_status = None;
             self.autostart_error = None;
@@ -1707,11 +1723,19 @@ impl App {
 
     /// 打开磁盘占用视图，从当前栏正在看的那一层开始算。
     fn open_usage(&mut self) {
-        self.usage_open = true;
+        self.open_dock(Dock::Usage);
         let root = self.active_path().clone();
         if self.usage_root != root || self.usage.is_none() {
             self.start_usage_scan(root);
         }
+    }
+
+    /// 停靠区一次只放一个视图。开新的必先关旧的：两个右侧栏并排会把
+    /// 中间的文件列表挤没，而那正是这轮要修掉的事。
+    fn open_dock(&mut self, which: Dock) {
+        self.pkg.open = matches!(which, Dock::Pkg);
+        self.settings_open = matches!(which, Dock::Settings);
+        self.usage_open = matches!(which, Dock::Usage);
     }
 
     /// 起一次扫描。旧的那次先取消：同时跑两棵树等于把内存和磁盘带宽翻倍，
@@ -1785,175 +1809,168 @@ impl App {
         // 重复扫描的结果先取出来：闭包里不能再借 self 一次
         let dupes_found = self.dupes.as_ref().and_then(|r| r.view()).cloned();
         let dupes_busy = self.dupes.as_ref().is_some_and(|r| r.busy());
-        let mut open = self.usage_open;
+        let keep = dock(ctx, "dock_usage", "磁盘占用", 560.0, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(root.display().to_string()).strong());
+                if ui.button("重扫").clicked() {
+                    want_rescan = true;
+                }
+                // 下钻之后必须出得来：没有"上一级"的话，点一次就被关在一层里，
+                // 只能关掉窗口重开。
+                if let Some(p) = root.parent().filter(|x| x.is_dir()) {
+                    if ui.button("↑ 上一级").clicked() {
+                        descend = Some(p.to_path_buf());
+                    }
+                }
+                if busy && ui.button("取消").clicked() {
+                    want_cancel = true;
+                }
+            });
 
-        egui::Window::new("磁盘占用")
-            .id(egui::Id::new("usage"))
-            .default_size([560.0, 420.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(root.display().to_string()).strong());
-                    if ui.button("重扫").clicked() {
-                        want_rescan = true;
-                    }
-                    // 下钻之后必须出得来：没有"上一级"的话，点一次就被关在一层里，
-                    // 只能关掉窗口重开。
-                    if let Some(p) = root.parent().filter(|x| x.is_dir()) {
-                        if ui.button("↑ 上一级").clicked() {
-                            descend = Some(p.to_path_buf());
-                        }
-                    }
-                    if busy && ui.button("取消").clicked() {
-                        want_cancel = true;
-                    }
-                });
-
-                // 水位线
-                match &space {
-                    Some(s) => {
-                        let ratio = s.used_ratio().unwrap_or(0.0);
-                        let w = ui.available_width();
-                        let rect = egui::Rect::from_min_size(
-                            ui.cursor().min,
-                            egui::vec2(w.max(80.0), 18.0),
-                        );
-                        ui.painter().rect_filled(rect, 6.0, ui.visuals().faint_bg_color);
-                        ui.painter().rect_filled(
-                            egui::Rect::from_min_size(
-                                rect.min,
-                                egui::vec2(rect.width() * ratio, rect.height()),
-                            ),
-                            6.0,
-                            if ratio > 0.92 {
-                                Color32::from_rgb(220, 50, 50)
-                            } else if ratio > 0.8 {
-                                Color32::from_rgb(230, 191, 0)
-                            } else {
-                                Color32::from_rgb(0, 122, 255)
-                            },
-                        );
-                        ui.allocate_at_least(rect.size(), egui::Sense::hover());
-                        ui.label(format!(
-                            "剩余 {} / 共 {}（已用 {:.0}%）",
-                            fmt_size(s.free),
-                            fmt_size(s.total),
-                            ratio * 100.0
-                        ));
-                        // 结论先行：只剩一点时直接说动谁有用，别让用户自己换算条子
-                        if s.free < 5 * 1024 * 1024 * 1024 {
-                            let c = ui.visuals().error_fg_color;
-                            let mut lines = vec![format!(
-                                "只剩 {}：装一个常见的更新包就可能不够。",
-                                fmt_size(s.free)
-                            )];
-                            if let Some(u) = &usage {
-                                for b in u.sorted().into_iter().take(3) {
-                                    lines.push(format!(
-                                        "  最大的一支：{}（{}，{} 个文件）",
-                                        b.name,
-                                        fmt_size(b.bytes),
-                                        b.entries
-                                    ));
-                                }
-                            }
-                            ui.colored_label(c, lines.join("\n"));
-                        }
-                    }
-                    None => {
+            // 水位线
+            match &space {
+                Some(s) => {
+                    let ratio = s.used_ratio().unwrap_or(0.0);
+                    let w = ui.available_width();
+                    let rect =
+                        egui::Rect::from_min_size(ui.cursor().min, egui::vec2(w.max(80.0), 18.0));
+                    ui.painter()
+                        .rect_filled(rect, 6.0, ui.visuals().faint_bg_color);
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(
+                            rect.min,
+                            egui::vec2(rect.width() * ratio, rect.height()),
+                        ),
+                        6.0,
+                        if ratio > 0.92 {
+                            Color32::from_rgb(220, 50, 50)
+                        } else if ratio > 0.8 {
+                            Color32::from_rgb(230, 191, 0)
+                        } else {
+                            Color32::from_rgb(0, 122, 255)
+                        },
+                    );
+                    ui.allocate_at_least(rect.size(), egui::Sense::hover());
+                    ui.label(format!(
+                        "剩余 {} / 共 {}（已用 {:.0}%）",
+                        fmt_size(s.free),
+                        fmt_size(s.total),
+                        ratio * 100.0
+                    ));
+                    // 结论先行：只剩一点时直接说动谁有用，别让用户自己换算条子
+                    if s.free < 5 * 1024 * 1024 * 1024 {
                         let c = ui.visuals().error_fg_color;
-                        ui.colored_label(
+                        let mut lines = vec![format!(
+                            "只剩 {}：装一个常见的更新包就可能不够。",
+                            fmt_size(s.free)
+                        )];
+                        if let Some(u) = &usage {
+                            for b in u.sorted().into_iter().take(3) {
+                                lines.push(format!(
+                                    "  最大的一支：{}（{}，{} 个文件）",
+                                    b.name,
+                                    fmt_size(b.bytes),
+                                    b.entries
+                                ));
+                            }
+                        }
+                        ui.colored_label(c, lines.join("\n"));
+                    }
+                }
+                None => {
+                    let c = ui.visuals().error_fg_color;
+                    ui.colored_label(
                             c,
                             "这一层的剩余空间读不到（只实现了 Windows 的卷查询）。读不到就说读不到，不画成空盘。",
                         );
-                    }
                 }
+            }
 
-                ui.separator();
-                match &usage {
-                    None => {
-                        ui.label("（还没起扫描）");
-                    }
-                    Some(u) => {
-                        if let Some(err) = &u.error {
-                            let c = ui.visuals().error_fg_color;
-                            ui.colored_label(c, format!("扫描：{err}"));
-                        }
-                        ui.label(format!(
-                            "{} · 已扫 {} 个文件 · 合计 {}",
-                            if u.done {
-                                "扫完了"
-                            } else {
-                                "还在算（下面的数会一路长）"
-                            },
-                            u.visited,
-                            fmt_size(u.total())
-                        ));
-                        let total = u.total().max(1);
-                        // 纵向 `auto_shrink=true` + 一个 max_height：
-                        // 原来写的是 `[false, false]`，滚动区会**吃掉整窗剩余高度**，
-                        // 于是下面那一节（还有本来就在的提示）被顶到窗口外看不见——
-                        // 真跑一次才发现，编译和单测都不会报这种错。
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, true])
-                            .max_height(240.0)
-                            .show(ui, |ui| {
-                                if u.loose_bytes > 0 {
-                                    bar(
-                                        ui,
-                                        "（这一层散落的文件）",
-                                        u.loose_bytes,
-                                        u.loose_bytes as f64 / total as f64,
-                                        0,
-                                        false,
-                                    );
-                                }
-                                for b in u.sorted() {
-                                    let frac = b.bytes as f64 / total as f64;
-                                    if bar(ui, &b.name, b.bytes, frac, b.errors, !u.done) {
-                                        descend = Some(b.path.clone());
-                                    }
-                                }
-                            });
-                    }
+            ui.separator();
+            match &usage {
+                None => {
+                    ui.label("（还没起扫描）");
                 }
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(
-                        "点一条进到那一层重算。这里只统计大小，不删任何东西；\
+                Some(u) => {
+                    if let Some(err) = &u.error {
+                        let c = ui.visuals().error_fg_color;
+                        ui.colored_label(c, format!("扫描：{err}"));
+                    }
+                    ui.label(format!(
+                        "{} · 已扫 {} 个文件 · 合计 {}",
+                        if u.done {
+                            "扫完了"
+                        } else {
+                            "还在算（下面的数会一路长）"
+                        },
+                        u.visited,
+                        fmt_size(u.total())
+                    ));
+                    let total = u.total().max(1);
+                    // 纵向 `auto_shrink=true` + 一个 max_height：
+                    // 原来写的是 `[false, false]`，滚动区会**吃掉整窗剩余高度**，
+                    // 于是下面那一节（还有本来就在的提示）被顶到窗口外看不见——
+                    // 真跑一次才发现，编译和单测都不会报这种错。
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, true])
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            if u.loose_bytes > 0 {
+                                bar(
+                                    ui,
+                                    "（这一层散落的文件）",
+                                    u.loose_bytes,
+                                    u.loose_bytes as f64 / total as f64,
+                                    0,
+                                    false,
+                                );
+                            }
+                            for b in u.sorted() {
+                                let frac = b.bytes as f64 / total as f64;
+                                if bar(ui, &b.name, b.bytes, frac, b.errors, !u.done) {
+                                    descend = Some(b.path.clone());
+                                }
+                            }
+                        });
+                }
+            }
+            ui.separator();
+            ui.label(
+                egui::RichText::new(
+                    "点一条进到那一层重算。这里只统计大小，不删任何东西；\
                          没扫完之前数字是半截的，别当结论用。",
-                    )
-                    .size(12.0)
-                    .weak(),
-                );
+                )
+                .size(12.0)
+                .weak(),
+            );
 
-                // ---- 重复文件：同一个根上的另一件事 ----
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("♻ 找重复").clicked() {
-                        want_dupes = true;
-                    }
-                    if dupes_busy && ui.button("取消").clicked() {
-                        want_dupes_cancel = true;
-                    }
-                    ui.checkbox(&mut self.dupes_remember, "记住指纹（默认不记）");
-                });
-                // 删除只走当前卷，而当前卷可能是只读归档或远程卷：
-                // 那种时候清单照看、按钮禁用，而不是点下去报一个内核错误。
-                let can_delete = self
-                    .current_volume()
-                    .is_some_and(|v| v.kind() == fmnr_core::VolumeKind::Local && v.writable());
-                dupes_plan = render_dupes_section(
-                    ui,
-                    dupes_found.as_ref(),
-                    dupes_busy,
-                    &mut self.dupes_sel,
-                    &self.dupes_dead,
-                    can_delete,
-                );
+            // ---- 重复文件：同一个根上的另一件事 ----
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("♻ 找重复").clicked() {
+                    want_dupes = true;
+                }
+                if dupes_busy && ui.button("取消").clicked() {
+                    want_dupes_cancel = true;
+                }
+                ui.checkbox(&mut self.dupes_remember, "记住指纹（默认不记）");
             });
+            // 删除只走当前卷，而当前卷可能是只读归档或远程卷：
+            // 那种时候清单照看、按钮禁用，而不是点下去报一个内核错误。
+            let can_delete = self
+                .current_volume()
+                .is_some_and(|v| v.kind() == fmnr_core::VolumeKind::Local && v.writable());
+            dupes_plan = render_dupes_section(
+                ui,
+                dupes_found.as_ref(),
+                dupes_busy,
+                &mut self.dupes_sel,
+                &self.dupes_dead,
+                can_delete,
+            );
+        });
 
-        self.usage_open = open;
+        self.usage_open = keep;
         if let Some(plan) = dupes_plan {
             let n = plan.paths.len();
             // 先记下"这些已经删了"，再发操作：清单是删之前扫的那一份，
@@ -1992,11 +2009,10 @@ impl App {
         }
     }
 
+    /// 顶栏的「自启动」是**设置停靠区里那一节**的直达入口。入口留在顶栏常驻
+    /// （用户要的是"随时能看到、随时能改"），但它不再有自己的窗。
     fn open_startup(&mut self) {
-        self.startup_open = true;
-        if self.startup.is_none() {
-            self.reload_startup();
-        }
+        self.open_settings();
     }
 
     fn reload_startup(&mut self) {
@@ -2013,98 +2029,87 @@ impl App {
     }
 
     /// 自启动管理器：全量列出，用户级的可开关，机器级只读并说明原因。
-    fn render_startup(&mut self, ctx: &egui::Context) {
-        if !self.startup_open {
-            return;
+    ///
+    /// 它原来是一扇自己的浮动窗，现在是**设置停靠区里的一节**——
+    /// 两个右侧栏并排会把中间的文件列表挤没，而它本来就是设置的一个开关。
+    /// 要做的动作写进 `out`，由调用方在画 UI 的闭包之外执行。
+    fn startup_section(&self, ui: &mut egui::Ui, out: &mut StartupAction) {
+        ui.horizontal(|ui| {
+            if ui.button("重新读取").clicked() {
+                out.reload = true;
+            }
+            ui.label(
+                egui::RichText::new("关掉一项会先把它的命令行抄进 HKCU\\Software\\fmnr\\startup-off 再删，所以能开回来。")
+                    .size(12.0)
+                    .weak(),
+            );
+        });
+        if let Some(e) = &self.startup_error {
+            let c = ui.visuals().error_fg_color;
+            ui.colored_label(c, e);
         }
-        // 先取成 owned 值：闭包里要按名字回写 self.startup 之外的字段
-        let inv = self.startup.clone();
-        let err = self.startup_error.clone();
-        let mut toggle: Option<(fmnr_fs::startup::StartupItem, bool)> = None;
-        let mut want_reload = false;
-        let mut open = self.startup_open;
-
-        egui::Window::new("开机自启动")
-            .id(egui::Id::new("startup"))
-            .default_size([620.0, 420.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("重新读取").clicked() {
-                        want_reload = true;
-                    }
-                    ui.label(
-                        egui::RichText::new("关掉一项会先把它的命令行抄进 HKCU\\Software\\fmnr\\startup-off 再删，所以能开回来。")
-                            .size(12.0)
-                            .weak(),
-                    );
-                });
-                if let Some(e) = err {
-                    let c = ui.visuals().error_fg_color;
-                    ui.colored_label(c, e);
-                }
-                let Some(inv) = inv else {
-                    return;
+        let Some(inv) = &self.startup else {
+            return;
+        };
+        for w in &inv.warnings {
+            ui.colored_label(Color32::from_rgb(230, 89, 38), format!("有一处没读到：{w}"));
+        }
+        let mut last: Option<fmnr_fs::startup::Origin> = None;
+        for it in &inv.items {
+            if Some(it.origin) != last {
+                last = Some(it.origin);
+                ui.separator();
+                ui.label(egui::RichText::new(it.origin.label()).strong());
+            }
+            ui.horizontal(|ui| {
+                let name = if it.turned_off_by_us {
+                    format!("（已关）{}", it.name)
+                } else {
+                    it.name.clone()
                 };
-                for w in &inv.warnings {
-                    ui.colored_label(Color32::from_rgb(230, 89, 38), format!("有一处没读到：{w}"));
+                ui.label(name);
+                if it.origin.editable() {
+                    let verb = if it.turned_off_by_us {
+                        "开回来"
+                    } else {
+                        "关掉"
+                    };
+                    if ui.button(verb).clicked() {
+                        out.toggle = Some((it.clone(), it.turned_off_by_us));
+                    }
+                } else if let Some(r) = it.origin.reason() {
+                    ui.weak(r);
                 }
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let mut last: Option<fmnr_fs::startup::Origin> = None;
-                        for it in &inv.items {
-                            if Some(it.origin) != last {
-                                last = Some(it.origin);
-                                ui.separator();
-                                ui.label(egui::RichText::new(it.origin.label()).strong());
-                            }
-                            ui.horizontal(|ui| {
-                                let name = if it.turned_off_by_us {
-                                    format!("（已关）{}", it.name)
-                                } else {
-                                    it.name.clone()
-                                };
-                                ui.label(name);
-                                if it.origin.editable() {
-                                    let verb = if it.turned_off_by_us { "开回来" } else { "关掉" };
-                                    if ui.button(verb).clicked() {
-                                        toggle = Some((it.clone(), it.turned_off_by_us));
-                                    }
-                                } else if let Some(r) = it.origin.reason() {
-                                    ui.weak(r);
-                                }
-                            });
-                            ui.label(
-                                egui::RichText::new(it.command.clone()).size(11.0).weak(),
-                            );
-                        }
-                    });
             });
+            ui.label(egui::RichText::new(it.command.clone()).size(11.0).weak());
+        }
+    }
 
-        self.startup_open = open;
-        if want_reload {
+    /// 执行 [startup_section] 记下的动作。注册表写入一律留在这里，不进画 UI 的闭包。
+    fn apply_startup_action(&mut self, act: StartupAction) {
+        if act.reload {
             self.reload_startup();
         }
-        if let Some((item, was_off)) = toggle {
-            let res = if was_off {
-                fmnr_fs::startup::turn_on(&item)
-            } else {
-                fmnr_fs::startup::turn_off(&item)
-            };
-            match res {
-                Ok(n) => {
-                    self.status = if was_off {
-                        format!("已开回「{}」（{n} 步）", item.name)
-                    } else {
-                        format!("已关掉「{}」，原值存在镜像里（{n} 步）", item.name)
-                    };
-                    self.reload_startup();
-                }
-                Err(e) => {
-                    self.status = format!("调整「{}」失败：{e}", item.name);
-                    self.reload_startup();
-                }
+        let Some((item, was_off)) = act.toggle else {
+            return;
+        };
+        let res = if was_off {
+            fmnr_fs::startup::turn_on(&item)
+        } else {
+            fmnr_fs::startup::turn_off(&item)
+        };
+        match res {
+            Ok(n) => {
+                self.status = if was_off {
+                    format!("已开回「{}」（{n} 步）", item.name)
+                } else {
+                    format!("已关掉「{}」，原值存在镜像里（{n} 步）", item.name)
+                };
+                self.reload_startup();
+            }
+            Err(e) => {
+                self.status = format!("调整「{}」失败：{e}", item.name);
+                self.reload_startup();
             }
         }
     }
@@ -2180,8 +2185,8 @@ impl eframe::App for App {
                 if ui.button("📊 空间").clicked() {
                     self.open_usage();
                 }
-                // 自启动放在顶栏常驻，不藏进设置面板：用户要的是"随时能看到、
-                // 随时能改"，而藏在设置里等于每次都要开一个窗口再翻一层。
+                // 入口留在顶栏常驻（用户要的是"随时能看到、随时能改"），
+                // 但它开的是设置停靠区里的那一节，不再有自己的窗。
                 if ui.button("🚀 自启动").clicked() {
                     self.open_startup();
                 }
@@ -2314,6 +2319,14 @@ impl eframe::App for App {
         if self.view == ViewMode::Panes && !self.search_open {
             self.render_tree(ctx);
         }
+
+        // 停靠区（包管理器 / 设置 / 磁盘占用）：右侧一栏。
+        // 和目录树同一条理由——必须在 CentralPanel 之前声明，否则它不扣宽度，
+        // 而是直接盖在文件列表上。三个都画在这里，但 [open_dock] 保证同一帧
+        // 最多只有一个真的开着。
+        self.render_pkg_panel(ctx);
+        self.render_settings(ctx);
+        self.render_usage(ctx);
 
         // 搜索面板展开时接管中央区（双栏暂时让位，回来时列表状态不变）。
         if self.search_open {
@@ -2574,10 +2587,6 @@ impl App {
         }
 
         self.render_mount_dialog(ctx);
-        self.render_pkg_panel(ctx);
-        self.render_settings(ctx);
-        self.render_usage(ctx);
-        self.render_startup(ctx);
     }
 
     /// 挂载对话框：类型三选一 + 入参 + 结果反馈。
@@ -3524,7 +3533,7 @@ impl App {
             self.navigate(self.active_pane, path);
         }
         if want_pkg {
-            self.pkg.open = true;
+            self.open_dock(Dock::Pkg);
             self.start_pkg_scan();
             // 底账跟着一起读：注册表三棵树实测 ~70 ms，不碰网络，
             // 而栏顶那条「这个目录有新版可升」的弱提示要它才成立。
@@ -4036,6 +4045,42 @@ fn highlight_hit(hit: &crate::search::Hit, style: &egui::Style) -> egui::WidgetT
     );
     job.wrap.max_width = f32::INFINITY;
     egui::WidgetText::from(job)
+}
+
+/// 停靠区的一帧：右侧一栏 + 自己的标题条和关闭按钮。
+///
+/// 和 `egui::Window` 的三点区别就是这轮要的东西：**不能拖、盖不住文件列表
+/// （它从中央区扣宽度，不是浮层）、不会飘到别的 OS 窗口后面**。
+/// 返回 `false` = 用户点了关闭。内容自己管滚动，这里不再套一层 ScrollArea，
+/// 否则内层那个 `auto_shrink([false, false])` 会在无限高里塌掉。
+fn dock<F: FnOnce(&mut egui::Ui)>(
+    ctx: &egui::Context,
+    id: &'static str,
+    title: &str,
+    width: f32,
+    content: F,
+) -> bool {
+    egui::SidePanel::right(id)
+        .resizable(true)
+        .default_width(width)
+        .width_range(300.0..=900.0)
+        .show(ctx, |ui| {
+            let mut keep = true;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(title).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // 用汉字而不是 ✕：实测这个字形在本机的字体栈里没有，
+                    // 按钮会画成一个空方框，看不出它是"关掉"。
+                    if ui.button("关闭").clicked() {
+                        keep = false;
+                    }
+                });
+            });
+            ui.separator();
+            content(ui);
+            keep
+        })
+        .inner
 }
 
 /// 一根占比条。返回 `true` = 用户点它要下钻。
