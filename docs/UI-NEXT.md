@@ -649,3 +649,32 @@ fmnr 不代跑升级。这是这一节最重要的决定。
 **实测**：起窗口 → 树里 `lbx13` 下第一组就是 下载/文档/图片/桌面，
 其后才是字母序的其余目录；点「下载」→ 左栏 `C:\Users\lbx13\Downloads`，
 栏头、面包屑（`C:\ › Users › lbx13 › Downloads`）、状态栏三处一致。
+
+## 14. 「用默认程序打开」接上真系统默认值（P0b）
+
+`spawn_external_open(file, "")` 以前是一条明确的报错（"解析尚未实现"）——
+那之前它回退到 COMSPEC，静默起一个永不退出的 cmd.exe，所以报错本身是对的，
+缺的是解析。现在补在新模块 `fmnr-fs::default_prog`：
+
+1. `HKCU\...\Explorer\FileExts\<ext>\UserChoice` 的 `ProgID`（用户点过"始终"的权威值）
+2. → `HKCU\Software\Classes\<ext>` 默认值 → `HKLM\Software\Classes\<ext>` 默认值
+3. → 拿到 ProgID 后读 `<ProgID>\shell\open\command`（先 HKCU 后 HKLM）
+4. → 命令行拆成「程序 + 参数模板」，摘掉 `%1` 与 `%*`
+
+两条刻意的取向：
+
+- **只读不写**。这个模块不碰任何默认值——写的那部分是 `assoc.rs` 的事，
+  两个文件混在一起容易把"我只查了一下"写成"我改了设置"（DESIGN 第 68 行）。
+- **摘掉 `%1`，而不是替换成文件路径**。这样"默认程序"和"显式指定程序"
+  两条路共用同一套拼接代码（文件由调用方补），也避免文件被传两次；
+  `%*` 同理必须摘，留着等于 spawn 一个等参数的壳。
+- 没有扩展名的点文件（`.gitignore`）走 `*`：Rust 与 Windows 都判它"无扩展名"，
+  这条测试里钉死了，因为写成 `".gitignore"` 也能过大部分场景。
+
+**实测**：本机 `.txt` 解析到
+`C:\Program Files\WindowsApps\Microsoft.WindowsNotepad_.../Notepad/Notepad.exe`
+（UserChoice 里的真值，不是猜的 `notepad.exe`）；
+`fmnr open <file.txt> --external`（不传 `--program`）返回
+`route: external, program: Notepad.exe` 并真的起了进程。
+`live_lookup_on_this_machine_resolves_to_a_real_exe` 这条测试的硬判据是
+"解析出来的程序必须是一个真实存在的绝对路径"，拿不到默认程序时跳过而不是判红。

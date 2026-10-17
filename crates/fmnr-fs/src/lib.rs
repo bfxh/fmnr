@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 pub mod assoc;
 pub mod autostart;
+pub mod default_prog;
 pub mod ops;
 pub mod space;
 pub mod startup;
@@ -235,19 +236,37 @@ impl Volume for LocalVolume {
         if !full.exists() {
             return Err(Error::NotFound(full.display().to_string()));
         }
-        // 空程序 = 调用方希望"用系统默认程序"。默认程序的注册表解析还没做
-        // （见 docs/UI-NEXT.md §2.1 的 P0b），所以这里**明确报错**。
+        // 空程序 = 调用方希望"用系统默认程序"。这一条现在真的去查注册表了
+        // （`default_prog::resolve_for`：UserChoice → HKCU/HKLM 的 Classes 映射
+        // → `shell\open\command`），**只读不写**，不改任何默认值。
         //
-        // 以前这条会回退到 COMSPEC，于是静默起一个永不退出的 cmd.exe：
-        // 文件没打开、角标谎报"已在 cmd.exe 中打开"、还连带把 MCP 测试的
+        // 查不到仍然明确报错，不回退到 COMSPEC。以前那条会静默起一个永不退出的
+        // cmd.exe：文件没打开、角标谎报"已在 cmd.exe 中打开"、还连带把 MCP 测试的
         // 临时目录钉在 %TEMP% 里删不掉。报错比"看起来做了点什么"值钱。
-        if program.trim().is_empty() {
-            return Err(Error::Unsupported(format!(
-                "没有为 {} 配置默认程序，也没指定要用哪个程序。系统默认程序的解析尚未实现；\
-                 请显式传 program，或在实现后重试。",
-                full.display()
-            )));
-        }
+        let owned_program: String = if program.trim().is_empty() {
+            let d = crate::default_prog::resolve_for(&full)?.ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "没找到 {} 的系统默认程序：这台机器上这个扩展名没有可用的默认打开方式\
+                     （非 Windows 平台目前不解析默认程序）。请显式传 program。",
+                    full.display()
+                ))
+            })?;
+            // 程序路径自己带空格时必须先裹引号，否则下面 `split_program`
+            // 会把 `C:\Program Files\x\a.exe` 从中间切断。
+            let prog = if d.program.contains(' ') {
+                format!("\"{}\"", d.program)
+            } else {
+                d.program.clone()
+            };
+            if d.args.is_empty() {
+                prog
+            } else {
+                format!("{prog} {}", d.args)
+            }
+        } else {
+            program.to_string()
+        };
+        let program = owned_program.as_str();
 
         #[cfg(windows)]
         {
@@ -481,7 +500,7 @@ fn split_program(program: &str) -> (String, String) {
 /// 那意味着在「下载目录」里放一个同名 `cmd.exe` 就能被优先执行——典型劫持面。
 /// 这里只认「已是绝对路径且存在」与「PATH 中命中」。
 #[cfg(windows)]
-fn resolve_program(program: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_program(program: &str) -> Option<PathBuf> {
     let p = Path::new(program);
     if p.is_absolute() {
         return p.exists().then(|| p.to_path_buf());
