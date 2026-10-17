@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub mod assoc;
 pub mod autostart;
 pub mod default_prog;
+pub mod drives;
 pub mod dupes;
 pub mod fingerprint;
 pub mod ops;

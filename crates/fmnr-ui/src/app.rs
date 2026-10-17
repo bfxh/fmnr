@@ -129,6 +129,9 @@ pub struct App {
     /// 留着已删的行会把"还在"的假象摆在那儿，所以按这份集合把行剔掉、
     /// 凑不满两个的组整组撤下（剩下那一份不再是重复）。
     dupes_dead: std::collections::HashSet<PathBuf>,
+    /// 这台电脑的盘。启动时枚举一次就够（盘符不会在运行中变，
+    /// 而每帧 `GetLogicalDrives` 是白付的 Win32 调用）。
+    drives: Vec<fmnr_fs::drives::Drive>,
     /// 当前在看哪一层（点占比条会下钻，面包屑回上级）。
     /// 和扫描的 root 是同一个东西：下钻=重起一次以它为根的扫描。
     usage_root: PathBuf,
@@ -258,6 +261,8 @@ struct MountDialog {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MountKind {
+    /// 本地目录/盘。挂在第一个：用户想"换个盘看看"时最先点的就是它。
+    Local,
     Archive,
     Wsl,
     Ssh,
@@ -266,7 +271,7 @@ enum MountKind {
 impl MountDialog {
     fn new() -> Self {
         Self {
-            kind: MountKind::Archive,
+            kind: MountKind::Local,
             input: String::new(),
             // 打开时同步发现（与本应用其它地方一致的同步模型；
             // `wsl -l -q` 实测很快，不值得为它引一套异步管线）。
@@ -278,6 +283,15 @@ impl MountDialog {
     /// 把对话框内容拼成挂载 spec；WSL 优先用发现列表的选中项。
     fn spec(&self) -> Option<MountSpec> {
         match self.kind {
+            MountKind::Local => {
+                let p = self.input.trim();
+                if p.is_empty() {
+                    return None;
+                }
+                Some(MountSpec::Local {
+                    root: PathBuf::from(p),
+                })
+            }
             MountKind::Archive => {
                 let p = self.input.trim();
                 if p.is_empty() {
@@ -385,6 +399,7 @@ impl App {
             dupes_remember: false,
             dupes_sel: Vec::new(),
             dupes_dead: std::collections::HashSet::new(),
+            drives: fmnr_fs::drives::list(),
             usage_root: PathBuf::new(),
             startup_open: false,
             startup: None,
@@ -600,10 +615,18 @@ impl App {
         }
         self.current_volume_id = Some(id);
         let kind = self.current_volume().map(|v| v.kind());
-        // 本地/WSL 卷用 home 当起点（这是用户最常去的地方）；
-        // 归档等虚拟卷没有「home」概念，从卷根开始。
+        // 起点 = **这个卷自己的根**，不是 home。
+        // 原来这里对 Local 卷一律回 `dirs_home()`：在只有"本地↔归档↔WSL"三种卷时
+        // 看不出来（本地卷就是 home 那块盘），但侧栏能点 D:\ 之后，
+        // 点一块盘却把人送到 `C:\Users\…` —— 那正好是这次要修的事本身。
+        // 归档/远程/WSL 卷没有 home 概念，照旧从卷根（空路径）开始。
         let start = match kind {
-            Some(fmnr_core::VolumeKind::Local) => dirs_home(),
+            Some(fmnr_core::VolumeKind::Local) => self
+                .current_volume_id
+                .as_ref()
+                .and_then(|v| local_root_of_volume_id(&v.0))
+                .filter(|p| p.is_dir())
+                .unwrap_or_else(dirs_home),
             _ => PathBuf::new(),
         };
         self.left_path = start.clone();
@@ -2571,11 +2594,42 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    ui.selectable_value(&mut dlg.kind, MountKind::Local, "本地目录");
                     ui.selectable_value(&mut dlg.kind, MountKind::Archive, "归档");
                     ui.selectable_value(&mut dlg.kind, MountKind::Wsl, "WSL");
                     ui.selectable_value(&mut dlg.kind, MountKind::Ssh, "SSH");
                 });
                 match dlg.kind {
+                    MountKind::Local => {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut dlg.input)
+                                .desired_width(320.0)
+                                .hint_text(r"D:\some\dir  或  E:\"),
+                        );
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            submit = true;
+                        }
+                        ui.label("把任意本地目录挂成一个卷（可读写）");
+                        // 盘符按钮：绝大多数情况下用户要的就是"换块盘"，
+                        // 让他手打 `F:\` 是白要一次输入。
+                        let drives = self.drives.clone();
+                        let mut pick: Option<PathBuf> = None;
+                        ui.horizontal_wrapped(|ui| {
+                            for d in drives {
+                                if ui
+                                    .button(format!("{} {}", d.kind.glyph(), d.display()))
+                                    .on_hover_text("挂这块盘并切过去")
+                                    .clicked()
+                                {
+                                    pick = Some(d.root);
+                                }
+                            }
+                        });
+                        if let Some(r) = pick {
+                            dlg.input = r.to_string_lossy().to_string();
+                            submit = true;
+                        }
+                    }
                     MountKind::Archive => {
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut dlg.input)
@@ -2659,6 +2713,12 @@ impl App {
             self.status = "挂载：输入为空".to_string();
             return;
         };
+        self.mount_spec(spec);
+    }
+
+    /// 真正落地一个挂载意图。侧栏的盘按钮和挂载对话框**共用这一条**：
+    /// 两处各写一遍挂载，失败处理就会分叉成"对话框会报错、点盘没反应"。
+    fn mount_spec(&mut self, spec: MountSpec) {
         let display = spec.display();
         let failures = self
             .mount_table
@@ -3332,6 +3392,7 @@ impl App {
         let mut toggle_to: Option<PathBuf> = None;
         let mut open_to: Option<PathBuf> = None;
         let mut want_pkg = false;
+        let mut want_mount_local: Option<PathBuf> = None;
 
         egui::SidePanel::left("tree")
             .default_width(220.0)
@@ -3356,6 +3417,50 @@ impl App {
                         want_pkg = true;
                     }
                 });
+                // ---- 这台电脑 ----
+                // 做成**扁平一节**而不是树里的可展开根：树每层都是拿"当前卷"去列的，
+                // 把别的盘塞进树就得给每个节点配一条"该用哪个卷列它"的规则
+                // （`reset_tree_roots` 的注释就是为了躲开这件事）。
+                // 点一块盘 = 挂它 + 切过去，之后树照旧单根展开——
+                // 这跟 Windows 的"这台电脑"本身也只是一个盘列表是一致的。
+                if !self.drives.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new("这台电脑").strong().size(11.0).weak());
+                    for d in &self.drives {
+                        let cur = self
+                            .current_volume()
+                            .is_some_and(|v| v.kind() == fmnr_core::VolumeKind::Local);
+                        let free = d.space.map(|s| fmt_size(s.free));
+                        let label = format!(
+                            "{} {}{}",
+                            d.kind.glyph(),
+                            d.display(),
+                            match &free {
+                                Some(f) => format!("  剩 {f}"),
+                                None => "  （容量读不到）".to_string(),
+                            }
+                        );
+                        if ui
+                            .add(
+                                egui::Label::new(egui::RichText::new(label).size(12.0))
+                                    .selectable(false)
+                                    // 🔴 `Label` 的默认 Sense 是 **hover**，
+                                    // `.selectable(false)` 只关掉选中文字、不给点击。
+                                    // 少了这一行 `.clicked()` 恒 false ⇒ 整节看着能点、
+                                    // 点了什么都没有（真跑时才发现，单测抓不到）。
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text(if cur {
+                                "挂这块盘并切过去"
+                            } else {
+                                "挂这块盘并切过去（当前在归档/远程卷上，切回来会丢挂载视图）"
+                            })
+                            .clicked()
+                        {
+                            want_mount_local = Some(d.root.clone());
+                        }
+                    }
+                }
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -3425,6 +3530,9 @@ impl App {
             // 而栏顶那条「这个目录有新版可升」的弱提示要它才成立。
             // （`start_ledger_load` 自己挡重复，所以这里可以无脑调。）
             self.start_ledger_load();
+        }
+        if let Some(root) = want_mount_local {
+            self.mount_spec(fmnr_mount::MountSpec::Local { root });
         }
     }
 
@@ -4135,6 +4243,17 @@ fn short_volume_name(id: &str) -> String {
     truncate_label(id, 40)
 }
 
+/// 从卷 id 反推**这个本地卷的根**。`local:D:\` → `Some(D:\)`。
+///
+/// 只认 `local:` 前缀：归档卷的 id 里也带路径（`archive:…\a.zip`），
+/// 但那个路径是**压缩包文件**不是目录，拿它当栏起点会得到一个进不去的路径。
+/// `local:` 后面是空的（相对写法）也不算——回落到 home 比停在空路径上可读。
+fn local_root_of_volume_id(id: &str) -> Option<PathBuf> {
+    id.strip_prefix("local:")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
 /// 排序下拉的当前项文案。`SortOrder` 的 Debug 输出是英文枚举名，
 /// 直接 `format!("{:?}")` 会让按钮上写着 `Modified` 而菜单里写着"修改时间"。
 fn sort_label(order: SortOrder) -> &'static str {
@@ -4496,9 +4615,32 @@ mod mount_dialog_tests {
         }
     }
 
+    /// 切卷时"栏该停在哪儿"的那条解析。
+    /// 点侧栏的 D:\ 却把人送回 home，就是这条解析以前根本不存在（写死 dirs_home）。
+    #[test]
+    fn local_volume_id_yields_its_own_root() {
+        assert_eq!(
+            local_root_of_volume_id(r"local:D:").as_deref(),
+            Some(Path::new(r"D:"))
+        );
+        assert_eq!(
+            local_root_of_volume_id(r"local:E:\proj\x").as_deref(),
+            Some(Path::new(r"E:\proj\x")),
+            "挂的是子目录就该停在子目录，不是它的盘根"
+        );
+        // 归档卷的 id 里那个路径是**文件**，不能当目录起点。
+        assert_eq!(local_root_of_volume_id(r"archive:D:\x\a.zip"), None);
+        assert_eq!(local_root_of_volume_id("wsl:Ubuntu-24.04"), None);
+        assert_eq!(
+            local_root_of_volume_id("local:"),
+            None,
+            "空根要回落到 home，不是停在空路径"
+        );
+    }
+
     #[test]
     fn empty_input_yields_no_spec() {
-        for kind in [MountKind::Archive, MountKind::Ssh] {
+        for kind in [MountKind::Local, MountKind::Archive, MountKind::Ssh] {
             let d = dlg(kind, "   ", None);
             assert!(d.spec().is_none(), "空输入不该拼出 spec（kind={kind:?}）");
         }
@@ -4516,6 +4658,29 @@ mod mount_dialog_tests {
                 path: PathBuf::from("D:/x/y.zip"),
             }),
             "首尾空白必须 trim：路径粘错一个空格就是 NotFound"
+        );
+    }
+
+    /// 侧栏点一块盘和对话框填一条路径，必须拼出**同一个** spec。
+    /// 两处各拼一套的话，就会出现"点盘能挂、手打挂不上"（或反过来）。
+    #[test]
+    fn local_tab_builds_the_same_spec_as_the_drive_buttons() {
+        let d = dlg(MountKind::Local, "  D:\\x  ", None);
+        assert_eq!(
+            d.spec(),
+            Some(MountSpec::Local {
+                root: PathBuf::from("D:\\x"),
+            }),
+            "首尾空白要 trim，且必须是 Local 而不是被当成别的种类"
+        );
+        // 盘根那种"带尾分隔符"的写法原样保留——去掉它就变成盘相对路径。
+        let d2 = dlg(MountKind::Local, "E:\\", None);
+        assert_eq!(
+            d2.spec(),
+            Some(MountSpec::Local {
+                root: PathBuf::from("E:\\"),
+            }),
+            "盘根末尾的分隔符不许被吃掉"
         );
     }
 
