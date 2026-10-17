@@ -1,6 +1,10 @@
 # fmnr — 一个独立的 Rust 文件管理器
 
+> **产品名：终**（发布物/安装名/客户端显示名用「终」）/ 仓库名：`fmnr`
 > file manager in rust
+
+> 命名说明：仓库、crate、二进制、`fmnr://` 协议字面量一律保留 `fmnr`，
+> 全量重命名推迟到发布范围确定后单独做，理由见 [`docs/IS-CONTRIBUTION.md`](docs/IS-CONTRIBUTION.md) §0。
 
 不接管系统、不依赖 Explorer 的文件管理器。三个跟别人不一样的卖点：
 
@@ -72,6 +76,20 @@ MCP：`cargo run -p fmnr-ai` 走 stdio；加 `--serve 127.0.0.1:PORT` 走 HTTP�
 
 ---
 
+## 拿现成的二进制
+
+不想自己编：去 [Releases](../../releases) 下对应平台的 zip
+（`fmnr-<版本>-windows-x86_64.zip` / `fmnr-<版本>-linux-x86_64.zip`），解压即用，
+`SHA256SUMS.txt` 里是校验和。zip 里三个可执行文件加一份 `RUNNING.md`，
+**装完怎么跑、插件放哪、MCP 怎么配**都写在那份里（源文件在
+[`packaging/RUNNING.md`](packaging/RUNNING.md)）。
+
+发版流程：改 `Cargo.toml` 的 `version` → 在 [`CHANGELOG.md`](CHANGELOG.md) 补一节
+`## <那个版本>` → 打 tag `v<那个版本>` 推上去。CI 会核对这三者一致，
+然后编两个平台的 release 产物并建 Release；任何一步对不上就判红而不是发一个错版本。
+
+---
+
 ## 工作区结构
 
 ```
@@ -96,6 +114,9 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
 加密与文件锁、卸载残留、MCP 是不是瓶颈——每条标了一手来源/推断/未找到，
 并写明哪三条我不同意提法本身（§6 尤其）。
 
+[`docs/IS-CONTRIBUTION.md`](docs/IS-CONTRIBUTION.md)：下一次 `is` 提交的完整实施方案——
+增量目录扫描（is-scan）、归档预索引、五个小功能，附待决策项的方案 A/B 与风险清单。
+
 ---
 
 ## 里程碑
@@ -111,6 +132,7 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
 | M6 | 白板布局 + 持久化 + 恢复 | ✅ |
 | M7a | 归档只读卷（zip/tar/tgz）+ WSL UNC 识别 + wslpath | ✅ 内核层**真机实测**；UI 侧见 M8 |
 | M7b | SSH/SFTP 卷 | ⚠️ 只有接口与纯逻辑测试，**未连过真实主机** |
+| M9 | `is`：增量扫描 + 归档预索引 + 小功能合集 | 📋 **方案已定稿未实现**：[`docs/IS-CONTRIBUTION.md`](docs/IS-CONTRIBUTION.md) |
 | M8 | 卷注册表 + 挂载入口（让用户真的能打开 zip / 切到 WSL / 连 SSH） | ⚠️ 入口在 UI 里；**挂 zip 实测通过**（对话框填路径→挂上→两栏列出包内内容）；**挂 WSL 实测通过**（WSL 页发现到 `Ubuntu-24.04`（来自 `wsl -l -q`）→ 挂上 → 顶栏变 `wsl:Ubuntu-24.04`、两栏与目录树都列出该发行版的根）；**SSH 那条没实测**（本机没有可连的真实主机） |
 | 拖拽 | 应用内两栏拖放搬运（含原地/自嵌套预检、Ctrl=复制） | ✅ 四条落地路径 computer-use 点过并 `ls` 对账；**Ctrl+drag 未点验**（自动化按不住修饰键） |
 | 包更新 | 「包管理器」面板：可升级（winget）+ 已装清单（注册表底账）+ 详情 + 拖入快捷方式认应用；**浏览到某程序的目录时栏顶给一行弱提示** | ✅ 本机真跑：可升级 11 项、底账 273 条（与独立计数一致）、详情/过滤/复制命令点过；打开面板就同时装载两份数据；**不代跑升级**（提示里也只复制 `winget upgrade --id …`）。目录归属判定层拿真注册表自洽跑过（67/67 认出自己、放弃 0 条），**但那一行提示的渲染没在真窗口看到过**，见下面「已知边界」。GitHub 上游只认出仓名，联网查询未接 |

@@ -1,0 +1,222 @@
+# 发布流水线：**只在打 tag 时跑**，产物挂到 GitHub Release。
+#
+# 和 CI 一样，这里每一步都要能判红。特意钉住的几条结论：
+#   1. tag 必须等于 Cargo.toml 里的 version —— 否则发出去的二进制自带错版本号；
+#   2. 三个可执行文件都得在、都得够大 —— 空壳/stub 不能算过；
+#   3. `fmnr --version` 报的版本必须含 tag 的版本 —— 这是行为尺，不是"文件存在"尺；
+#   4. CHANGELOG 里必须有这一版的段落 —— 没说明的发布算缺陷；
+#   5. release 建完后**回读**附件清单逐项比对 —— `gh` 返回 0 不等于附件真挂上了。
+#
+# 打包统一在 ubuntu 上做（`zip`/`sha256sum` 两边口径一致），
+# 各平台的二进制由 build job 编好后作为 artifact 传过来。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+# 发布**不**自我取消：跑到一半被新 tag 掐掉，会留下"有 tag、有半截 release"的脏状态。
+# CI 那边用 cancel-in-progress 是对的（旧提交的结论没价值），这里不对。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Linux system deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev \
+            libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libwayland-dev wayland-protocols pkg-config
+
+      # 门禁 1：tag 与 workspace 版本必须一致。
+      # 不一致时的错法很具体：v0.2.0 的 tag 发出 0.1.0 的 exe，
+      # 而 `fmnr --version` 会老实报 0.1.0 —— 用户看到的是"这个 release 在骗人"。
+      - name: 钉住 tag == Cargo.toml 的 version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CUR="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$TAG" != "$CUR" ]; then
+            echo "::error::tag 是 v$TAG，但 Cargo.toml 里写的是 $CUR。先提交版本号再来打 tag。"
+            exit 1
+          fi
+          echo "要发布的版本：$TAG"
+
+      - name: Build (release)
+        run: cargo build --workspace --locked --release
+
+      - name: Build the wasm plugin
+        run: cargo build --release --manifest-path plugins/md-outline/Cargo.toml --target wasm32-unknown-unknown --locked
+
+      # 门禁 2+3：产物存在、体积不像空壳，并且**跑一下**看版本对不对。
+      # 只查"文件在"是不够的：链接到一个错的 stub 也能产出同名文件。
+      - name: 验产物存在且 --version 对得上
+        shell: bash
+        run: |
+          set -u
+          V="${GITHUB_REF_NAME#v}"
+          EXT=""
+          [ "$RUNNER_OS" = "Windows" ] && EXT=".exe"
+          fail=0
+          for b in fmnr-ui fmnr fmnr-ai; do
+            p="target/release/$b$EXT"
+            if [ ! -f "$p" ]; then
+              echo "::error::缺产物 $p"
+              fail=1
+              continue
+            fi
+            sz=$(wc -c < "$p")
+            # 1 MB 以下不可能是这三个之一（实测 release 的 fmnr-ui 约 13 MB）。
+            if [ "$sz" -lt 1000000 ]; then
+              echo "::error::$p 只有 $sz 字节，不像真产物"
+              fail=1
+            fi
+          done
+          [ "$fail" = 0 ] || exit 1
+          out=$("./target/release/fmnr$EXT" --version)
+          case "$out" in
+            *"$V"*) echo "fmnr --version 与 tag 一致：$out" ;;
+            *)
+              echo "::error::fmnr --version 报「$out」，里面没有 tag 的版本 $V"
+              exit 1
+              ;;
+          esac
+
+      - name: 组装待上传的产物
+        shell: bash
+        run: |
+          set -eu
+          EXT=""
+          [ "$RUNNER_OS" = "Windows" ] && EXT=".exe"
+          mkdir -p out out/plugins/md-outline
+          cp "target/release/fmnr-ui$EXT"   out/
+          cp "target/release/fmnr$EXT"      out/
+          cp "target/release/fmnr-ai$EXT"   out/
+          cp plugins/md-outline/md-outline.wasm out/plugins/md-outline/
+          cp plugins/md-outline/plugin.json     out/plugins/md-outline/
+          # 随包说明：装在哪、插件放哪、怎么起 MCP。文案在仓库里可评审，不埋在 YAML 里。
+          cp packaging/RUNNING.md out/RUNNING.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bins-${{ matrix.os }}
+          path: out/
+          if-no-files-found: error
+
+  publish:
+    name: package and publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bins-*
+          path: staged
+
+      # 门禁 4：CHANGELOG 必须有这一版的段落。
+      # 少了它，release 页面就只剩一串文件名，没人知道这版能干什么、坑在哪。
+      - name: 取本版的发布说明
+        shell: bash
+        run: |
+          set -eu
+          V="${GITHUB_REF_NAME#v}"
+          awk -v want="$V" '
+            /^## / {
+              line=$0; sub(/^## /, "", line); sub(/[[:space:]].*$/, "", line)
+              keep = (line == want)
+              if (keep) { hit=1 }
+            }
+            keep { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md 里找不到「## $V」这一段的说明。先写变更再来发布。"
+            exit 1
+          fi
+          echo "本版说明 $({ wc -l < notes.md; }) 行"
+
+      - name: 打 zip 与校验和
+        shell: bash
+        run: |
+          set -eu
+          V="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          # 平台名 → zip 名。两个都要有，少一个就是 build job 挂了却没被拦住。
+          for pair in "windows-latest:windows-x86_64" "ubuntu-latest:linux-x86_64"; do
+            src="${pair%%:*}"; dst="${pair##*:}"
+            d="staged/bins-$src"
+            # 两个 if 分开写：`A || B && C` 在 bash 里是 `((A||B)&&C)`，
+            # 混成一条会把"目录不存在"判成"检查通过"。
+            if [ ! -d "$d" ]; then
+              echo "::error::$src 的产物目录不在（$d）"
+              exit 1
+            fi
+            if [ ! -f "$d/fmnr-ui" ] && [ ! -f "$d/fmnr-ui.exe" ]; then
+              echo "::error::$src 的产物里没有 fmnr-ui"
+              exit 1
+            fi
+            (cd "$d" && zip -qr "$GITHUB_WORKSPACE/dist/fmnr-$V-$dst.zip" .)
+          done
+          (cd dist && sha256sum ./*.zip > SHA256SUMS.txt)
+          ls -l dist
+          cat dist/SHA256SUMS.txt
+
+      - name: 建 release 并挂附件
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.zip dist/SHA256SUMS.txt \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            || { echo "::error::gh release create 失败"; exit 1; }
+
+      # 门禁 5：回读附件清单逐项比对。
+      # "命令返回 0" 不是证据——上传半途失败、名字打错、zip 是 0 字节，
+      # 都可能照样返回 0 或者根本没人看。这里按**期望清单**核对，缺一项就红。
+      - name: 复核 release 上的附件真的挂上了
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          V="${GITHUB_REF_NAME#v}"
+          want=$(printf '%s\n' \
+            "fmnr-$V-windows-x86_64.zip" \
+            "fmnr-$V-linux-x86_64.zip" \
+            "SHA256SUMS.txt" | sort)
+          got=$(gh release view "$GITHUB_REF_NAME" --json assets -q '.assets[].name' | sort)
+          if [ "$want" != "$got" ]; then
+            echo "::error::附件清单对不上。期望：$(echo "$want" | tr '\n' ' ') 实得：$(echo "$got" | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "附件齐：$got"
+          # 顺手把下载量级打出来：0 字节的附件挂在上面比不挂更糟。
+          gh release view "$GITHUB_REF_NAME" --json assets \
+            -q '.assets[] | "\(.name)  \(.size) bytes  \(.downloadCount)"'
