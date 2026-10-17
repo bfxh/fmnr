@@ -273,3 +273,107 @@ fn cat_reports_truncation_from_cli() {
     assert_eq!(p["bytes"], serde_json::json!(50));
     assert_eq!(p["truncated"], serde_json::json!(true), "必须报截断：{p}");
 }
+
+/// 跑 `fmnr batch`：喂 stdin，拿回 (stdout 逐行解析, 退出码)。
+fn run_batch(cwd: &Path, input: &str) -> (Vec<serde_json::Value>, Option<i32>, String) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fmnr"))
+        .arg("batch")
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("启动 fmnr batch");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("写 stdin");
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("等 fmnr batch");
+    let stdout = String::from_utf8(out.stdout).expect("stdout 必须是 UTF-8");
+    let lines = stdout
+        .lines()
+        .map(|l| {
+            serde_json::from_str(l).unwrap_or_else(|e| panic!("批量输出不是 NDJSON（{e}）：{l}"))
+        })
+        .collect();
+    (
+        lines,
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// 批量模式的两条主张：**一次进程跑完多条**，以及**一行失败不拖垮整批**。
+/// 后者是这里真正要钉的那条——如果实现改成"遇错就 exit"，
+/// 客户端拿到的是半截流而没有解释。
+#[test]
+fn batch_runs_every_line_and_isolates_the_bad_ones() {
+    let fx = Fixture::new("batch");
+    let input = [
+        r#"{"tool":"create_dir","args":{"path":"out"}}"#,
+        r#"{"tool":"write_file","args":{"path":"out/n.txt","text":"hi"}}"#,
+        r#"{"tool":"no_such_tool"}"#,
+        r#"{ 这行不是合法 JSON"#,
+        r#"{"tool":"stat","args":{"path":"out/n.txt"}}"#,
+    ]
+    .join("\n");
+    let (lines, code, stderr) = run_batch(&fx.0, &input);
+    assert_eq!(
+        lines.len(),
+        5,
+        "每条请求该回一行，实得 {lines:?}\nstderr: {stderr}"
+    );
+    let nums: Vec<u64> = lines.iter().map(|v| v["line"].as_u64().unwrap()).collect();
+    assert_eq!(nums, vec![1, 2, 3, 4, 5], "行号要逐条对上");
+    assert_eq!(lines[0]["ok"], serde_json::json!(true));
+    assert_eq!(lines[1]["ok"], serde_json::json!(true));
+    assert_eq!(
+        lines[2]["ok"],
+        serde_json::json!(false),
+        "未知工具必须这一行自己报错"
+    );
+    assert_eq!(lines[2]["error"]["code"], serde_json::json!(-32601));
+    assert_eq!(
+        lines[3]["ok"],
+        serde_json::json!(false),
+        "坏 JSON 也只该杀它自己那一行"
+    );
+    assert_eq!(
+        lines[4]["ok"],
+        serde_json::json!(true),
+        "坏行之后必须继续跑"
+    );
+    assert_eq!(lines[4]["result"]["size"], serde_json::json!(2));
+    assert_eq!(code, Some(1), "有任何一行失败就要非零退出");
+    // 真落盘：批量不是"只回个 JSON 就算数"
+    assert_eq!(
+        std::fs::read_to_string(fx.0.join("out/n.txt")).unwrap(),
+        "hi",
+        "批量里的 write_file 必须真的写进磁盘"
+    );
+}
+
+/// 空行是分隔符：不是一条请求，**也不回一行**。
+/// 所以返回体必须自带 `line`——消费方靠它对，而不是靠"第 N 个输出对第 N 个输入"。
+#[test]
+fn batch_blank_lines_do_not_shift_the_line_numbers() {
+    let fx = Fixture::new("batchblank");
+    let input = format!(
+        "{}\n\n{}\n",
+        r#"{"tool":"list_volume"}"#, r#"{"tool":"list_volume"}"#
+    );
+    let (lines, code, _) = run_batch(&fx.0, &input);
+    assert_eq!(lines.len(), 2, "空行不该产出输出行");
+    let nums: Vec<u64> = lines.iter().map(|v| v["line"].as_u64().unwrap()).collect();
+    assert_eq!(nums, vec![1, 3], "行号要对齐输入的物理行号：{lines:?}");
+    assert_eq!(code, Some(0), "全成都该零退出");
+    // 批量里的 list_volume 必须和 `fmnr volumes` 给同一份卷表
+    let via_batch = lines[0]["result"]["volumes"].clone();
+    let via_sub = run_json(&fx.0, &["volumes"])["volumes"].clone();
+    assert_eq!(via_batch, via_sub, "两条路径的卷表分叉了");
+}

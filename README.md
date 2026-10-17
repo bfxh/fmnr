@@ -27,7 +27,7 @@
 |---|---|
 | MCP stdio | 给 Claude / Cursor 之类的 AI 客户端调 `list_dir` / `search` / `open` / `copy` |
 | HTTP (axum) | 本机 HTTP API，默认只允许回环地址 |
-| CLI | `fmnr ls/search/cp/volumes/register`，人也能直接敲 |
+| CLI | `fmnr ls/search/cp/stat/apps/volumes/register`，人也能直接敲；`fmnr batch` 吃 NDJSON 一次跑完一批 |
 | `fmnr://` 协议 | 从浏览器/别的软件点回来，注册在 HKCU 下且可完整回滚 |
 
 ### 4. 白板（Board）
@@ -58,7 +58,13 @@ CLI 试一下：
 ```sh
 cargo run -p fmnr-cli -- ls .
 cargo run -p fmnr-cli -- search --root . --query rs
+cargo run -p fmnr-cli -- stat .\Cargo.toml      # 属性：类型/大小/时间/隐藏·系统·只读
+cargo run -p fmnr-cli -- apps --limit 5         # 已装程序底账（只列，不含卸载命令行）
 cargo run -p fmnr-cli -- volumes
+# 一批命令共享一次挂载扫描：一行一条请求，一行一条结果
+printf '%s\n' '{"tool":"create_dir","args":{"path":"out"}}' \
+              '{"tool":"write_file","args":{"path":"out/a.txt","text":"hi"}}' \
+  | cargo run -p fmnr-cli -- batch
 cargo run -p fmnr-cli -- register --dry-run   # 先看计划，不写注册表
 ```
 
@@ -110,6 +116,7 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
 | 包更新 | 「包管理器」面板：可升级（winget）+ 已装清单（注册表底账）+ 详情 + 拖入快捷方式认应用 | ✅ 本机真跑：可升级 11 项、底账 273 条（与独立 PowerShell 计数一致）、详情/过滤/复制命令点过；**不代跑升级**；GitHub 上游只认出仓名，联网查询未接 |
 | 设置 | 顶栏「⚙ 设置」：开机自启动开关（HKCU `Run\fmnr`，可逆）、显示隐藏项、本机卷/插件计数 | ✅ 真机往返点过：开→注册表多出 1 个值、关→回到原样且**别人的 9 个自启动项一个没动** |
 | 三入口一致 | 内核能力上表：`read_file` / `write_file` / `rename` / `create_dir` / `stat` / `packages`（CLI 对应 `cat` / `put` / `rename` / `mkdir` / `stat` / `apps`） | ✅ `entry_parity.rs` 三条腿（MCP 真子进程 / HTTP 真套接字 / CLI 真二进制）逐步比对返回 JSON **整份相等**；反证打过（CLI 腿偷加 `--max-bytes 3` 立刻判红；把 CLI 的 `stat` 改指 `ls` 也立刻判红）；`stat` 真跑：只读+隐藏文件回 `["ReadOnly","Hidden"]`、普通文件回 `[]`；`apps` 真跑：本机 273 条底账、**不回显卸载命令行**；**§6.2「MCP/HTTP 接多卷」未做**，见 `docs/NEXT-BATCH.md` §11 |
+| 批量入口 | `fmnr batch`：stdin 一行一条 `{"tool":…,"args":…}`，stdout 一行一条结果，**共享一次挂载扫描** | ✅ 本机量过：20 条命令 0.813 s → 一次 batch 0.045 s（**18.2 倍**）；一行失败不中断整批（改成遇错就退，测试拿到 3 行而不是 5 行）；返回体带 `line` 对齐输入物理行号，空行不回话 |
 | 默认程序 | 「用默认程序打开」解析系统真值（UserChoice → Classes → shell\open\command），只读不写 | ✅ 本机 `.txt` 解析到 WindowsApps 里的 Notepad 真路径并成功起进程；`fmnr open --external` 不传 program 即走这条 |
 | 重复文件 | 阶梯筛选 + **字节比对才算判定**；「磁盘占用」面板里扫、勾、**只删副本（进回收站）** | ✅ 真跑：`a/b/c.bin` 同内容扫成一组、默认留第一个、取消某项后按钮计数跟着变、删完清单重算且**保住用户其余的勾**；`b.bin` 在回收站里查到（删前 0 项）；9 条测试含"喂恒等碰撞哈希也不许把不等内容成组"；四元组指纹缓存，"不记住"是真开关（ephemeral 连落盘都拒绝） |
 | 多卷寻址 | MCP/HTTP 每次调用按参数选卷（与 CLI 共用 `fmnr-core` 那一份规则），空表明确报错而不是列空 | ✅ 探针卷测试钉住"选错卷立刻显形"（第一版用两个本地卷的测试把路由摘掉照样过，已作废重写）；**独立 MCP 进程仍挂不了 zip**，那是依赖决定 |

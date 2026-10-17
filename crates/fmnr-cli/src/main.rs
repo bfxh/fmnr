@@ -9,6 +9,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use fmnr_ai::tools;
 use fmnr_core::volreg::VolumeRegistry;
+use fmnr_core::Volume;
 use fmnr_fs::LocalVolume;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -162,6 +163,10 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// 批量：stdin 一行一条 `{"tool":"…","args":{…}}`，stdout 一行一条结果（NDJSON）。
+    /// 给脚本和 AI 客户端用——共享**一次**挂载扫描，不必每条命令重开一个进程。
+    Batch,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -186,8 +191,15 @@ enum ConflictArg {
 /// 它们碰的是系统边界，不该被远程客户端经由 MCP/HTTP 触发。
 enum Action {
     Tool(&'static str, Value),
-    Register { exe: Option<String>, dry_run: bool },
-    Unregister { dry_run: bool },
+    Register {
+        exe: Option<String>,
+        dry_run: bool,
+    },
+    Unregister {
+        dry_run: bool,
+    },
+    /// 批量：工具名从 stdin 里读，不在子命令表里写死。
+    Batch,
 }
 
 impl Cmd {
@@ -262,6 +274,7 @@ impl Cmd {
                 dry_run: *dry_run,
             },
             Cmd::Unregister { dry_run } => Action::Unregister { dry_run: *dry_run },
+            Cmd::Batch => Action::Batch,
         }
     }
 }
@@ -297,8 +310,31 @@ fn main() {
     match cli.cmd.to_action() {
         Action::Register { exe, dry_run } => run_register(exe, dry_run),
         Action::Unregister { dry_run } => run_unregister(dry_run),
+        Action::Batch => run_batch(),
         Action::Tool(tool, args) => run_tool(tool, args),
     }
+}
+
+/// 挂载表 → `list_volume` 的返回体。
+///
+/// 单独抽出来是因为**两条路径都要它**：`fmnr volumes` 和 `fmnr batch` 里的一行。
+/// 各写一份就会分叉成"batch 里的 list_volume 只报默认卷"——那正是这张表
+/// 一路在避免的事。
+fn volumes_payload(registry: &VolumeRegistry) -> Value {
+    let items: Vec<Value> = registry
+        .list()
+        .iter()
+        .map(|v| {
+            json!({
+                "id": v.id.0,
+                "kind": format!("{:?}", v.kind),
+                "writable": v.writable,
+                "name": v.name,
+                "note": v.note,
+            })
+        })
+        .collect();
+    json!({ "volumes": items })
 }
 
 /// 注册：只写 HKCU。默认拿当前进程自身当目标程序。
@@ -385,66 +421,75 @@ fn plan_to_json(plan: &fmnr_fs::assoc::RegistrationPlan) -> Value {
     })
 }
 
-fn run_tool(tool: &'static str, args: Value) {
-    let (registry, mount_failures) = build_volume_registry();
+/// 一次进程生命周期里要复用的三件套：挂载表、默认卷、异步运行时。
+///
+/// 抽出来给 `run_tool` 和 `run_batch` 共用，理由就是批量模式存在的理由：
+/// **挂载表只扫一次**。原来每条命令都要重开进程 + 重扫一遍挂载。
+struct Ctx {
+    registry: VolumeRegistry,
+    default_volume: Arc<dyn Volume>,
+    rt: tokio::runtime::Runtime,
+}
 
-    // 挂载失败只进 stderr：stdout 是外部客户端消费的纯 JSON，混入诊断
-    // 文本会直接把 MCP 契约打碎——但不显示就等于吞错，所以分流不丢弃。
-    for f in &mount_failures {
-        eprintln!("fmnr: 挂载失败：{f}");
+impl Ctx {
+    fn open() -> Self {
+        let (registry, mount_failures) = build_volume_registry();
+
+        // 挂载失败只进 stderr：stdout 是外部客户端消费的纯 JSON，混入诊断
+        // 文本会直接把契约打碎——但不显示就等于吞错，所以分流不丢弃。
+        for f in &mount_failures {
+            eprintln!("fmnr: 挂载失败：{f}");
+        }
+
+        // 默认卷 = 注册表第一个。**不硬编码 id**：LocalVolume::new(cwd) 自生的
+        // id 是 local:<cwd 绝对路径>，写 local:. 永远查不到（与 UI 侧同款的坑），
+        // 只能靠兜底新建卷，注册表就白建了。
+        let default_volume = registry
+            .list()
+            .first()
+            .and_then(|v| registry.get(&v.id))
+            .unwrap_or_else(|| {
+                Arc::new(LocalVolume::new(
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                ))
+            });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|e| {
+                eprintln!("fmnr: 无法启动运行时：{e}");
+                std::process::exit(1);
+            });
+
+        Ctx {
+            registry,
+            default_volume,
+            rt,
+        }
     }
 
-    // 默认卷 = 注册表第一个。**不硬编码 id**：LocalVolume::new(cwd) 自生的
-    // id 是 local:<cwd 绝对路径>，写 local:. 永远查不到（与 UI 侧同款的坑），
-    // 只能靠兜底新建卷，注册表就白建了。
-    let default_volume = registry
-        .list()
-        .first()
-        .and_then(|v| registry.get(&v.id))
-        .unwrap_or_else(|| {
-            Arc::new(LocalVolume::new(
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-            ))
-        });
+    /// 卷路由：路径带 `archive:`/`wsl:` 等前缀时切到对应卷，否则用默认卷。
+    fn volume_for(&self, args: &Value) -> Arc<dyn Volume> {
+        self.registry
+            .route_for_args(args)
+            .unwrap_or_else(|| self.default_volume.clone())
+    }
+}
 
-    let volume = match tool {
-        // `list_volume` 列出注册表里的每一个卷。
-        "list_volume" => {
-            let items: Vec<Value> = registry
-                .list()
-                .iter()
-                .map(|v| {
-                    json!({
-                        "id": v.id.0,
-                        "kind": format!("{:?}", v.kind),
-                        "writable": v.writable,
-                        "name": v.name,
-                        "note": v.note,
-                    })
-                })
-                .collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({ "volumes": items })).unwrap()
-            );
-            return;
-        }
-        // 卷路由：路径带 archive:/wsl: 等前缀时切到对应卷，否则用默认卷。
-        _ => registry.route_for_args(&args).unwrap_or(default_volume),
-    };
+fn run_tool(tool: &'static str, args: Value) {
+    let ctx = Ctx::open();
+    if tool == "list_volume" {
+        // 列出注册表里的**每一个**卷，而不是分发表里那个只报默认卷的臂。
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&volumes_payload(&ctx.registry)).unwrap()
+        );
+        return;
+    }
+    let volume = ctx.volume_for(&args);
 
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("fmnr: 无法启动运行时：{e}");
-            std::process::exit(1);
-        }
-    };
-
-    match rt.block_on(tools::dispatch_payload(volume, tool, args)) {
+    match ctx.rt.block_on(tools::dispatch_payload(volume, tool, args)) {
         Ok(payload) => {
             println!(
                 "{}",
@@ -456,6 +501,93 @@ fn run_tool(tool: &'static str, args: Value) {
             eprintln!("fmnr: {} ({})", e.message, e.code);
             std::process::exit(1);
         }
+    }
+}
+
+/// 批量模式：stdin 一行一条 `{"tool":"…","args":{…}}`，stdout 一行一条结果。
+///
+/// 三条入口里 CLI 的摩擦最大：一条命令 = 一次进程 spawn + 一次重扫挂载，
+/// 二十次就是二十次。这里挂载表只扫一次（`Ctx::open`），循环里只剩分派本身。
+///
+/// 三个刻意的形状：
+/// - **输出是紧凑 NDJSON，不 pretty**：一行一条才叫流，缩进只会让 `| jq -c` 白跑。
+/// - **一行失败不中断整批**：第 7 行拼错工具名，前 6 行和后 13 行的结果照样要给出去。
+///   每条返回带 `line`，所以"空行不回话"也不会让消费方错位。
+/// - **退出码：全成 0，有任何一行失败 1**，汇总计数走 stderr（不污染 stdout）。
+fn run_batch() {
+    use std::io::{BufRead, Write};
+    let ctx = Ctx::open();
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut handled = 0usize;
+    let mut failed = 0usize;
+
+    let mut emit = |v: Value| {
+        if let Err(e) = writeln!(out, "{v}") {
+            eprintln!("fmnr: 写 stdout 失败：{e}");
+            std::process::exit(1);
+        }
+    };
+
+    for (i, raw) in stdin.lock().lines().enumerate() {
+        let line_no = i + 1;
+        let line = match raw {
+            Ok(l) => l,
+            Err(e) => {
+                failed += 1;
+                emit(json!({"line": line_no, "ok": false,
+                            "error": {"message": format!("读 stdin 第 {line_no} 行失败：{e}")}}));
+                continue;
+            }
+        };
+        // 空行是分隔符，不是一条请求，也不回一行。
+        if line.trim().is_empty() {
+            continue;
+        }
+        handled += 1;
+        let req: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                failed += 1;
+                emit(json!({"line": line_no, "ok": false,
+                            "error": {"message": format!("第 {line_no} 行不是合法 JSON：{e}")}}));
+                continue;
+            }
+        };
+        let Some(tool) = req.get("tool").and_then(|t| t.as_str()) else {
+            failed += 1;
+            emit(json!({"line": line_no, "ok": false,
+                        "error": {"message": format!(
+                            "第 {line_no} 行缺 tool 字段（形状是 {{\"tool\":\"…\",\"args\":{{…}}}}）")}}));
+            continue;
+        };
+        // `args` 省略、或显式给 null，都当"这个工具不收参数"。
+        let args = match req.get("args") {
+            Some(v) if !v.is_null() => v.clone(),
+            _ => json!({}),
+        };
+        // `list_volume` 走的是挂载表而不是分发表：分发表那一臂只知道被选中的
+        // 那个卷，批量里如果直接喂给它，同一条命令在两种模式下会给出不同答案。
+        let result = if tool == "list_volume" {
+            Ok(volumes_payload(&ctx.registry))
+        } else {
+            let volume = ctx.volume_for(&args);
+            ctx.rt.block_on(tools::dispatch_payload(volume, tool, args))
+        };
+        match result {
+            Ok(payload) => emit(json!({"line": line_no, "ok": true, "result": payload})),
+            Err(e) => {
+                failed += 1;
+                emit(json!({"line": line_no, "ok": false,
+                            "error": {"code": e.code, "message": e.message}}));
+            }
+        }
+    }
+
+    eprintln!("fmnr: 批量处理 {handled} 条，失败 {failed} 条");
+    if failed > 0 {
+        std::process::exit(1);
     }
 }
 
@@ -618,15 +750,18 @@ mod tests {
             let (tool, _) = call(c);
             assert!(names.contains(&tool), "CLI 指向了未注册的工具：{tool}");
         }
-        // 名单要盖住 clap 声明的**全部**子命令。register/unregister 不走工具表
-        // （那是系统边界，见 `registration_is_local_only_not_a_tool_call`），所以减 2。
+        // 名单要盖住 clap 声明的**全部**子命令。三个不走工具表的豁免项：
+        // `register`/`unregister`（系统边界，见
+        // `registration_is_local_only_not_a_tool_call`）与 `batch`
+        // （工具名从 stdin 读，不在这里写死）。
+        const NOT_A_TOOL_CALL: usize = 3;
         let declared = Cli::command().get_subcommands().count();
         assert_eq!(
             declared,
-            listed + 2,
-            "clap 声明了 {declared} 个子命令（去掉 register/unregister 该是 {} 个），\
+            listed + NOT_A_TOOL_CALL,
+            "clap 声明了 {declared} 个子命令（去掉 {NOT_A_TOOL_CALL} 个非工具调用该是 {} 个），\
              但这份名单只有 {listed} 项——新增了变体没往名单里加",
-            declared - 2
+            declared - NOT_A_TOOL_CALL
         );
     }
 
