@@ -132,6 +132,9 @@ zip 根甚至是空串 ⇒ `WalkDir::new("")` 遍历的是**进程当前目录**
 
 ## 3. 磁盘占用视图：disktree 的核心逻辑怎么进来
 
+> **落地方案**：本节研究的"磁盘占用实时增量"（增量扫描 + 缓存未命中自动刷新 + 不阻塞 UI + 可取消）
+> 已收进 [`IS-CONTRIBUTION.md`](IS-CONTRIBUTION.md) §5.2，与 is-scan 共用一套缓存键。
+
 ### 3.1 先把对象搞对（我踩的坑，写下来免得再踩）
 
 `tobi/disktree` 是 **Rust + GPUI 的 treemap 磁盘占用浏览器**：
