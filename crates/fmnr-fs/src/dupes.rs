@@ -49,7 +49,18 @@ pub struct DupReport {
     pub skipped: Vec<Skipped>,
     /// 参与比对的候选文件数（进了大小分组的那批）
     pub candidates: usize,
+    /// 被调用方中途取消。取消点落在"某一组还在算哈希"的时候，
+    /// 所以 `groups` 只包含**取消前已经整组确认完**的那些（可能是空）。
+    /// 界面必须把 `aborted` 说出来，否则半份清单会被读成
+    /// "这棵树里就这些重复"——那是最坏的一种安静。
+    pub aborted: bool,
 }
+
+/// 扫描进度回调。参数是"已经处理过的文件数"，返回 `false` 表示请中止。
+///
+/// 为什么回调而不是 `AtomicBool` + 单独计数：调用方（UI）要的既是"能取消"
+/// 又是"知道走到哪了"，一次调用同时给这两件事，省一个共享状态。
+pub type Progress<'a> = Option<&'a mut dyn FnMut(u64) -> bool>;
 
 /// 默认的哈希实现：SHA-256。
 pub fn sha256_of(bytes: &[u8]) -> [u8; 32] {
@@ -65,7 +76,7 @@ pub fn sha256_of(bytes: &[u8]) -> [u8; 32] {
 /// 就得能喂一个故意全碰撞的哈希（比如恒返回同一个值），此时正确的实现
 /// 仍然只把**字节真相等**的文件成组。写死 sha256 的话，那条断言压根写不出来。
 pub fn find_duplicates(paths: &[PathBuf], hash: impl Fn(&[u8]) -> [u8; 32]) -> DupReport {
-    find_duplicates_cached(paths, hash, None)
+    find_duplicates_cached(paths, hash, None, None)
 }
 
 /// 同上，但可以带一个按四元组缓存全文件哈希的 [`HashCache`](crate::fingerprint::HashCache)。
@@ -75,8 +86,10 @@ pub fn find_duplicates_cached(
     paths: &[PathBuf],
     hash: impl Fn(&[u8]) -> [u8; 32],
     mut cache: Option<&mut crate::fingerprint::HashCache>,
+    mut progress: Progress<'_>,
 ) -> DupReport {
     let mut report = DupReport::default();
+    let mut seen: u64 = 0;
 
     // 第 1 级：按大小分组。大小不同的文件不可能字节相等，这一刀最便宜。
     let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
@@ -157,6 +170,13 @@ pub fn find_duplicates_cached(
                             _ => hash(&bytes),
                         };
                         by_full.entry(h).or_default().push(p.clone());
+                        seen += 1;
+                        if let Some(cb) = progress.as_mut() {
+                            if !cb(seen) {
+                                report.aborted = true;
+                                return report;
+                            }
+                        }
                     }
                     Err(e) => report.skipped.push(Skipped {
                         path: p.clone(),
@@ -354,7 +374,7 @@ mod tests {
             calls.set(calls.get() + 1);
             sha256_of(bytes)
         };
-        let r1 = find_duplicates_cached(&[a.clone(), b.clone()], counting, Some(&mut c));
+        let r1 = find_duplicates_cached(&[a.clone(), b.clone()], counting, Some(&mut c), None);
         let after_first = calls.get();
         assert!(after_first > 0, "第一次扫描必须真算过哈希");
         let (hits1, misses1) = c.stats();
@@ -362,7 +382,7 @@ mod tests {
         assert_eq!((hits1, misses1), (0, 4), "第一次应当全是 miss");
 
         calls.set(0);
-        let r2 = find_duplicates_cached(&[a, b], counting, Some(&mut c));
+        let r2 = find_duplicates_cached(&[a, b], counting, Some(&mut c), None);
         assert_eq!(calls.get(), 0, "全命中时一次哈希都不该再算");
         assert_eq!(c.stats(), (4, 4), "第二次应当全是 hit");
         assert_eq!(r1.groups, r2.groups, "缓存不许改变判定结果");
@@ -390,10 +410,75 @@ mod tests {
         let a = put(&d, "x.bin", &x);
         let b = put(&d, "y.bin", &y);
         let mut c = crate::fingerprint::HashCache::persistent();
-        let r = find_duplicates_cached(&[a, b], sha256_of, Some(&mut c));
+        let r = find_duplicates_cached(&[a, b], sha256_of, Some(&mut c), None);
         assert!(
             r.groups.is_empty(),
             "头尾相同、中间不同的两个文件被判成重复了：{:?}",
+            r.groups
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 进度回调要真的被调到，且计数单调递增。
+    /// 不验这条的话，"取消"按钮点了没反应是看不出来的。
+    #[test]
+    fn progress_reports_monotonic_counts() {
+        let d = tmp("progress");
+        // 两组各三件、内容互不相同：全文件阶段该处理 6 个文件
+        let mut files = Vec::new();
+        for i in 0..3 {
+            files.push(put(&d, &format!("a{i}.bin"), &vec![10u8; 3000]));
+            files.push(put(&d, &format!("b{i}.bin"), &vec![20u8; 3000]));
+        }
+        let mut seen: Vec<u64> = Vec::new();
+        let r = find_duplicates_cached(
+            &files,
+            sha256_of,
+            None,
+            Some(&mut |n| {
+                seen.push(n);
+                true
+            }),
+        );
+        assert_eq!(r.groups.len(), 2, "两组三件，实得 {:?}", r.groups);
+        assert_eq!(
+            seen,
+            vec![1, 2, 3, 4, 5, 6],
+            "每个进全文件阶段的文件都该报一次数"
+        );
+        assert!(!r.aborted);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 取消要**立刻停下**并标 `aborted`；已经整组确认完的部分保留。
+    /// 不断言"取消后还剩几组"——那取决于 HashMap 的迭代顺序，
+    /// 断言它等于某个固定值会把实现绑死在哈希顺序上（那是假精确）。
+    #[test]
+    fn cancel_stops_the_scan_and_says_so() {
+        let d = tmp("cancel");
+        let mut files = Vec::new();
+        for i in 0..4 {
+            files.push(put(&d, &format!("x{i}.bin"), &vec![30u8; 3000]));
+            files.push(put(&d, &format!("y{i}.bin"), &vec![40u8; 3000]));
+        }
+        let full = find_duplicates_cached(&files, sha256_of, None, None);
+        assert_eq!(full.groups.len(), 2);
+
+        let mut seen_max = 0u64;
+        let r = find_duplicates_cached(
+            &files,
+            sha256_of,
+            None,
+            Some(&mut |n| {
+                seen_max = n;
+                n < 3
+            }),
+        );
+        assert!(r.aborted, "回调返回 false 就该标 aborted");
+        assert!(seen_max <= 4, "取消之后不该继续处理到 {seen_max}");
+        assert!(
+            r.groups.len() < full.groups.len() || r.groups.is_empty(),
+            "取消在 3 个文件处，两组（各 4 件）都不该完整成组：{:?}",
             r.groups
         );
         let _ = std::fs::remove_dir_all(&d);
@@ -406,7 +491,7 @@ mod tests {
         let a = put(&d, "a.bin", &vec![3u8; 7000]);
         let b = put(&d, "b.bin", &vec![3u8; 7000]);
         let plain = find_duplicates(&[a.clone(), b.clone()], sha256_of);
-        let via_api = find_duplicates_cached(&[a, b], sha256_of, None);
+        let via_api = find_duplicates_cached(&[a, b], sha256_of, None, None);
         assert_eq!(plain.groups, via_api.groups);
         let _ = std::fs::remove_dir_all(&d);
     }

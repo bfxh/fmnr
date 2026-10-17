@@ -116,6 +116,11 @@ pub struct App {
     /// 磁盘占用视图：在跑的扫描 + 窗口是否开着
     usage_open: bool,
     usage: Option<crate::usage::Running>,
+    /// 重复文件扫描（跟着「磁盘占用」面板走，同一个根）
+    dupes: Option<crate::dupes_run::Running>,
+    /// 默认 **false = 不记住**。用户原话是"可以选择不记住"，
+    /// 而记住要往盘上写指纹与哈希，所以默认关。
+    dupes_remember: bool,
     /// 当前在看哪一层（点占比条会下钻，面包屑回上级）。
     /// 和扫描的 root 是同一个东西：下钻=重起一次以它为根的扫描。
     usage_root: PathBuf,
@@ -368,6 +373,8 @@ impl App {
             settings_open: false,
             usage_open: false,
             usage: None,
+            dupes: None,
+            dupes_remember: false,
             usage_root: PathBuf::new(),
             startup_open: false,
             startup: None,
@@ -1700,6 +1707,30 @@ impl App {
         }
     }
 
+    /// 每帧拉一次重复扫描的增量；有新东西就催重绘（同 `poll_usage` 的理由）。
+    fn poll_dupes(&mut self, ctx: &egui::Context) {
+        let repaint = match self.dupes.as_mut() {
+            Some(r) => {
+                let was_done = r.view().is_some_and(|f| f.done);
+                let got = r.poll();
+                got || (r.view().is_some_and(|f| f.done) && !was_done)
+            }
+            None => false,
+        };
+        if repaint {
+            ctx.request_repaint();
+        }
+    }
+
+    fn start_dupes_scan(&mut self, root: std::path::PathBuf) {
+        let cache = if self.dupes_remember {
+            dirs::config_dir().map(|d| crate::dupes_run::cache_path(&d))
+        } else {
+            None
+        };
+        self.dupes = Some(crate::dupes_run::Running::start(root, cache));
+    }
+
     /// 水位线 + 逐级占比条。
     ///
     /// "差了多少"要先给结论再给图：只剩一点时，用户要的是"动哪个有用"，
@@ -1715,6 +1746,11 @@ impl App {
         let mut descend: Option<PathBuf> = None;
         let mut want_rescan = false;
         let mut want_cancel = false;
+        let mut want_dupes = false;
+        let mut want_dupes_cancel = false;
+        // 重复扫描的结果先取出来：闭包里不能再借 self 一次
+        let dupes_found = self.dupes.as_ref().and_then(|r| r.view()).cloned();
+        let dupes_busy = self.dupes.as_ref().is_some_and(|r| r.busy());
         let mut open = self.usage_open;
 
         egui::Window::new("磁盘占用")
@@ -1820,8 +1856,13 @@ impl App {
                             fmt_size(u.total())
                         ));
                         let total = u.total().max(1);
+                        // 纵向 `auto_shrink=true` + 一个 max_height：
+                        // 原来写的是 `[false, false]`，滚动区会**吃掉整窗剩余高度**，
+                        // 于是下面那一节（还有本来就在的提示）被顶到窗口外看不见——
+                        // 真跑一次才发现，编译和单测都不会报这种错。
                         egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
+                            .auto_shrink([false, true])
+                            .max_height(240.0)
                             .show(ui, |ui| {
                                 if u.loose_bytes > 0 {
                                     bar(
@@ -1851,9 +1892,30 @@ impl App {
                     .size(12.0)
                     .weak(),
                 );
+
+                // ---- 重复文件：同一个根上的另一件事 ----
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("♻ 找重复").clicked() {
+                        want_dupes = true;
+                    }
+                    if dupes_busy && ui.button("取消").clicked() {
+                        want_dupes_cancel = true;
+                    }
+                    ui.checkbox(&mut self.dupes_remember, "记住指纹（默认不记）");
+                });
+                render_dupes_section(ui, dupes_found.as_ref(), dupes_busy);
             });
 
         self.usage_open = open;
+        if want_dupes {
+            self.start_dupes_scan(root.clone());
+        }
+        if want_dupes_cancel {
+            if let Some(r) = self.dupes.as_ref() {
+                r.cancel();
+            }
+        }
         if want_rescan {
             self.start_usage_scan(root);
         }
@@ -1997,6 +2059,7 @@ impl eframe::App for App {
         self.poll_search(ctx);
         self.poll_pkg(ctx);
         self.poll_usage(ctx);
+        self.poll_dupes(ctx);
         // 拖拽目标每帧重算：它是"这一帧指针悬在哪个目录上"的结论。
         self.drop_target = None;
 
@@ -4532,5 +4595,102 @@ mod shortcut_check_tests {
             Verdict::Ok(s) => assert!(s.contains("底账里没有这条"), "{s}"),
             other => panic!("期望 Ok，拿到 {other:?}"),
         }
+    }
+}
+
+/// 重复文件那一节。
+///
+/// 三件事必须说清楚，否则这一节会给出假结论：
+/// - **还在扫**：显示"已处理 N 个"，不显示"没有重复"；
+/// - **被取消**：明说这是半截结果——半截清单和完整清单长得一模一样；
+/// - **有读不到的文件**：报条数 + 第一条原因。漏了文件却说"没有重复"，
+///   用户会照着这句话去删东西。
+fn render_dupes_section(ui: &mut egui::Ui, found: Option<&crate::dupes_run::Found>, busy: bool) {
+    let Some(f) = found else {
+        ui.label(
+            egui::RichText::new("还没扫。点上面「♻ 找重复」。")
+                .size(12.0)
+                .weak(),
+        );
+        return;
+    };
+    let warn = egui::Color32::from_rgb(230, 89, 38);
+    if let Some(e) = &f.error {
+        // 这一句必须挡在所有结论前面：它说明后面那些数字压根没算出来
+        ui.label(egui::RichText::new(format!("扫不动：{e}")).color(warn));
+        return;
+    }
+    if busy {
+        ui.label(format!(
+            "扫描中… 已处理 {} 个文件，目前 {} 组",
+            f.scanned,
+            f.groups.len()
+        ));
+    }
+    if f.aborted {
+        ui.label(egui::RichText::new("这是扫到一半的结果，不是整棵树的答案。").color(warn));
+    }
+    if !f.skipped.is_empty() {
+        ui.label(
+            egui::RichText::new(format!(
+                "{} 个条目没读成，这些没算进结果。第一条：",
+                f.skipped.len()
+            ))
+            .color(warn),
+        );
+        ui.label(
+            egui::RichText::new(format!(
+                "{}：{}",
+                f.skipped[0].path.display(),
+                f.skipped[0].reason
+            ))
+            .size(12.0)
+            .weak(),
+        );
+    }
+    if f.done && f.groups.is_empty() && !f.aborted {
+        ui.label(
+            egui::RichText::new(format!("查过 {} 个文件，没有重复。", f.candidates))
+                .size(12.0)
+                .weak(),
+        );
+        return;
+    }
+    if !f.groups.is_empty() {
+        ui.label(
+            egui::RichText::new(format!(
+                "{} 组重复 · 每组留一个可省 {}",
+                f.groups.len(),
+                fmt_size(f.reclaimable())
+            ))
+            .strong(),
+        );
+        egui::ScrollArea::vertical()
+            .id_salt("dupes-groups")
+            .max_height(200.0)
+            .show(ui, |ui| {
+                for (i, g) in f.groups.iter().enumerate() {
+                    ui.label(format!(
+                        "第 {} 组：{} 个 × {}",
+                        i + 1,
+                        g.paths.len(),
+                        fmt_size(g.size)
+                    ));
+                    for path in &g.paths {
+                        ui.label(
+                            egui::RichText::new(format!("    {}", path.display()))
+                                .size(11.0)
+                                .weak(),
+                        );
+                    }
+                }
+            });
+        ui.label(
+            egui::RichText::new(
+                "这里只列清单，不删文件。要删请回到列表里选中后用「删除」（走回收站）。",
+            )
+            .size(12.0)
+            .weak(),
+        );
     }
 }

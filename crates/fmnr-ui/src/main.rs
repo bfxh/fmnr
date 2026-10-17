@@ -2,6 +2,7 @@ use eframe::egui;
 
 mod app;
 mod board_view;
+mod dupes_run;
 mod fonts;
 mod icons;
 mod ops;
