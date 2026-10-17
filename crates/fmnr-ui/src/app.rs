@@ -3421,7 +3421,23 @@ impl App {
         if want_pkg {
             self.pkg.open = true;
             self.start_pkg_scan();
+            // 底账跟着一起读：注册表三棵树实测 ~70 ms，不碰网络，
+            // 而栏顶那条「这个目录有新版可升」的弱提示要它才成立。
+            // （`start_ledger_load` 自己挡重复，所以这里可以无脑调。）
+            self.start_ledger_load();
         }
+    }
+
+    /// 目录 → 升级提示。**这个函数自己不碰注册表也不跑 winget**：
+    /// 两份数据都是包管理器面板打开时就加载好的（底账 ~70 ms 纯本地，
+    /// `winget upgrade` 要几秒且是用户主动查更新才有的东西）。
+    /// ⇒ 没查过可升级清单 = 没有提示，这是设计而不是缺陷：
+    /// 为了在目录上打个角标去偷偷跑一次 winget，是不该有的代价。
+    fn pkg_hint_for(&self, dir: &std::path::Path) -> Option<fmnr_pkg::owner::Hint> {
+        if self.pkg.ledger.is_empty() || self.pkg.rows.is_empty() {
+            return None;
+        }
+        fmnr_pkg::owner::upgrade_hint(&self.pkg.ledger, &self.pkg.rows, dir)
     }
 
     /// 一栏：栏头 → 面包屑 → 过滤 → 行列表。
@@ -3489,6 +3505,26 @@ impl App {
                     }
                 });
                 self.text_focus |= filter_focused;
+                // 「这里是某个**有新版可升**的程序的目录」——弱提示，两个条件都凑齐才说话：
+                // 目录确证对得上底账里的 InstallLocation（宁漏勿错，歧义也不说），
+                // 且用户查过的那轮 winget 盘点里有它。
+                // 命中率上限实测 ~18%（297 个 Uninstall 键只有 73 个带安装位置），
+                // 所以它是顺手提醒，不是更新入口；没查过更新就完全不出现。
+                let hint = self.pkg_hint_for(&path);
+                if let Some(h) = hint.as_ref() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "📦 这里是「{}」的安装目录，有新版 {}（现装 {}）",
+                                h.name, h.available, h.installed
+                            ))
+                            .size(12.0),
+                        );
+                        if ui.button("复制升级命令").clicked() {
+                            self.clipboard_text = Some(h.command.clone());
+                        }
+                    });
+                }
                 ui.separator();
 
                 // 列视图

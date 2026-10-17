@@ -12,6 +12,7 @@
 
 pub mod github;
 pub mod lnk;
+pub mod owner;
 pub mod registry;
 
 /// 一行可升级条目。字段按 winget 表格的五列（名称 / ID / 版本 / 可用 / 源）。
