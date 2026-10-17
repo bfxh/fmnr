@@ -225,6 +225,10 @@ CLI/HTTP 直接用 payload。当初这么设计就是为了不出现"CLI 能删�
 1. **内核有、工具表没有**：`Volume` 的 `read_stream`/`write`、属性、建目录/改名，
    以及 `fmnr-pkg` 的已装清单（`quiet_uninstall_string` 字段已经在结构体里了）
    ——**任何一条入口都调不到**。这是覆盖面缺口，不是 MCP 弱。
+   ✅ **已做完（2026-10-17）**：`read_file`/`write_file`/`rename`/`create_dir` 见 §11，
+   `stat`（属性，走卷给的 `Entry`）与 `packages`（已装底账）见 §19。
+   剩 `read_stream` 没单独成工具——`read_file` 内部就是按块读，
+   再开一个流式工具对 JSON-RPC 的调用方没有可消费的意义（它拿不到增量）。
 2. **多卷只在 CLI 有**：MCP/HTTP 进程只挂单个本地卷，归档/WSL/SSH 的注册表没接过去。
 3. **摩擦**：CLI 每条命令重新 spawn 进程 + 重扫挂载；没有批量入口、没有 NDJSON/stdin 流式、
    长操作没有进度回传。
@@ -412,3 +416,60 @@ Unix 走 `MetadataExt` 的 `dev()/ino()`。**四个分量全部进键**——
 **这里刻意没留一个"先按 mtime+size 缓存"的过渡版**：
 那种缓存会把该重算的判成不用重算（timestomp、FAT 2 秒粒度、同尺寸改写都漏），
 比没有缓存更糟。宁可这一轮少交付一半。
+
+## 19. 属性与已装清单上表（2026-10-17）——顺手挖出一个界面缺陷
+
+§6.1 剩下的两条补进 `tools::dispatch_payload`：`stat`（单条目属性）与
+`packages`（已装底账），CLI 侧对应 `fmnr stat <路径>` 与 `fmnr apps [--query] [--limit]`。
+一处补，三条入口同时拿到——这正是 §6 说的"覆盖面缺口不是 MCP 弱"。
+
+**`stat` 刻意不自己 `fs::metadata`**：属性一律从**卷给的 `Entry`** 里取。
+归档卷的"大小"是包内声明的大小、远程卷的是 SFTP 报的，
+自己 stat 一遍等于把这套口径换成"只对本地盘成立"的另一套。
+
+### 顺着这条路挖出来的真缺陷：勾上「显示隐藏项」会把属性一起关掉
+`fmnr-fs::LocalVolume::list` 里整段属性计算写在 `if !opts.show_hidden { … }` 里面，
+所以：
+- `show_hidden = true`（界面那个勾选、以及 `stat`）时，`Hidden`/`System`/`ReadOnly`
+  **三个标记一起变空**——"显示了隐藏项"反而看不到它是隐藏项；
+- 更难看的是 `attrs.push(Attr::Hidden)` 那一行**前面就摆着一个同条件的 `continue`**，
+  它在 Windows 上永远到不了：那份代码从来没执行过一次。
+- Windows 上 `ReadOnly` 位压根没算过（`FILE_ATTRIBUTE_READONLY` 没读）。
+- unix 上判只读用的是 `mode & 0o400`（**读**位），要的是 `0o200`（属主写位）：
+  会把"能改但谁都不许读"报成只读、把真只读的漏掉。
+
+`fmnr-archive` 早就是"先算属性、再按开关筛"（`show_hidden || !attrs.contains(Hidden)`）
+⇒ 这次是把 `LocalVolume` 对齐到仓里已有的那套口径，不是新发明。
+测试：`attr_tests` 两条，各带一个**对照组**（普通文件不许也带 Hidden/ReadOnly），
+否则"全都算成隐藏"也能让断言过。反证打过：把 Hidden 的条件改回带 `!show_hidden`
+就判红。unix 那条 `0o200` 本机判不动（Windows 没有 mode 位），由 CI 的 ubuntu job 判。
+
+### `packages` 的两条刻意取舍
+1. **不回显 `uninstall_string` / `quiet_uninstall_string`**。那是可执行面，
+   而本项目的立场是"只列、不代跑卸载/升级"；和"注册动作不做成 MCP 工具"同一条理由
+   ——碰系统边界的不由远程客户端触发。给一个 `has_uninstaller` 布尔就够回答"能不能卸"。
+   这条由测试钉住：返回体里不许出现那两个字段名。
+2. 非 Windows 上 `list_installed()` **报错**而不是回空表
+   （"这台机器没装软件"和"这台机器读不到注册表"是两件事）。
+   也因为它必然报错，`packages` **没进**三条腿一致性那串序列——
+   三条腿报错时的形状本来就不一样（JSON-RPC 的 error 对象 / HTTP 状态码 / CLI 退出码+stderr），
+   而那串序列钉的是"成功返回整份相等"。它的接线改由 CLI 侧的
+   `every_subcommand_targets_a_registered_tool` 钉。
+
+### 顺带把那条"每个子命令"的测试补成真的
+它原来只列了 8 个子命令，而 clap 声明了 16 个——N1 加的 `cat`/`put`/`rename`/`mkdir`
+**全都在名单外**，测试名却写着"每个"。现在名单补全，并加一条
+`clap 声明数 == 名单数 + 2`（register/unregister 不走工具表）的数量断言：
+以后新增变体不往名单里加就当场判红。反证打过：从名单里删掉 `Cmd::Stat` 一项，
+报"clap 声明了 16 个但名单只有 13 项"。
+
+### 依赖代价是量过的，不是估的
+`fmnr-ai` 新增 `fmnr-pkg` 一条依赖。它只带 `thiserror`/`tracing` 和
+**按 target 门控**的 `windows`，不带 `ring`/`zstd-sys` 那两条要跨端 C 编译器的链
+⇒ `fmnr-ai` 仍留在门禁第 5 步的可覆盖面清单里（跑过，见门禁输出）。
+这和 §17 那条"让 MCP 进程自己挂归档卷"是**两件事**：那条要把 `fmnr-mount`→`fmnr-archive`
+接进来，才会掉出覆盖面。
+
+**实测数字**：`fmnr stat E:\tmp\statprobe\locked.txt`（`attrib +h +r`）→
+`attrs: ["ReadOnly","Hidden"]`；同目录 `plain.txt` → `attrs: []`。
+`fmnr apps --limit 3` → `matched: 273`，与 §本机实测数字 那节记的三棵 Uninstall 树条数一致。

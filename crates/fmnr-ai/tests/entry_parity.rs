@@ -44,18 +44,25 @@ impl Drop for Fixture {
     }
 }
 
-/// 五个动作，按顺序，参数三条腿完全一致。
+/// 六个动作，按顺序，参数三条腿完全一致。
 /// 返回每一步的输出 JSON；任何一步失败即 panic（带着是哪条腿）。
+///
+/// ⚠ `packages` **故意不在这串里**：非 Windows 上它必然报错（注册表 Uninstall 树
+/// 只有 Windows 有），而三条腿**报错时的形状本来就不一样**（JSON-RPC 的 error 对象 /
+/// HTTP 的状态码 / CLI 的退出码+stderr），本测试钉的是"成功返回整份相等"。
+/// 它的接线由 `fmnr-cli` 的子命令映射测试与 `tools.rs` 的
+/// `every_spec_is_dispatchable` 一起钉住。
 trait Leg {
     fn call(&mut self, tool: &str, args: Value) -> Value;
 
     fn run_sequence(&mut self) -> Vec<Value> {
-        let steps: [(&str, Value); 5] = [
+        let steps: [(&str, Value); 6] = [
             ("create_dir", json!({"path": "out"})),
             ("write_file", json!({"path": "note.txt", "text": TEXT})),
             ("read_file", json!({"path": "note.txt"})),
             ("rename", json!({"from": "note.txt", "to": "out/note.txt"})),
             ("read_file", json!({"path": "out/note.txt"})),
+            ("stat", json!({"path": "out/note.txt"})),
         ];
         steps
             .iter()
@@ -262,6 +269,7 @@ impl Leg for Cli {
                 args["from"].as_str().unwrap().into(),
                 args["to"].as_str().unwrap().into(),
             ],
+            "stat" => vec!["stat".into(), args["path"].as_str().unwrap().into()],
             other => panic!("CLI 腿没配 {other} 的子命令"),
         };
         let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
@@ -283,8 +291,27 @@ impl Leg for Cli {
 
 // ---------------------------------------------------------------- 判据
 
+/// 去掉**每条腿各自不同**的那两个字段之后的整份 JSON，只给 `stat` 那一步用。
+///
+/// - `modified_ms`：三条腿各自写自己的夹具，时间戳不可能相同；
+/// - `native_path`：卷根就是各条腿自己的工作目录，同一个相对路径在谁那儿
+///   解析都是**它自己**的那个目录（其余步骤靠"参数一律用相对路径"避开这一点，
+///   而 `stat` 的返回里回显了绝对路径，绕不开）。
+///
+/// 除这两个之外，每个字段（`path`/`is_dir`/`size`/`attrs`/`volume_kind`/`writable`）
+/// 都必须字节级相等——少一个、多一个都算这条腿分叉。
+/// 这两个字段本身另外单独钉"存在且类型对"，见判据末尾。
+fn without_leg_local(v: &Value) -> Value {
+    let mut o = v.clone();
+    if let Some(m) = o.as_object_mut() {
+        m.remove("modified_ms");
+        m.remove("native_path");
+    }
+    o
+}
+
 #[tokio::test]
-async fn three_entries_return_identical_json_for_the_new_four_tools() {
+async fn three_entries_return_identical_json_for_the_shared_sequence() {
     // 腿 1：MCP（真子进程 + 真 stdin/stdout 管道）
     let mfx = Fixture::new("mcp");
     let mut mcp = Mcp::start(&mfx.0);
@@ -318,6 +345,7 @@ async fn three_entries_return_identical_json_for_the_new_four_tools() {
         )
         .await,
         http_call(http.port, "read_file", json!({"path": "out/note.txt"})).await,
+        http_call(http.port, "stat", json!({"path": "out/note.txt"})).await,
     ];
     drop(http);
     drop(hfx);
@@ -328,11 +356,25 @@ async fn three_entries_return_identical_json_for_the_new_four_tools() {
         "read_file",
         "rename",
         "read_file",
+        "stat",
     ];
-    for i in 0..5 {
+    for i in 0..6 {
+        // `stat` 带两个"每条腿各自不同"的字段（墙钟时间戳、各自夹具目录解析出的
+        // 原生路径），所以这一步比**去掉这两个字段之后的整份**，
+        // 另外单独钉住"这两个字段在三条腿上都存在且类型对"——
+        // 少一个字段、或者某条腿根本不报原生路径，仍然算这条腿分叉。
+        let (m, h, c) = if tools[i] == "stat" {
+            (
+                without_leg_local(&mcp_out[i]),
+                without_leg_local(&http_out[i]),
+                without_leg_local(&cli_out[i]),
+            )
+        } else {
+            (mcp_out[i].clone(), http_out[i].clone(), cli_out[i].clone())
+        };
         assert_eq!(
-            mcp_out[i],
-            http_out[i],
+            m,
+            h,
             "第 {} 步（{}）MCP 与 HTTP 返回不同：\n MCP={} \n HTTP={}",
             i + 1,
             tools[i],
@@ -340,8 +382,8 @@ async fn three_entries_return_identical_json_for_the_new_four_tools() {
             http_out[i]
         );
         assert_eq!(
-            mcp_out[i],
-            cli_out[i],
+            m,
+            c,
             "第 {} 步（{}）MCP 与 CLI 返回不同：\n MCP={} \n CLI={}",
             i + 1,
             tools[i],
@@ -349,6 +391,18 @@ async fn three_entries_return_identical_json_for_the_new_four_tools() {
             cli_out[i]
         );
     }
+    for v in [&mcp_out[5], &http_out[5], &cli_out[5]] {
+        assert!(
+            v["modified_ms"].is_number(),
+            "stat 少了 modified_ms 这个字段：{v}"
+        );
+        assert!(
+            v["native_path"].is_string() && !v["native_path"].as_str().unwrap().is_empty(),
+            "本地卷的 stat 必须给出非空原生路径：{v}"
+        );
+    }
+    assert_eq!(mcp_out[5]["size"], json!(TEXT.len() as u64));
+    assert_eq!(mcp_out[5]["is_dir"], json!(false));
 
     // 顺带钉住"内容真的动了磁盘"，否则三条腿一起返回空也算一致。
     assert_eq!(mcp_out[2]["text"], json!(TEXT));

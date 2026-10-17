@@ -180,6 +180,32 @@ pub fn specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
         },
+        // ↓ 剩下两条同样是"内核早就有、工具表没有"：
+        //   属性在 `Entry` 里（UI 一直在用），已装底账在 `fmnr-pkg::registry`（面板在用）。
+        ToolSpec {
+            name: "stat",
+            description: "取单个条目的属性：类型、大小、修改时间、隐藏/系统/符号链接/只读，外加这个卷的种类、可否写、有没有原生路径。属性走卷给的 Entry，所以归档卷里读到的是包内声明的大小。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "条目路径（相对当前卷根或绝对）"}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "packages",
+            description: "列出注册表 Uninstall 三棵树里的已装程序（名称/发行商/版本/家族/安装位置/GitHub 上游）。只读盘点：不返回卸载命令行，也不代跑卸载或升级。query 按名称或发行商子串筛。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "名称/发行商子串，大小写不敏感"},
+                    "limit": {"type": "integer", "minimum": 1, "default": 200}
+                },
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -271,6 +297,21 @@ struct RenameArgs {
 #[serde(deny_unknown_fields)]
 struct MkdirArgs {
     path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatArgs {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackagesArgs {
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -519,6 +560,113 @@ pub async fn dispatch_payload(
                 .await
                 .map_err(to_rpc)?;
             Ok(json!({ "path": a.path, "created": true }))
+        }
+
+        "stat" => {
+            let a: StatArgs = parse(args)?;
+            let path = std::path::PathBuf::from(&a.path);
+            // 属性一律从**卷给的 Entry** 里取，不在这里另 `fs::metadata` 一遍：
+            // 归档卷的"大小"是包内声明的大小，远程卷的是 SFTP 报的，
+            // 自己 stat 会把这套口径换成只对本地盘成立的另一套。
+            let opts = ListOpts {
+                show_hidden: true,
+                sort: SortOrder::Name,
+            };
+            let (is_dir, size, modified, attrs) = match path.parent() {
+                Some(dir) => {
+                    let nm = path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .ok_or_else(|| RpcError::new(INVALID_PARAMS, "路径里没有可查的条目名"))?;
+                    // show_hidden=true 是必须的：不然"这是个隐藏文件"会被报成
+                    // "这个文件不存在"——查属性恰恰是最想知道它隐藏的时候。
+                    let entries = volume
+                        .list(&VPath(dir.to_path_buf()), &opts)
+                        .await
+                        .map_err(to_rpc)?;
+                    let e = entries.into_iter().find(|e| e.name == nm).ok_or_else(|| {
+                        to_rpc(fmnr_core::Error::NotFound(format!("{} 不存在", a.path)))
+                    })?;
+                    (e.is_dir, e.size, e.modified, e.attrs)
+                }
+                // 卷根（`E:\`、`\\wsl$\<distro>`）在父目录里不是一条条目。
+                // 拿"列得出来"当它存在的证据；这一层抽象没给的大小和时间就报 null。
+                None => {
+                    volume
+                        .list(&VPath(path.clone()), &opts)
+                        .await
+                        .map_err(to_rpc)?;
+                    (true, None, None, Vec::new())
+                }
+            };
+            Ok(json!({
+                "path": a.path,
+                "is_dir": is_dir,
+                "size": size,
+                "modified_ms": modified.and_then(|t| t
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_millis() as u64)),
+                "attrs": attrs.iter().map(|x| format!("{x:?}")).collect::<Vec<_>>(),
+                "volume_kind": format!("{:?}", volume.kind()),
+                "writable": volume.writable(),
+                "native_path": volume
+                    .native_path(&VPath(path))
+                    .map(|p| p.to_string_lossy().to_string()),
+            }))
+        }
+
+        "packages" => {
+            let a: PackagesArgs = parse(args)?;
+            // 只读盘点。两条刻意的取舍：
+            // 1. **不回显卸载命令行**（`uninstall_string`/`quiet_uninstall_string`）——
+            //    那是可执行面，而本项目的立场是"只列，不代跑"（和注册动作
+            //    不做成工具同一条理由：碰系统边界的不在这里给远程客户端触发）。
+            //    所以只给 `has_uninstaller` 这个布尔。
+            // 2. 底账本身按名称排好（`registry.rs` 里有测试钉着），
+            //    三条入口才可能拿到字节级相同的返回。
+            let all = fmnr_pkg::registry::list_installed()
+                .map_err(|e| RpcError::new(INTERNAL_ERROR, format!("读已装程序底账失败：{e}")))?;
+            let total = all.len();
+            let needle = a.query.clone().unwrap_or_default().to_lowercase();
+            let matched: Vec<_> = all
+                .iter()
+                .filter(|app| {
+                    needle.is_empty()
+                        || app.name.to_lowercase().contains(&needle)
+                        || app
+                            .publisher
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_lowercase()
+                            .contains(&needle)
+                })
+                .collect();
+            let items: Vec<Value> = matched
+                .iter()
+                .take(a.limit)
+                .map(|app| {
+                    json!({
+                        "name": app.name,
+                        "publisher": app.publisher,
+                        "version": app.version,
+                        "family": format!("{:?}", app.family),
+                        "hive": format!("{:?}", app.hive),
+                        "install_location": app.install_location,
+                        "url": app.url,
+                        "github": app.github,
+                        "has_uninstaller": app.uninstall_string.is_some()
+                            || app.quiet_uninstall_string.is_some(),
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "count": items.len(),
+                "matched": matched.len(),
+                "total_installed": total,
+                "truncated": items.len() < matched.len(),
+                "packages": items,
+            }))
         }
 
         "open" => {
@@ -918,6 +1066,186 @@ mod tests {
 
     fn ro_vol() -> Arc<dyn Volume> {
         Arc::new(ReadOnly(LocalVolume::new(std::env::temp_dir())))
+    }
+
+    /// 只有在 `show_hidden = true` 时才肯列东西的卷。
+    ///
+    /// 它存在的唯一目的：把 `stat` 里那句 `show_hidden: true` 钉成会判红的东西。
+    /// 改成 false 的话，隐藏项的属性就查不到，而工具会把"这是个隐藏文件"
+    /// 报成"这个文件不存在"——正是查属性最不该说错的那一句。
+    struct OnlyWhenShown(LocalVolume);
+
+    #[async_trait::async_trait]
+    impl Volume for OnlyWhenShown {
+        fn id(&self) -> VolumeId {
+            self.0.id()
+        }
+        fn kind(&self) -> VolumeKind {
+            self.0.kind()
+        }
+        async fn list(&self, path: &VPath, opts: &ListOpts) -> Result<Vec<Entry>> {
+            if !opts.show_hidden {
+                return Ok(Vec::new());
+            }
+            self.0.list(path, opts).await
+        }
+        async fn read_stream(
+            &self,
+            path: &VPath,
+        ) -> Result<Box<dyn futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + Unpin>>
+        {
+            self.0.read_stream(path).await
+        }
+        async fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
+            self.0.write(path, data).await
+        }
+        fn writable(&self) -> bool {
+            self.0.writable()
+        }
+        fn native_path(&self, path: &VPath) -> Option<std::path::PathBuf> {
+            self.0.native_path(path)
+        }
+        async fn spawn_external_open(
+            &self,
+            file_path: &VPath,
+            program: &str,
+        ) -> Result<ExternalOpen> {
+            self.0.spawn_external_open(file_path, program).await
+        }
+        fn external_opens(&self) -> &ExternalOpens {
+            self.0.external_opens()
+        }
+        async fn copy(
+            &self,
+            sources: &[VPath],
+            dest_dir: &VPath,
+            policy: ConflictPolicy,
+            progress: Arc<Progress>,
+        ) -> Result<OpReport> {
+            self.0.copy(sources, dest_dir, policy, progress).await
+        }
+        async fn move_entries(
+            &self,
+            sources: &[VPath],
+            dest_dir: &VPath,
+            policy: ConflictPolicy,
+            progress: Arc<Progress>,
+        ) -> Result<OpReport> {
+            self.0
+                .move_entries(sources, dest_dir, policy, progress)
+                .await
+        }
+        async fn delete(&self, targets: &[VPath], progress: Arc<Progress>) -> Result<OpReport> {
+            self.0.delete(targets, progress).await
+        }
+        async fn rename(&self, from: &VPath, to: &VPath) -> Result<()> {
+            self.0.rename(from, to).await
+        }
+        async fn create_dir(&self, path: &VPath) -> Result<()> {
+            self.0.create_dir(path).await
+        }
+        async fn search(&self, root: &VPath, needle: String, limit: usize) -> Result<Vec<VPath>> {
+            self.0.search(root, needle, limit).await
+        }
+    }
+
+    fn shown_vol(dir: &std::path::Path) -> Arc<dyn Volume> {
+        Arc::new(OnlyWhenShown(LocalVolume::new(dir)))
+    }
+
+    #[tokio::test]
+    async fn stat_reads_its_attributes_through_the_volume() {
+        let d = tmp_dir("stat");
+        std::fs::write(d.join("note.txt"), b"12345").unwrap();
+        let got = dispatch_payload(
+            shown_vol(&d),
+            "stat",
+            json!({ "path": d.join("note.txt").display().to_string() }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got["is_dir"], false);
+        assert_eq!(got["size"], 5, "大小要从卷的 Entry 来");
+        assert!(
+            got["native_path"].is_string(),
+            "本地卷必须有原生路径：{got}"
+        );
+        assert_eq!(got["writable"], true);
+        // 这条同时判住 `show_hidden: true`：换成 false，上面整段就会 NotFound。
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn stat_on_a_directory_says_so() {
+        let d = tmp_dir("statdir");
+        std::fs::create_dir(d.join("sub")).unwrap();
+        let got = dispatch_payload(
+            vol(),
+            "stat",
+            json!({ "path": d.join("sub").display().to_string() }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got["is_dir"], true);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 查不到必须是 NotFound，不能返回一个"全 null 的对象"——
+    /// 后者看起来像"这文件没有大小"，而不是"根本没有这个文件"。
+    #[tokio::test]
+    async fn stat_on_missing_path_is_not_found() {
+        let d = tmp_dir("statmiss");
+        let e = dispatch_payload(
+            vol(),
+            "stat",
+            json!({ "path": d.join("ghost.txt").display().to_string() }),
+        )
+        .await
+        .unwrap_err();
+        assert_ne!(e.code, crate::protocol::METHOD_NOT_FOUND);
+        assert!(
+            e.message.contains("不存在"),
+            "该报「不存在」，实得：{}",
+            e.message
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 已装清单的返回里不许出现卸载命令行那两个字段（那是可执行面）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn packages_never_carries_uninstall_commands() {
+        let got = dispatch_payload(vol(), "packages", json!({ "limit": 5 }))
+            .await
+            .unwrap();
+        assert!(got["packages"].is_array(), "返回形状不对：{got}");
+        assert!(got["count"].as_u64().unwrap() <= 5);
+        let text = got.to_string().to_lowercase();
+        for banned in ["uninstall_string", "quiet_uninstall"] {
+            assert!(
+                !text.contains(banned),
+                "返回里出现了 {banned}：卸载命令行不外流"
+            );
+        }
+        assert!(
+            text.contains("has_uninstaller"),
+            "至少要给出「有没有卸载器」这个布尔：{got}"
+        );
+    }
+
+    /// 非 Windows 要**报错**，不能回一张空表——
+    /// "这台机器没装软件"和"这台机器读不到注册表"是两件事。
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn packages_errors_instead_of_claiming_nothing_installed() {
+        let e = dispatch_payload(vol(), "packages", json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            e.message.contains("Windows"),
+            "该如实说只实现了 Windows，实得：{}",
+            e.message
+        );
     }
 
     /// 三条写路径在只读卷上必须在**落盘之前**被拦下，且报的是 INVALID_PARAMS

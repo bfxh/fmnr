@@ -14,6 +14,9 @@ path = "src/main.rs"
 axum = "0.8.9"
 fmnr-core = { path = "../fmnr-core" }
 fmnr-fs = { path = "../fmnr-fs" }
+# 已装程序底账。它只多带 `thiserror`/`tracing` 和**按 target 门控**的 windows，
+# 不带 ring/zstd 那两条要跨端 C 编译器的链 ⇒ 本包仍留在门禁第 5 步可覆盖面里。
+fmnr-pkg = { path = "../fmnr-pkg" }
 serde.workspace = true
 serde_json.workspace = true
 futures = "0.3"

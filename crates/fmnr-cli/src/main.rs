@@ -84,6 +84,22 @@ enum Cmd {
         path: String,
     },
 
+    /// 查单个条目的属性（类型/大小/修改时间/隐藏·系统·符号链接·只读）
+    Stat {
+        /// 条目路径
+        path: String,
+    },
+
+    /// 列已装程序底账（只读盘点：不含卸载命令行，也不代跑卸载或升级）
+    Apps {
+        /// 按名称或发行商子串筛
+        #[arg(long)]
+        query: Option<String>,
+        /// 最多返回条数
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
+
     /// 拷贝条目到目标目录
     Cp {
         /// 源条目（至少一个）
@@ -233,6 +249,14 @@ impl Cmd {
             }
             Cmd::Rename { from, to } => Action::Tool("rename", json!({ "from": from, "to": to })),
             Cmd::Mkdir { path } => Action::Tool("create_dir", json!({ "path": path })),
+            Cmd::Stat { path } => Action::Tool("stat", json!({ "path": path })),
+            Cmd::Apps { query, limit } => {
+                let mut a = json!({ "limit": limit });
+                if let Some(q) = query {
+                    a["query"] = json!(q);
+                }
+                Action::Tool("packages", a)
+            }
             Cmd::Register { exe, dry_run } => Action::Register {
                 exe: exe.clone(),
                 dry_run: *dry_run,
@@ -475,6 +499,35 @@ mod tests {
         );
     }
 
+    /// `stat` 与 `apps` 的**参数形状**。工具名是否注册由
+    /// `every_subcommand_targets_a_registered_tool` 统一判，这里只钉两件事：
+    /// 子命令名和工具名不必一致（`apps` → `packages`），以及省略 query 时不许
+    /// 塞一个空字段进去（`deny_unknown_fields` 那边会按"给了但为空"理解）。
+    #[test]
+    fn stat_and_apps_build_the_right_arguments() {
+        let (t1, a1) = call(Cmd::Stat {
+            path: r"D:\x\a.txt".into(),
+        });
+        assert_eq!(t1, "stat");
+        assert_eq!(a1, json!({"path": r"D:\x\a.txt"}));
+        let (t2, a2) = call(Cmd::Apps {
+            query: None,
+            limit: 3,
+        });
+        assert_eq!(t2, "packages");
+        assert_eq!(a2, json!({"limit": 3}), "没给 query 时不该出现这个字段");
+    }
+
+    /// 给了 query 就要带上，且不能顺手把 limit 挤掉。
+    #[test]
+    fn apps_carries_query_when_given() {
+        let (_, args) = call(Cmd::Apps {
+            query: Some("zip".into()),
+            limit: 200,
+        });
+        assert_eq!(args, json!({"limit": 200, "query": "zip"}));
+    }
+
     #[test]
     fn open_without_program_omits_the_field() {
         let (tool, args) = call(Cmd::Open {
@@ -501,8 +554,14 @@ mod tests {
     }
 
     /// 每个子命令都必须映射到真实存在的工具，否则 CLI 会拿到 -32601。
+    ///
+    /// 这份名单**必须覆盖全部子命令**——底下那条数量断言就是钉这件事的：
+    /// 新增一个 `Cmd` 变体而没往这里加一项，clap 数出来的子命令数就会和名单对不上，
+    /// 当场判红。没有那条断言的话，"每个子命令"这个测试名是假的
+    /// （N1 加 cat/put/rename/mkdir 时它就漏在名单外过）。
     #[test]
     fn every_subcommand_targets_a_registered_tool() {
+        use clap::CommandFactory;
         let names: Vec<&str> = tools::specs().iter().map(|s| s.name).collect();
         let cmds = [
             Cmd::Volumes,
@@ -535,11 +594,40 @@ mod tests {
                 program: None,
             },
             Cmd::Opens,
+            Cmd::Cat {
+                path: "a".into(),
+                max_bytes: 1,
+            },
+            Cmd::Put {
+                path: "a".into(),
+                text: "b".into(),
+            },
+            Cmd::Rename {
+                from: "a".into(),
+                to: "b".into(),
+            },
+            Cmd::Mkdir { path: "a".into() },
+            Cmd::Stat { path: "a".into() },
+            Cmd::Apps {
+                query: None,
+                limit: 1,
+            },
         ];
+        let listed = cmds.len();
         for c in cmds {
             let (tool, _) = call(c);
             assert!(names.contains(&tool), "CLI 指向了未注册的工具：{tool}");
         }
+        // 名单要盖住 clap 声明的**全部**子命令。register/unregister 不走工具表
+        // （那是系统边界，见 `registration_is_local_only_not_a_tool_call`），所以减 2。
+        let declared = Cli::command().get_subcommands().count();
+        assert_eq!(
+            declared,
+            listed + 2,
+            "clap 声明了 {declared} 个子命令（去掉 register/unregister 该是 {} 个），\
+             但这份名单只有 {listed} 项——新增了变体没往名单里加",
+            declared - 2
+        );
     }
 
     /// register/unregister 必须**不是**工具调用。
