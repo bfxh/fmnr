@@ -121,6 +121,14 @@ pub struct App {
     /// 默认 **false = 不记住**。用户原话是"可以选择不记住"，
     /// 而记住要往盘上写指纹与哈希，所以默认关。
     dupes_remember: bool,
+    /// 每一项的勾选状态，下标和清单里（剔掉已删项之后的）组一一对应。
+    /// 形状一对不上就重新按默认播种：扫描进行中组数一直在长，
+    /// 拿上一棵树的「第 3 组第 2 项」去勾这一棵树，删的就是没选中的文件。
+    dupes_sel: Vec<Vec<bool>>,
+    /// 这一轮里**已经由本面板删掉**的路径。清单是删之前扫的，
+    /// 留着已删的行会把"还在"的假象摆在那儿，所以按这份集合把行剔掉、
+    /// 凑不满两个的组整组撤下（剩下那一份不再是重复）。
+    dupes_dead: std::collections::HashSet<PathBuf>,
     /// 当前在看哪一层（点占比条会下钻，面包屑回上级）。
     /// 和扫描的 root 是同一个东西：下钻=重起一次以它为根的扫描。
     usage_root: PathBuf,
@@ -375,6 +383,8 @@ impl App {
             usage: None,
             dupes: None,
             dupes_remember: false,
+            dupes_sel: Vec::new(),
+            dupes_dead: std::collections::HashSet::new(),
             usage_root: PathBuf::new(),
             startup_open: false,
             startup: None,
@@ -1748,6 +1758,7 @@ impl App {
         let mut want_cancel = false;
         let mut want_dupes = false;
         let mut want_dupes_cancel = false;
+        let mut dupes_plan: Option<crate::dupes_run::DeletePlan> = None;
         // 重复扫描的结果先取出来：闭包里不能再借 self 一次
         let dupes_found = self.dupes.as_ref().and_then(|r| r.view()).cloned();
         let dupes_busy = self.dupes.as_ref().is_some_and(|r| r.busy());
@@ -1904,11 +1915,40 @@ impl App {
                     }
                     ui.checkbox(&mut self.dupes_remember, "记住指纹（默认不记）");
                 });
-                render_dupes_section(ui, dupes_found.as_ref(), dupes_busy);
+                // 删除只走当前卷，而当前卷可能是只读归档或远程卷：
+                // 那种时候清单照看、按钮禁用，而不是点下去报一个内核错误。
+                let can_delete = self
+                    .current_volume()
+                    .is_some_and(|v| v.kind() == fmnr_core::VolumeKind::Local && v.writable());
+                dupes_plan = render_dupes_section(
+                    ui,
+                    dupes_found.as_ref(),
+                    dupes_busy,
+                    &mut self.dupes_sel,
+                    &self.dupes_dead,
+                    can_delete,
+                );
             });
 
         self.usage_open = open;
+        if let Some(plan) = dupes_plan {
+            let n = plan.paths.len();
+            // 先记下"这些已经删了"，再发操作：清单是删之前扫的那一份，
+            // 不记的话删完还挂在上面，下一句"可省多少"就虚报了。
+            self.dupes_dead.extend(plan.paths.iter().cloned());
+            self.start_op(
+                crate::ops::OpKind::Delete,
+                plan.paths.into_iter().map(VPath).collect(),
+                None,
+                fmnr_core::ConflictPolicy::Skip,
+            );
+            self.status = format!("重复清单：送入回收站（{n} 项，可恢复）…");
+        }
         if want_dupes {
+            // 新一轮扫描：勾选状态和"已删"名单都属于上一轮，留着会把
+            // 上一棵树的下标套到这一棵树上。
+            self.dupes_sel.clear();
+            self.dupes_dead.clear();
             self.start_dupes_scan(root.clone());
         }
         if want_dupes_cancel {
@@ -4605,21 +4645,46 @@ mod shortcut_check_tests {
 /// - **被取消**：明说这是半截结果——半截清单和完整清单长得一模一样；
 /// - **有读不到的文件**：报条数 + 第一条原因。漏了文件却说"没有重复"，
 ///   用户会照着这句话去删东西。
-fn render_dupes_section(ui: &mut egui::Ui, found: Option<&crate::dupes_run::Found>, busy: bool) {
+fn render_dupes_section(
+    ui: &mut egui::Ui,
+    found: Option<&crate::dupes_run::Found>,
+    busy: bool,
+    sel: &mut Vec<Vec<bool>>,
+    dead: &std::collections::HashSet<PathBuf>,
+    can_delete: bool,
+) -> Option<crate::dupes_run::DeletePlan> {
     let Some(f) = found else {
+        sel.clear();
         ui.label(
             egui::RichText::new("还没扫。点上面「♻ 找重复」。")
                 .size(12.0)
                 .weak(),
         );
-        return;
+        return None;
     };
     let warn = egui::Color32::from_rgb(230, 89, 38);
     if let Some(e) = &f.error {
         // 这一句必须挡在所有结论前面：它说明后面那些数字压根没算出来
+        sel.clear();
         ui.label(egui::RichText::new(format!("扫不动：{e}")).color(warn));
-        return;
+        return None;
     }
+    // 已经被这个面板删掉的路径不能再留在清单上：留着的话
+    // "还剩 N 组重复""每组留一个可省 X"这些数字就是说假话
+    // （那几份文件其实已经不在了）。凑不满两份的组整组撤下。
+    let filtered;
+    let f = if dead.is_empty() {
+        f
+    } else {
+        filtered = {
+            let mut v = f.clone();
+            let (groups, sels) = crate::dupes_run::prune_selection(&f.groups, sel, dead);
+            v.groups = groups;
+            *sel = sels;
+            v
+        };
+        &filtered
+    };
     if busy {
         ui.label(format!(
             "扫描中… 已处理 {} 个文件，目前 {} 组",
@@ -4649,48 +4714,132 @@ fn render_dupes_section(ui: &mut egui::Ui, found: Option<&crate::dupes_run::Foun
         );
     }
     if f.done && f.groups.is_empty() && !f.aborted {
+        sel.clear();
         ui.label(
             egui::RichText::new(format!("查过 {} 个文件，没有重复。", f.candidates))
                 .size(12.0)
                 .weak(),
         );
-        return;
+        return None;
     }
-    if !f.groups.is_empty() {
+    if f.groups.is_empty() {
+        return None;
+    }
+
+    // 勾选状态的下标必须贴住这一份结果。形状一变（换根、重扫、扫描中组数增长）
+    // 就按默认重新播种——拿上一棵树的第 3 组第 2 项去勾这一棵树，删的是没选中的文件。
+    let shaped = sel.len() == f.groups.len()
+        && sel
+            .iter()
+            .zip(f.groups.iter())
+            .all(|(s, g)| s.len() == g.paths.len());
+    if !shaped {
+        *sel = crate::dupes_run::default_selection(&f.groups);
+    }
+
+    ui.label(
+        egui::RichText::new(format!(
+            "{} 组重复 · 每组留一个可省 {}",
+            f.groups.len(),
+            fmt_size(f.reclaimable())
+        ))
+        .strong(),
+    );
+
+    let mut want_delete = false;
+    let interactive = f.done;
+    egui::ScrollArea::vertical()
+        .id_salt("dupes-groups")
+        .max_height(220.0)
+        .show(ui, |ui| {
+            for (i, g) in f.groups.iter().enumerate() {
+                ui.label(format!(
+                    "第 {} 组：{} 个 × {}",
+                    i + 1,
+                    g.paths.len(),
+                    fmt_size(g.size)
+                ));
+                for (j, path) in g.paths.iter().enumerate() {
+                    // 第一项标"留"：默认不勾的就是要保留的那一份，
+                    // 光看勾选框分不出哪一个是正主。
+                    let tag = if j == 0 { "留" } else { "副本" };
+                    ui.horizontal(|ui| {
+                        if !interactive {
+                            ui.label(
+                                egui::RichText::new(format!("{tag} {}", path.display()))
+                                    .size(11.0)
+                                    .weak(),
+                            );
+                            return;
+                        }
+                        let mut on = sel[i][j];
+                        let resp = ui.checkbox(&mut on, tag);
+                        // 整行路径做成可选中的文本会把点击吃掉（和文件列表同一个坑），
+                        // 所以路径单独放一个不可选中的标签。
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(path.display().to_string())
+                                    .size(11.0)
+                                    .weak(),
+                            )
+                            .selectable(false),
+                        );
+                        if resp.changed() {
+                            sel[i][j] = on;
+                        }
+                    });
+                }
+            }
+        });
+
+    if !interactive {
+        return None;
+    }
+
+    let plan = crate::dupes_run::plan_delete(&f.groups, sel);
+    if plan.stale > 0 {
         ui.label(
             egui::RichText::new(format!(
-                "{} 组重复 · 每组留一个可省 {}",
-                f.groups.len(),
-                fmt_size(f.reclaimable())
+                "{} 项在扫描之后已经不在了，这次不会动它们。",
+                plan.stale
             ))
-            .strong(),
+            .color(warn),
         );
-        egui::ScrollArea::vertical()
-            .id_salt("dupes-groups")
-            .max_height(200.0)
-            .show(ui, |ui| {
-                for (i, g) in f.groups.iter().enumerate() {
-                    ui.label(format!(
-                        "第 {} 组：{} 个 × {}",
-                        i + 1,
-                        g.paths.len(),
-                        fmt_size(g.size)
-                    ));
-                    for path in &g.paths {
-                        ui.label(
-                            egui::RichText::new(format!("    {}", path.display()))
-                                .size(11.0)
-                                .weak(),
-                        );
-                    }
-                }
-            });
+    }
+    if plan.emptied_groups > 0 {
         ui.label(
-            egui::RichText::new(
-                "这里只列清单，不删文件。要删请回到列表里选中后用「删除」（走回收站）。",
-            )
-            .size(12.0)
-            .weak(),
+            egui::RichText::new(format!(
+                "注意：有 {} 组被勾空了，一份都不剩。",
+                plan.emptied_groups
+            ))
+            .color(warn),
         );
+    }
+    ui.horizontal(|ui| {
+        let del = ui.add_enabled_ui(can_delete && !plan.paths.is_empty(), |ui| {
+            ui.button(format!("删除勾选的 {} 个（进回收站）", plan.paths.len()))
+        });
+        if del.inner.clicked() {
+            want_delete = true;
+        }
+        if !can_delete {
+            ui.label(
+                egui::RichText::new("当前卷删不了（只读或不是本地卷），清单照常看。")
+                    .size(12.0)
+                    .weak(),
+            );
+        }
+        if ui.button("全部保留（不勾）").clicked() {
+            for row in sel.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = false;
+                }
+            }
+        }
+    });
+    if want_delete {
+        Some(plan)
+    } else {
+        None
     }
 }
