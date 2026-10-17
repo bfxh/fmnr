@@ -10,6 +10,7 @@ mod preview;
 mod search;
 mod theme;
 mod tree;
+mod treemap;
 mod usage;
 
 fn main() -> eframe::Result<()> {

@@ -323,6 +323,11 @@ mod tests {
     }
 
     /// 真扫一个临时目录树：验证 jwalk 那条路真能把字节归到正确的桶。
+    ///
+    /// 其中 `top.len() == 2` 那一条同时钉住 treemap 的内存边界（docs/UI-REWORK.md §4）：
+    /// 这棵树里有 3 个目录，但只有 root 的**直接**子目录成桶。整棵树常驻是
+    /// `Node` 88 B × 条目数，340 万条目 ≈ 299 MB（docs/UI-NEXT.md §3.3 实测），
+    /// 所以"只保留当前层"不是省事的画法，是这张图能开的前提。
     #[test]
     fn scans_a_real_tree_and_bins_it() {
         let root = std::env::temp_dir().join("fmnr-usage-test-7c1b");

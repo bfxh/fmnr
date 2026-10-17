@@ -1941,39 +1941,41 @@ impl App {
                         u.visited,
                         fmt_size(u.total())
                     ));
-                    let total = u.total().max(1);
-                    // 纵向 `auto_shrink=true` + 一个 max_height：
-                    // 原来写的是 `[false, false]`，滚动区会**吃掉整窗剩余高度**，
-                    // 于是下面那一节（还有本来就在的提示）被顶到窗口外看不见——
-                    // 真跑一次才发现，编译和单测都不会报这种错。
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, true])
-                        .max_height(240.0)
-                        .show(ui, |ui| {
-                            if u.loose_bytes > 0 {
-                                bar(
-                                    ui,
-                                    "（这一层散落的文件）",
-                                    u.loose_bytes,
-                                    u.loose_bytes as f64 / total as f64,
-                                    0,
-                                    false,
-                                );
-                            }
-                            for b in u.sorted() {
-                                let frac = b.bytes as f64 / total as f64;
-                                if bar(ui, &b.name, b.bytes, frac, b.errors, !u.done) {
-                                    descend = Some(b.path.clone());
-                                }
-                            }
+                    let mut cells: Vec<TreCell> = Vec::with_capacity(u.buckets.len() + 1);
+                    if u.loose_bytes > 0 {
+                        cells.push(TreCell {
+                            label: "（这一层散落的文件）".to_string(),
+                            bytes: u.loose_bytes,
+                            entries: 0,
+                            errors: 0,
+                            descend: None,
                         });
+                    }
+                    for b in u.sorted() {
+                        cells.push(TreCell {
+                            label: b.name.clone(),
+                            bytes: b.bytes,
+                            entries: b.entries,
+                            errors: b.errors,
+                            descend: Some(b.path.clone()),
+                        });
+                    }
+                    let (into, copied) = treemap_view(ui, &cells, 260.0);
+                    if let Some(p) = into {
+                        descend = Some(p);
+                    }
+                    if let Some(text) = copied {
+                        self.clipboard_text = Some(text.clone());
+                        self.status = format!("已复制 {text}");
+                    }
                 }
             }
             ui.separator();
             ui.label(
                 egui::RichText::new(
-                    "点一条进到那一层重算。这里只统计大小，不删任何东西；\
-                         没扫完之前数字是半截的，别当结论用。",
+                    "点一块进到那一层重算。这里只统计大小，不删任何东西；\
+                         没扫完之前数字是半截的，别当结论用。方块面积 = 占本层的比例，\
+                         挤不下名字的格子悬上去能看到它是谁。",
                 )
                 .size(12.0)
                 .weak(),
@@ -4177,55 +4179,138 @@ fn dock<F: FnOnce(&mut egui::Ui)>(
         .inner
 }
 
-/// 一根占比条。返回 `true` = 用户点它要下钻。
+/// treemap 上的一格。
+struct TreCell {
+    label: String,
+    bytes: u64,
+    entries: u64,
+    errors: u64,
+    /// `None` = 点不进去（"这一层的散落文件"不是一个目录）。
+    descend: Option<PathBuf>,
+}
+
+/// 方块底色：一组压低的浅色，按序号取模。
 ///
-/// 条长按**占本层的比例**，标签里同时给绝对值——只有比例的话
-/// "1% 但 40 GB"和"1% 但 400 MB"看起来一模一样，而那正是要分清的两种情况。
-fn bar(ui: &mut egui::Ui, name: &str, bytes: u64, frac: f64, errors: u64, partial: bool) -> bool {
-    let row_h = 22.0;
-    let w = ui.available_width().max(120.0);
-    let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(w, row_h));
-    let resp = ui.interact(
-        rect,
-        ui.id().with(("usage-bar", name)),
-        egui::Sense::click(),
+/// 没走 HSV 现算——这版 egui 没有 `Color32::from_hsv`，手搓换算会把
+/// "配色还是不是这套调子"变成一条运行时算式；写死色板跑没跑偏一眼看得见。
+const TREEMAP_TINTS: [[u8; 3]; 8] = [
+    [196, 219, 246], // 雾蓝
+    [206, 232, 208], // 薄荷
+    [245, 222, 179], // 麦
+    [232, 205, 224], // 藕
+    [214, 226, 190], // 苔
+    [241, 205, 200], // 砖粉
+    [203, 220, 232], // 天青
+    [228, 219, 200], // 米
+];
+
+fn treemap_fill(i: usize) -> Color32 {
+    let t = TREEMAP_TINTS[i % TREEMAP_TINTS.len()];
+    Color32::from_rgb(t[0], t[1], t[2])
+}
+
+/// 当前层的方块图。返回 `(点进去的目录, 要写进系统剪贴板的路径)`。
+///
+/// **只铺当前层**是刻意的边界：整棵树常驻是 `Node` 88 B × 条目数，
+/// 340 万条目 ≈ 299 MB（docs/UI-NEXT.md §3.3 实测），那不是一个文件管理器
+/// 该占的。点一块进到那一层重扫，内存就只跟"这一层有几个子目录"成正比。
+fn treemap_view(
+    ui: &mut egui::Ui,
+    cells: &[TreCell],
+    height: f32,
+) -> (Option<PathBuf>, Option<String>) {
+    let mut hit: Option<PathBuf> = None;
+    let mut copy: Option<String> = None;
+    let (rect, _frame) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::hover(),
     );
-    ui.painter()
-        .rect_filled(rect, 5.0, ui.visuals().faint_bg_color);
-    let fill_w = (rect.width() * frac.clamp(0.0, 1.0) as f32).max(2.0);
-    ui.painter().rect_filled(
-        egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, rect.height())),
-        5.0,
-        if resp.hovered() {
-            Color32::from_rgb(0, 102, 204)
-        } else {
-            Color32::from_rgb(0, 122, 255)
-        },
-    );
-    let mut label = format!("{name}  {}  {:.1}%", fmt_size(bytes), frac * 100.0);
-    if errors > 0 {
-        // 读不了的目录不能算成 0：那一支的真实大小只会比显示的更大
-        label.push_str(&format!("  （有 {errors} 处读不了，实际更大）"));
+    let weights: Vec<f64> = cells.iter().map(|c| c.bytes as f64).collect();
+    let total: f64 = weights.iter().sum();
+    if total <= 0.0 || rect.width() < 2.0 || rect.height() < 2.0 {
+        return (None, None);
     }
-    if partial {
-        label.push_str("  ·还在算");
+    let layout = crate::treemap::squarify(&weights, rect.width() as f64, rect.height() as f64);
+    let painter = ui.painter_at(rect);
+    let ink = Color32::from_rgb(30, 32, 38);
+    let err_color = ui.visuals().error_fg_color;
+    for (i, (c, cell)) in cells.iter().zip(layout.iter()).enumerate() {
+        let r = egui::Rect::from_min_size(
+            rect.min + egui::vec2(cell.x as f32, cell.y as f32),
+            egui::vec2(cell.w.max(0.0) as f32, cell.h.max(0.0) as f32),
+        );
+        if r.area() < 2.0 {
+            continue;
+        }
+        // 先 interact 再画：hover 高亮要读这一帧的悬停结论。
+        let resp = ui.interact(r, ui.id().with(("treemap", i)), egui::Sense::click());
+        let base = treemap_fill(i);
+        painter.rect_filled(
+            r.shrink(0.5),
+            2.0,
+            if resp.hovered() {
+                base.linear_multiply(1.12)
+            } else {
+                base
+            },
+        );
+        if c.errors > 0 {
+            // 读不了的那一支不能算成"就这么大"：真实只会更大，所以描一圈。
+            painter.rect_stroke(
+                r.shrink(0.5),
+                2.0,
+                egui::Stroke::new(1.5_f32, err_color),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let pct = c.bytes as f64 / total * 100.0;
+        if r.width() > 62.0 && r.height() > 30.0 {
+            let head = c.label.clone();
+            let sub = format!("{} · {pct:.1}%", fmt_size(c.bytes));
+            let g = painter.layout_no_wrap(head, egui::FontId::proportional(11.0), ink);
+            painter.galley(r.min + egui::vec2(6.0, 4.0), g, ink);
+            if r.height() > 44.0 {
+                let g2 = painter.layout_no_wrap(sub, egui::FontId::proportional(10.0), ink);
+                painter.galley(r.min + egui::vec2(6.0, 19.0), g2, ink);
+            }
+        }
+        // 小格子挤不下标签，但 hover 一定要说清它是谁——第 80 小的那块
+        // 只能靠这个读到。
+        let mut tip = format!(
+            "{}\n{} · {pct:.1}% · {} 个文件",
+            c.label,
+            fmt_size(c.bytes),
+            c.entries
+        );
+        if c.errors > 0 {
+            tip.push_str(&format!("\n这一支有 {} 个目录没读到，实际更大", c.errors));
+        }
+        if c.descend.is_none() {
+            tip.push_str("\n（散落文件，不在任何子目录里，点不进去）");
+        }
+        let resp = resp.on_hover_text(tip);
+        // 右键菜单：进到这一层 / 复制这个目录的路径。单击已经是"进去"，
+        // 但只想拿走路径的人不该被逼先进去再退出来。
+        let target = c.descend.clone();
+        let _ = resp.context_menu(|ui| {
+            let Some(t) = target.as_ref() else {
+                ui.label("散落文件不是一个目录，没有可进去的地方");
+                return;
+            };
+            if ui.button("进到这一层").clicked() {
+                hit = Some(t.clone());
+                ui.close_menu();
+            }
+            if ui.button("复制这个目录的路径").clicked() {
+                copy = Some(t.display().to_string());
+                ui.close_menu();
+            }
+        });
+        if c.descend.is_some() && resp.clicked() {
+            hit = c.descend.clone();
+        }
     }
-    // 标签左对齐画在条上。用 `ui.put` 会居中——它内部是
-    // `Layout::centered_and_justified`（egui 0.31 ui.rs 里写着），
-    // 而占比条的文字居中会盖住"条子有多长"这个信息本身。
-    // 只推进游标、不再 interact 一次：同一块矩形上挂两个身份会串 hover。
-    ui.advance_cursor_after_rect(rect);
-    let color = if frac > 0.35 {
-        Color32::WHITE
-    } else {
-        ui.visuals().text_color()
-    };
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label, egui::FontId::proportional(12.0), color);
-    ui.painter()
-        .galley(rect.min + egui::vec2(6.0, 4.0), galley, color);
-    resp.clicked()
+    (hit, copy)
 }
 
 /// 详情里的一行：没有值就干脆不写这行，不写"（无）"占满屏。
