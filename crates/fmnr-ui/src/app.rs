@@ -3204,14 +3204,22 @@ impl App {
             if let Some(volume) = self.current_volume() {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 let opts = self.opts();
+                // 特殊文件夹只挂本地卷的起点下面：归档/远程卷没有"用户桌面"可言，
+                // 而挂到别的层会让树里凭空长出指回本地磁盘的节点。
+                let root = self.volume_root();
+                let local = matches!(volume.kind(), fmnr_core::VolumeKind::Local);
+                let specials = if local { special_folders() } else { Vec::new() };
                 for path in pending {
-                    let level = match rt.block_on(volume.list(&VPath(path.clone()), &opts)) {
+                    let mut level = match rt.block_on(volume.list(&VPath(path.clone()), &opts)) {
                         Ok(entries) => crate::tree::level_of(&path, &entries),
                         Err(e) => crate::tree::Level {
                             dirs: Vec::new(),
                             error: Some(e.to_string()),
                         },
                     };
+                    if local && path == root {
+                        level = crate::tree::merge_specials(level, &specials);
+                    }
                     self.tree.put_level(&path, level);
                 }
             }
@@ -4006,6 +4014,30 @@ fn dirs_home() -> PathBuf {
         .or_else(|_| std::env::var("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// 特殊文件夹：稳定标签 + 真实路径。
+///
+/// 走 `dirs`（Windows 上读的是系统已知文件夹），不自己拼 `home\Downloads`：
+/// 这几个目录**常被重定向**（挪去 OneDrive 或 `D:\文档`），拼出来的路径
+/// 会指向一个不存在或不是用户那个文档库的目录。
+/// 拿不到的（精简系统/没配置）就不挂——宁可少四个节点，不要四个假的。
+fn special_folders() -> Vec<crate::tree::TreeDir> {
+    let mut out = Vec::new();
+    for (label, dir) in [
+        ("下载", dirs::download_dir()),
+        ("文档", dirs::document_dir()),
+        ("图片", dirs::picture_dir()),
+        ("桌面", dirs::desktop_dir()),
+    ] {
+        if let Some(p) = dir.filter(|p| p.is_dir()) {
+            out.push(crate::tree::TreeDir {
+                name: label.to_string(),
+                path: p,
+            });
+        }
+    }
+    out
 }
 
 /// 用户图标覆盖目录（`<config>/fmnr/icons`），不存在时 resolver 会静默跳过。

@@ -41,6 +41,33 @@ pub fn level_of(parent: &Path, entries: &[fmnr_core::Entry]) -> Level {
     Level { dirs, error: None }
 }
 
+/// 把「特殊文件夹」并进某一层的目录列表前面。
+///
+/// 用于把 下载/文档/图片/桌面 挂在起点目录下面：它们可能被系统重定向
+/// （实测常见的是被挪进 OneDrive），真实子目录名和稳定标签不是一回事，
+/// 所以标签由调用方给，这里只负责**按路径去重**——
+/// 同一个目录既出现在真实列举里、又出现在特殊清单里时，只留一份，
+/// 留着带标签的那份（用户认的是"下载"，不是 `OneDrive\文档` 这种路径）。
+pub fn merge_specials(mut level: Level, specials: &[TreeDir]) -> Level {
+    // 列失败的层原样退回：那里已经有一个红色标记要说"我读不到"，
+    // 再并四个指得准不准都不知道的节点进去，等于把错误盖成一份看起来正常的清单。
+    if level.error.is_some() {
+        return level;
+    }
+    // 带标签的那份排在最前，**保持调用方给的顺序**；同一个目录若在真实
+    // 列举里也出现（多数情况就是如此），从它原来的字母位摘掉。
+    // 留在字母位等于没挂——实测这个 home 下有一百多个点目录，`下载` 会被埋到看不见。
+    let mut dirs: Vec<TreeDir> = specials.to_vec();
+    dirs.extend(
+        level
+            .dirs
+            .into_iter()
+            .filter(|d| !specials.iter().any(|s| s.path == d.path)),
+    );
+    level.dirs = dirs;
+    level
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeDir {
     pub path: PathBuf,
@@ -205,6 +232,70 @@ mod tests {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.to_string()),
         }
+    }
+
+    /// 特殊文件夹并进起点那一层：一律插到最前，且同一目录不许出现两次。
+    #[test]
+    fn specials_are_prepended_but_never_duplicated() {
+        let level = Level {
+            dirs: vec![
+                dir("R:/a"),
+                TreeDir {
+                    path: PathBuf::from("R:/od"),
+                    name: "od".into(),
+                },
+            ],
+            error: None,
+        };
+        let merged = merge_specials(
+            level,
+            &[
+                TreeDir {
+                    path: PathBuf::from("R:/od"),
+                    name: "文档".into(),
+                },
+                TreeDir {
+                    path: PathBuf::from("R:/dl"),
+                    name: "下载".into(),
+                },
+            ],
+        );
+        let got: Vec<(String, String)> = merged
+            .dirs
+            .iter()
+            .map(|d| (d.name.clone(), d.path.to_string_lossy().to_string()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("文档".to_string(), "R:/od".to_string()),
+                ("下载".to_string(), "R:/dl".to_string()),
+                ("a".to_string(), "R:/a".to_string()),
+            ],
+            "实得 {got:?}"
+        );
+        // 同一个路径在结果里只能出现一次
+        let mut paths: Vec<_> = got.iter().map(|(_, p)| p.clone()).collect();
+        let n = paths.len();
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths.len(), n, "并进来了重复目录");
+    }
+
+    /// 起点目录列不出来（权限/卷掉了）时不许长出假节点：错误标记必须原样留着。
+    #[test]
+    fn merge_keeps_an_error_level_empty() {
+        let level = Level {
+            dirs: Vec::new(),
+            error: Some("拒绝访问".into()),
+        };
+        let merged = merge_specials(level, &[dir("R:/dl")]);
+        assert_eq!(merged.error.as_deref(), Some("拒绝访问"));
+        assert!(
+            merged.dirs.is_empty(),
+            "列失败的层不该被并进节点：{:?}",
+            merged.dirs
+        );
     }
 
     #[test]
