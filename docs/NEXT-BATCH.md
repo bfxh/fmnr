@@ -294,10 +294,12 @@ CI：`47a301a` 六个 job 全绿（双平台 + 插件行为 + 字节可复现 + 
 参数一律用相对路径——卷根就是各条腿自己的工作目录，所以返回体回显的 `path`
 与绝对路径无关，三条腿才可能字节级相等。
 
-**§6.2 MCP/HTTP 接多卷：没做。** 现在只有 CLI 会按路径前缀路由到归档/远程卷
-（`build_volume_registry` + `route_volume`），MCP server 与 HTTP router 各拿**一个**卷。
-所以"从 MCP 读压缩包里的文件"今天仍然做不到——这是覆盖问题，不是协议问题，
-但它不在本轮已完成的那一半里，别把它记成已完成。
+**§6.2 MCP/HTTP 接多卷：规则已统一，接线卡在依赖决定（见 §17）。**
+当时只有 CLI 会按路径前缀路由到归档/远程卷（`build_volume_registry` + `route_volume`），
+MCP server 与 HTTP router 各拿**一个**卷，所以"从 MCP 读压缩包里的文件"做不到。
+路由规则后来（2026-10-17）已提到 `fmnr-core::volreg`（`route_for` / `route_for_args` /
+`path_samples`），CLI 改成调用它，本地那份删了——三个入口从此共用一份规则。
+**剩下的是"谁来填这个注册表"**，那是一条依赖决定，不是接线工作量，见 §17。
 
 **顺带钉住的一条安全边界**：三条写路径在 `volume.writable() == false` 时
 先拒再落盘，错误走 `Error::Unsupported → to_rpc`，与 `copy`/`delete` 同一条映射
@@ -321,3 +323,30 @@ MCP 客户端会当成服务端故障而重试。要不要给一个可辨的码�
 上一版脚本对第 5 步用 `--workspace`，我删掉 `target/x86_64-unknown-linux-gnu` 之后
 它就从"绿"变成了"环境判红"——**缓存能掩盖环境缺口**。所以分档必须显式列包名，
 不能靠"上次它过了"。
+
+## 17. §6.2 剩下的不是工作量，是一个依赖决定（要你拍）
+
+路由规则已经统一（见 §11 的更新）。但 MCP/HTTP 要**真的**看到归档卷，
+`fmnr-ai` 必须能把一个 zip 挂成卷，而挂卷的代码在 `fmnr-mount` →
+`fmnr-archive`（`zstd-sys`）与 `fmnr-remote`（`ring`）——**两个都要跨端 C 编译器**。
+
+代价是可测量的，不是"稍微重一点"：
+- `fmnr-ai` 一旦吃到这两个依赖，它的 linux 交叉编译就和本机 `fmnr-ui`/`fmnr-cli` 一样
+  **过不了门禁第 5 步**（本机没有 `x86_64-linux-gnu-gcc`）⇒ MCP 那一层的
+  "非 Windows 才出现的错"从此只能等 CI 判红。今天 `fmnr-ai` 是**在**可覆盖面清单里的。
+- MCP server 二进制要带上 zstd + ring 的编译产物；`Cargo.lock` 里 `ring` 目前
+  只经 `fmnr-remote` 进来，MCP 用户（很多是 AI 客户端，只想列个目录）会跟着背。
+
+三条路，按代价排：
+1. **注入式（不加依赖）**：`fmnr-ai` 的 `Server`/`router` 收一个
+   `Arc<VolumeRegistry>`（类型在 `fmnr-core`，零新依赖），谁起服务谁填表。
+   今天的 `fmnr-ai` 可执行文件仍是单卷；要多卷就从**已经有多卷的那个进程**
+   （UI，或以后带 `--mount` 的 CLI 常驻模式）里起服务。半天，无代价，但"独立跑个 MCP server 就能读 zip"仍然做不到。
+2. **只加归档、不加远程** —— ❌ **量过了，省不掉**：
+   `cargo tree -p fmnr-archive --target x86_64-unknown-linux-gnu -i zstd-sys` 给出
+   `zstd-sys ← zstd-safe ← zstd ← zip 9.0.3 ← fmnr-archive`，是**必经链**，
+   不是可选 feature。⇒ 这条与第 3 条同代价，划掉。
+3. **全都要**：MCP/HTTP 与 CLI 一样能挂任意卷。代价就是上面那两条（可覆盖面 + 二进制）。
+
+我的建议是 **1 先做**（它把"三个入口共用一份规则"这件事从"规则"推到"进程"，
+而且不动依赖树），2/3 等你说值不值那半条门禁覆盖面。

@@ -361,45 +361,6 @@ fn plan_to_json(plan: &fmnr_fs::assoc::RegistrationPlan) -> Value {
     })
 }
 
-/// 从工具 args 里挑出可能携带卷前缀的路径样本，用于卷路由。
-///
-/// `list_dir` 用 path、`search` 用 root、`copy` 用 sources/dest_dir——
-/// 逐个字段枚举而不是反射：JSON 里还可能有无关字符串，全量扫描会误路由。
-fn path_samples(args: &Value) -> Vec<String> {
-    let mut out = Vec::new();
-    for k in ["path", "root", "dest_dir", "to"] {
-        if let Some(s) = args.get(k).and_then(|v| v.as_str()) {
-            out.push(s.to_string());
-        }
-    }
-    if let Some(arr) = args.get("sources").and_then(|v| v.as_array()) {
-        out.extend(arr.iter().filter_map(|v| v.as_str().map(str::to_string)));
-    }
-    out
-}
-
-/// 卷路由：按最长 id 前缀把 args 里的路径样本对到注册表里的卷。
-///
-/// 归档卷的 VPath 形如 `archive:/abs/a.zip/sub`（id = `archive:/abs/a.zip`），
-/// 只把本地卷塞给 dispatch 会让归档路径被当成本地路径拼接，
-/// 撞出 os error 123（路径语法不正确）。路由失败回退默认卷，
-/// 行为与之前一致，不会让老命令变红。
-fn route_volume(
-    registry: &VolumeRegistry,
-    args: &Value,
-) -> Option<std::sync::Arc<dyn fmnr_core::Volume>> {
-    let ids: Vec<fmnr_core::VolumeId> = registry.list().into_iter().map(|v| v.id).collect();
-    let mut best: Option<fmnr_core::VolumeId> = None;
-    for s in path_samples(args) {
-        for id in &ids {
-            if s.starts_with(&id.0) && best.as_ref().is_none_or(|b| id.0.len() > b.0.len()) {
-                best = Some(id.clone());
-            }
-        }
-    }
-    best.and_then(|id| registry.get(&id))
-}
-
 fn run_tool(tool: &'static str, args: Value) {
     let (registry, mount_failures) = build_volume_registry();
 
@@ -445,7 +406,7 @@ fn run_tool(tool: &'static str, args: Value) {
             return;
         }
         // 卷路由：路径带 archive:/wsl: 等前缀时切到对应卷，否则用默认卷。
-        _ => route_volume(&registry, &args).unwrap_or(default_volume),
+        _ => registry.route_for_args(&args).unwrap_or(default_volume),
     };
 
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -604,31 +565,5 @@ mod tests {
         let names: Vec<&str> = tools::specs().iter().map(|s| s.name).collect();
         assert!(!names.contains(&"register"), "register 不该是 MCP 工具");
         assert!(!names.contains(&"unregister"), "unregister 不该是 MCP 工具");
-    }
-    /// 卷路由：路径样本只从已知字段取，且按**最长** id 前缀匹配。
-    ///
-    /// 路由错了不会报错，只会静默走错卷（表现为莫名的 NotFound），
-    /// 所以这里把两个易错点都钉死：字段名单，与前缀优先级。
-    #[test]
-    fn path_samples_reads_only_known_fields() {
-        let args = json!({
-            "path": "archive:D:/x.zip/a",
-            "root": "archive:D:/x.zip",
-            "sources": ["a.txt", "archive:D:/x.zip/b"],
-            "query": "archive:D:/x.zip",
-        });
-        let got = path_samples(&args);
-        assert!(got.contains(&"archive:D:/x.zip/a".to_string()));
-        assert!(got.contains(&"archive:D:/x.zip/b".to_string()));
-        assert!(
-            !got.contains(&"archive:D:/x.zip".to_string())
-                || got.iter().filter(|s| *s == "archive:D:/x.zip").count() >= 1,
-            "root 是路径字段，应当被收进来"
-        );
-        // query 不是路径：混进来会让搜索词意外命中卷前缀。
-        assert!(
-            !got.contains(&"query".to_string()),
-            "非路径字段不该进样本：{got:?}"
-        );
     }
 }

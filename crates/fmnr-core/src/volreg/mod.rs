@@ -77,6 +77,47 @@ impl VolumeRegistry {
     pub fn clear(&self) {
         *self.map.write().unwrap() = Vec::new();
     }
+
+    /// 按「参数里出现的路径」挑卷：谁的 id 前缀匹配得最长就用谁。
+    ///
+    /// 这条规则原来长在 CLI 里。提到这里是因为它必须**三个入口共用一份**：
+    /// 每个客户端各写一遍，迟早出现"CLI 能读包内文件、MCP 说找不到"，
+    /// 而那种分叉看起来像某个入口坏了，实际是两份规则漂移了。
+    /// 匹配不到返回 None，由调用方回退默认卷（行为与单卷时代一致）。
+    pub fn route_for(&self, samples: &[String]) -> Option<Arc<dyn Volume>> {
+        let ids: Vec<VolumeId> = self.list().into_iter().map(|v| v.id).collect();
+        let mut best: Option<VolumeId> = None;
+        for s in samples {
+            for id in &ids {
+                if s.starts_with(&id.0) && best.as_ref().is_none_or(|b| id.0.len() > b.0.len()) {
+                    best = Some(id.clone());
+                }
+            }
+        }
+        best.and_then(|id| self.get(&id))
+    }
+
+    /// 直接从工具参数 JSON 路由（字段名单一见 [`path_samples`]）。
+    pub fn route_for_args(&self, args: &serde_json::Value) -> Option<Arc<dyn Volume>> {
+        self.route_for(&path_samples(args))
+    }
+}
+
+/// 工具参数里"哪些字段是路径"的**唯一**清单。
+///
+/// 只认已知字段名，不递归猜：拼错字段（`srcs` 写成 `source`）时应当
+/// 回退默认卷并让调用方看见，而不是被当成路径样本路由到莫名其妙的卷上。
+pub fn path_samples(args: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for k in ["path", "root", "dest_dir", "to", "from"] {
+        if let Some(s) = args.get(k).and_then(|v| v.as_str()) {
+            out.push(s.to_string());
+        }
+    }
+    if let Some(arr) = args.get("sources").and_then(|v| v.as_array()) {
+        out.extend(arr.iter().filter_map(|v| v.as_str().map(str::to_string)));
+    }
+    out
 }
 
 /// 一个「卷来源」的对外描述：挂载尝试的结果。
@@ -256,5 +297,75 @@ mod tests {
         assert_eq!(info.kind, crate::VolumeKind::Archive);
         assert!(info.writable, "DummyVol 自报可写，这里断言字段被如实透传");
         assert!(!info.note.is_empty(), "归档卷应有说明文案");
+    }
+
+    fn dummy(id: &str) -> Arc<DummyVol> {
+        Arc::new(DummyVol {
+            id: VolumeId(id.into()),
+            kind: crate::VolumeKind::Local,
+            entries: Vec::new(),
+        })
+    }
+
+    /// 卷路由的两个易错点之一：**最长 id 前缀**优先。
+    /// 选错卷不报错，只会静默走错（表现为莫名的 NotFound），所以钉死。
+    #[test]
+    fn route_picks_the_longest_matching_volume_id() {
+        let reg = VolumeRegistry::new();
+        reg.add(dummy("archive:D:/x.zip"));
+        reg.add(dummy("archive:D:/x.zip/deep.zip"));
+        reg.add(dummy("local:C:"));
+        let got = reg
+            .route_for(&["archive:D:/x.zip/deep.zip/a/b".to_string()])
+            .expect("应当命中某个卷");
+        assert_eq!(got.id().0, "archive:D:/x.zip/deep.zip");
+        let got2 = reg
+            .route_for(&["archive:D:/x.zip/top.txt".to_string()])
+            .expect("应当命中某个卷");
+        assert_eq!(got2.id().0, "archive:D:/x.zip");
+    }
+
+    /// 谁都不匹配时返回 None，让调用方回退默认卷——
+    /// 直接报错会让"没挂归档卷"的普通用法变红。
+    #[test]
+    fn route_returns_none_when_nothing_matches() {
+        let reg = VolumeRegistry::new();
+        reg.add(dummy("local:C:"));
+        assert!(reg.route_for(&["D:/elsewhere".to_string()]).is_none());
+        assert!(reg.route_for(&[]).is_none());
+    }
+
+    /// 另一个易错点：**只认已知路径字段**。
+    /// 搜索词混进样本会让一个跟卷无关的 query 意外决定走哪个卷。
+    #[test]
+    fn path_samples_reads_only_known_fields() {
+        let args = serde_json::json!({
+            "path": "archive:D:/x.zip/a",
+            "root": "archive:D:/x.zip",
+            "from": "archive:D:/x.zip/b",
+            "sources": ["a.txt", "archive:D:/x.zip/c"],
+            "query": "archive:D:/x.zip",
+            "note": "archive:D:/x.zip",
+        });
+        let got = path_samples(&args);
+        for want in [
+            "archive:D:/x.zip/a",
+            "archive:D:/x.zip",
+            "archive:D:/x.zip/b",
+            "archive:D:/x.zip/c",
+            "a.txt",
+        ] {
+            assert!(
+                got.iter().any(|s| s == want),
+                "{want} 应当是样本，实得 {got:?}"
+            );
+        }
+        // query/note 的值换成不像路径的串再断一次：
+        // 上面那条 "archive:D:/x.zip" 恰好与 root 同值，单独看它判不出有没有混进来。
+        let noisy = serde_json::json!({"query": "hello world", "note": "hello world", "path": "p"});
+        assert!(
+            !path_samples(&noisy).iter().any(|s| s == "hello world"),
+            "非路径字段不该进样本：{noisy:?}"
+        );
     }
 }
