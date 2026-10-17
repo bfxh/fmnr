@@ -144,6 +144,30 @@ async fn copy_over_http_moves_bytes_on_disk() {
 }
 
 /// 参数错误 → 400（不是 500）。客户端要能靠状态码区分「我写错了」和「服务炸了」。
+/// HTTP 这条腿也必须**经过注册表**：空表时要说"没有已挂载的卷"，
+/// 而不是回一个空清单（那会被读成"这个目录是空的"）。
+/// 这条同时证明 `router_of` 这条路是活的——如果哪天它退回持有单个卷，
+/// 这里就会拿到别的回答。
+#[tokio::test]
+async fn empty_registry_says_so_over_http() {
+    let reg = fmnr_core::volreg::VolumeRegistry::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = fmnr_ai::http::router_of(std::sync::Arc::new(reg));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let (status, body) = request(port, "POST", "/tool/list_dir", Some(r#"{"path":"."}"#)).await;
+    assert_eq!(
+        status, 500,
+        "空注册表应当是服务端错误，实得 {status} / {body}"
+    );
+    assert!(
+        body.contains("没有已挂载的卷"),
+        "文案要说清是没卷，而不是假装列出空目录：{body}"
+    );
+}
+
 #[tokio::test]
 async fn bad_params_are_400_not_500() {
     let fx = Fixture::new("badparam");

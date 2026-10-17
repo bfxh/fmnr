@@ -101,6 +101,20 @@ impl VolumeRegistry {
     pub fn route_for_args(&self, args: &serde_json::Value) -> Option<Arc<dyn Volume>> {
         self.route_for(&path_samples(args))
     }
+
+    /// 路由不上时的兜底卷：注册表里的第一个。
+    ///
+    /// **不硬编码 id**：`LocalVolume::new(cwd)` 自生的 id 是 `local:<绝对路径>`，
+    /// 写死 `local:.` 永远查不到，只能靠这条兜底新建卷——那注册表就白建了。
+    pub fn default_volume(&self) -> Option<Arc<dyn Volume>> {
+        self.map.read().unwrap().first().cloned()
+    }
+
+    /// 「按参数选卷，选不上回退默认卷」。三个入口都该只调这一个：
+    /// 分开写就会有人忘了兜底（空表时 panic）或忘了路由（归档路径被当本地路径拼）。
+    pub fn route_or_default(&self, args: &serde_json::Value) -> Option<Arc<dyn Volume>> {
+        self.route_for_args(args).or_else(|| self.default_volume())
+    }
 }
 
 /// 工具参数里"哪些字段是路径"的**唯一**清单。

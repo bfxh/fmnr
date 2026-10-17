@@ -38,6 +38,22 @@ impl LocalVolume {
     }
 
     fn resolve(&self, path: &VPath) -> PathBuf {
+        // 认 `local:C:\Users\x\file` 这种**带卷名前缀**的写法：客户端从 `list_volume`
+        // 看到的是 `local:<根>`，照着它拼路径是最自然的，而归档卷早就认这种形式
+        // （`fmnr-archive` 的 `key_of` 会剥掉 `archive:`）。不认的话注册表就是个
+        // 接不通的插座——路由能选出卷，卷却读不懂这条路径。
+        // 只在剥完前缀剩下**绝对路径**时才认：否则 `local:notes.txt` 这种
+        // 真存在的相对写法会被误当成卷名。
+        if let Some(rest) = path
+            .0
+            .to_string_lossy()
+            .strip_prefix("local:")
+            .map(PathBuf::from)
+        {
+            if rest.is_absolute() {
+                return rest;
+            }
+        }
         if path.0.is_absolute() {
             path.0.clone()
         } else if let Some(rooted) = root_drive_relative(&path.0) {
@@ -633,6 +649,28 @@ pub fn search(
 #[cfg(test)]
 mod path_tests {
     use super::*;
+
+    /// `local:<绝对路径>` 这种**带卷名前缀**的写法必须认：
+    /// 客户端从 `list_volume` 看到的就是 `local:<根>`，照着它拼路径最自然，
+    /// 而归档卷早就认 `archive:` 前缀（`key_of`）。不认的话注册表就是个接不通的插座。
+    #[test]
+    fn qualified_local_path_is_accepted() {
+        let root = std::env::temp_dir().join(format!("fmnr-qual-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("marker.txt"), b"x").unwrap();
+        let vol = LocalVolume::new(&root);
+        // 限定写法与裸绝对路径必须落到同一个地方
+        let qualified = vol.resolve(&VPath(PathBuf::from(format!("local:{}", root.display()))));
+        assert_eq!(qualified, root, "限定写法没剥干净：{qualified:?}");
+        // 但 `local:notes.txt` 这种**相对**写法不该被误当成卷名
+        let rel = vol.resolve(&VPath(PathBuf::from("local:notes.txt")));
+        assert_eq!(
+            rel,
+            root.join("local:notes.txt"),
+            "相对写法被误改了：{rel:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[cfg(windows)]
     fn opts() -> ListOpts {

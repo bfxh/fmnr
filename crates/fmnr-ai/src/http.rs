@@ -18,19 +18,29 @@ use std::sync::Arc;
 use crate::protocol::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 use crate::tools;
 
-/// 共享状态：卷。`Arc<dyn Volume>` 与 MCP server 用的是同一个类型。
+/// 共享状态：卷**注册表**。与 MCP server 持的是同一个类型，
+/// 所以"哪些卷看得见"这件事两个入口不会给出不同答案。
 #[derive(Clone)]
 pub struct AppState {
-    pub volume: Arc<dyn Volume>,
+    pub registry: Arc<fmnr_core::volreg::VolumeRegistry>,
 }
 
-/// 建路由。测试可以直接拿它配 `axum::serve`，不必走 `run`。
+/// 建路由（单卷）。测试与"只有一个本地卷"的老调用方用这个。
 pub fn router(volume: Arc<dyn Volume>) -> Router {
+    let registry = fmnr_core::volreg::VolumeRegistry::new();
+    registry.add(volume);
+    router_of(Arc::new(registry))
+}
+
+/// 建路由（带注册表）：要让更多卷被 HTTP 客户端看到，调用方挂好再交进来。
+/// 与 MCP 侧同理，这里不自己去挂归档/远程卷——那会把跨端 C 依赖拽进本 crate，
+/// 取舍见 `docs/NEXT-BATCH.md` §17。
+pub fn router_of(registry: Arc<fmnr_core::volreg::VolumeRegistry>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/tools", get(list_tools))
         .route("/tool/{name}", post(call_tool))
-        .with_state(AppState { volume })
+        .with_state(AppState { registry })
 }
 
 async fn health() -> Json<Value> {
@@ -59,7 +69,18 @@ async fn call_tool(
     body: Option<Json<Value>>,
 ) -> Response {
     let args = body.map(|Json(v)| v).unwrap_or(json!({}));
-    match tools::dispatch_payload(Arc::clone(&state.volume), &name, args).await {
+    // 与 MCP 同一条选卷规则：按参数前缀路由，选不上回退注册表第一个。
+    let Some(volume) = state.registry.route_or_default(&args) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "没有已挂载的卷：注册表是空的",
+                "code": INTERNAL_ERROR
+            })),
+        )
+            .into_response();
+    };
+    match tools::dispatch_payload(volume, &name, args).await {
         Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
         Err(e) => {
             // JSON-RPC 错误码 → HTTP 状态码。别一律 500：
@@ -97,10 +118,20 @@ pub fn bind_addr(host: &str, port: u16, allow_remote: bool) -> Result<String, St
     Ok(format!("{h}:{port}"))
 }
 
-/// 起服务并阻塞。`addr` 形如 `127.0.0.1:8787`。
+/// 起服务并阻塞（单卷）。`addr` 形如 `127.0.0.1:8787`。
 pub async fn run(volume: Arc<dyn Volume>, addr: &str) -> std::io::Result<()> {
+    let registry = fmnr_core::volreg::VolumeRegistry::new();
+    registry.add(volume);
+    run_of(Arc::new(registry), addr).await
+}
+
+/// 起服务并阻塞（带注册表）。
+pub async fn run_of(
+    registry: Arc<fmnr_core::volreg::VolumeRegistry>,
+    addr: &str,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router(volume)).await
+    axum::serve(listener, router_of(registry)).await
 }
 
 #[cfg(test)]

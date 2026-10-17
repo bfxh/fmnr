@@ -7,6 +7,7 @@
 //! - **stdout 只走协议**。任何日志/调试输出必须去 stderr，否则会污染报文流。
 //! - 一行一帧；读到 EOF 就干净退出（客户端关管道即结束）。
 
+use fmnr_core::volreg::VolumeRegistry;
 use fmnr_core::Volume;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -19,16 +20,28 @@ use crate::tools;
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
 pub struct Server {
-    volume: Arc<dyn Volume>,
+    /// 卷**注册表**而不是单个卷：谁起这个服务谁往里填，填几个就能路由几个。
+    /// 路由规则在 `fmnr-core::volreg`，与 CLI 共用一份（见那里的 `route_or_default`）。
+    registry: Arc<VolumeRegistry>,
     /// 客户端在 initialize 里报的版本，原样回给 tools/list 之后的分支判断。
     client_version: Option<String>,
     initialized: bool,
 }
 
 impl Server {
+    /// 单卷起服务（老调用方与测试用）。
     pub fn new(volume: Arc<dyn Volume>) -> Self {
+        let registry = VolumeRegistry::new();
+        registry.add(volume);
+        Self::with_registry(Arc::new(registry))
+    }
+
+    /// 带注册表起服务：要让更多卷被看见，调用方自己挂好再交进来。
+    /// 这里刻意**不**自己去挂归档/远程卷——那会把 `zstd-sys`/`ring` 的跨端 C 依赖
+    /// 拽进 MCP server，代价与取舍写在 `docs/NEXT-BATCH.md` §17。
+    pub fn with_registry(registry: Arc<VolumeRegistry>) -> Self {
         Self {
-            volume,
+            registry,
             client_version: None,
             initialized: false,
         }
@@ -104,7 +117,12 @@ impl Server {
                     .ok_or_else(|| RpcError::new(INVALID_PARAMS, "缺少 tools/call 的 name"))?
                     .to_string();
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                tools::dispatch(Arc::clone(&self.volume), &name, args).await
+                // 按参数选卷，选不上回退注册表里的第一个（规则与 CLI 同一份）。
+                let volume = self
+                    .registry
+                    .route_or_default(&args)
+                    .ok_or_else(|| RpcError::new(INTERNAL_ERROR, "没有已挂载的卷：注册表是空的"))?;
+                tools::dispatch(volume, &name, args).await
             }
 
             other => Err(RpcError::new(
@@ -192,10 +210,222 @@ fn write_frame<W: Write>(out: &mut W, resp: &Response) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fmnr_core::VolumeId;
     use fmnr_fs::LocalVolume;
 
     fn server() -> Server {
         Server::new(Arc::new(LocalVolume::new(std::env::temp_dir())))
+    }
+
+    /// **注册表路由**：路径带着第二个卷的 id 前缀时，必须真的把这次调用交给
+    /// 第二个卷，而不是回退到"注册表第一个"。
+    ///
+    /// 为什么用探针卷而不是两个本地卷：`LocalVolume` 本来就接受绝对路径，
+    /// 所以"走错卷"在本地卷之间**看不出差别**——第一版这条测试就是这么假绿的
+    /// （把路由整个摘掉它照样过）。探针卷的 `list` 各自回一个只有它自己有的
+    /// 标记名，选错卷立刻显形。
+    #[tokio::test]
+    async fn tools_call_routes_to_the_matching_volume_not_the_first_one() {
+        let reg = VolumeRegistry::new();
+        let id_a = reg.add(Arc::new(ProbeVol::new("probe:alpha")));
+        let id_b = reg.add(Arc::new(ProbeVol::new("probe:beta")));
+        assert_ne!(id_a, id_b, "两个探针卷必须有不同 id，否则这条测试没有判据");
+        let mut s = Server::with_registry(Arc::new(reg));
+
+        let input = format!(
+            "{}\n{}\n{}\n{}\n",
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":PROTOCOL_VERSION,"capabilities":{},
+                "clientInfo":{"name":"t","version":"1"}}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name":"list_dir","arguments":{"path": format!("{}/inner", id_a.0)}}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"list_dir","arguments":{"path": format!("{}/inner", id_b.0)}}}),
+        );
+        let got = frames(&mut s, &input).await;
+        let marker = |id: i64| -> String {
+            let text = got
+                .iter()
+                .find(|f| f["id"] == json!(id))
+                .unwrap_or_else(|| panic!("没拿到 id={id} 的回帧：{got:?}"))
+                .pointer("/result/content/0/text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("id={id} 没有 text 载荷：{got:?}"))
+                .to_string();
+            let v: Value = serde_json::from_str(&text).unwrap();
+            v["entries"][0]["name"]
+                .as_str()
+                .unwrap_or("<空>")
+                .to_string()
+        };
+        assert_eq!(marker(2), "来自-alpha", "第 2 帧走错卷");
+        assert_eq!(marker(3), "来自-beta", "第 3 帧走错卷");
+    }
+
+    /// 注册表空着时必须说"没有已挂载的卷"，而不是 panic 或回一个空清单
+    /// （空清单会被客户端读成"这个目录是空的"）。
+    #[tokio::test]
+    async fn empty_registry_says_so_instead_of_listing_nothing() {
+        let mut s = Server::with_registry(Arc::new(VolumeRegistry::new()));
+        let got = frames(
+            &mut s,
+            &format!(
+                "{}\n{}\n",
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":PROTOCOL_VERSION,"capabilities":{},
+                    "clientInfo":{"name":"t","version":"1"}}}),
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                    "name":"list_dir","arguments":{"path":"."}}}),
+            ),
+        )
+        .await;
+        let err = got
+            .iter()
+            .find(|f| f["id"] == json!(2))
+            .and_then(|f| f.get("error"))
+            .unwrap_or_else(|| panic!("空注册表应当报错，实得 {got:?}"));
+        assert!(
+            err["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("没有已挂载的卷"),
+            "错误文案要说清是没卷：{err}"
+        );
+    }
+
+    /// 只实现这条测试要用的 `id`/`list`，其余一律 panic：
+    /// 一旦哪天 `tools/call` 走了别的方法，这里会立刻炸出来，
+    /// 比默默给个假实现更容易看清测试在测什么。
+    struct ProbeVol {
+        id: VolumeId,
+        marker: &'static str,
+        opens: fmnr_core::ExternalOpens,
+    }
+
+    impl ProbeVol {
+        fn new(id: &str) -> Self {
+            let marker = if id.ends_with("alpha") {
+                "来自-alpha"
+            } else {
+                "来自-beta"
+            };
+            Self {
+                id: VolumeId(id.into()),
+                marker,
+                opens: fmnr_core::ExternalOpens::new(),
+            }
+        }
+        fn nope(&self) -> ! {
+            panic!("探针卷不该被问到这个方法（说明测试走偏了）");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Volume for ProbeVol {
+        fn id(&self) -> VolumeId {
+            self.id.clone()
+        }
+        fn kind(&self) -> fmnr_core::VolumeKind {
+            fmnr_core::VolumeKind::Local
+        }
+        async fn list(
+            &self,
+            _path: &fmnr_core::VPath,
+            _opts: &fmnr_core::ListOpts,
+        ) -> fmnr_core::Result<Vec<fmnr_core::Entry>> {
+            Ok(vec![fmnr_core::Entry {
+                name: self.marker.to_string(),
+                is_dir: false,
+                size: Some(1),
+                modified: None,
+                icon_key: fmnr_core::IconKey::Generic,
+                attrs: Vec::new(),
+            }])
+        }
+        async fn read_stream(
+            &self,
+            _: &fmnr_core::VPath,
+        ) -> fmnr_core::Result<
+            Box<dyn futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + Unpin>,
+        > {
+            self.nope()
+        }
+        async fn write(&self, _: &fmnr_core::VPath, _: &[u8]) -> fmnr_core::Result<()> {
+            self.nope()
+        }
+        fn writable(&self) -> bool {
+            false
+        }
+        fn native_path(&self, _: &fmnr_core::VPath) -> Option<std::path::PathBuf> {
+            None
+        }
+        async fn spawn_external_open(
+            &self,
+            _: &fmnr_core::VPath,
+            _: &str,
+        ) -> fmnr_core::Result<fmnr_core::ExternalOpen> {
+            self.nope()
+        }
+        fn external_opens(&self) -> &fmnr_core::ExternalOpens {
+            &self.opens
+        }
+        async fn copy(
+            &self,
+            _: &[fmnr_core::VPath],
+            _: &fmnr_core::VPath,
+            _: fmnr_core::ConflictPolicy,
+            _: Arc<fmnr_core::Progress>,
+        ) -> fmnr_core::Result<fmnr_core::OpReport> {
+            self.nope()
+        }
+        async fn move_entries(
+            &self,
+            _: &[fmnr_core::VPath],
+            _: &fmnr_core::VPath,
+            _: fmnr_core::ConflictPolicy,
+            _: Arc<fmnr_core::Progress>,
+        ) -> fmnr_core::Result<fmnr_core::OpReport> {
+            self.nope()
+        }
+        async fn delete(
+            &self,
+            _: &[fmnr_core::VPath],
+            _: Arc<fmnr_core::Progress>,
+        ) -> fmnr_core::Result<fmnr_core::OpReport> {
+            self.nope()
+        }
+        async fn rename(
+            &self,
+            _: &fmnr_core::VPath,
+            _: &fmnr_core::VPath,
+        ) -> fmnr_core::Result<()> {
+            self.nope()
+        }
+        async fn create_dir(&self, _: &fmnr_core::VPath) -> fmnr_core::Result<()> {
+            self.nope()
+        }
+        async fn search(
+            &self,
+            _: &fmnr_core::VPath,
+            _: String,
+            _: usize,
+        ) -> fmnr_core::Result<Vec<fmnr_core::VPath>> {
+            self.nope()
+        }
+    }
+
+    /// 用内存管道喂给**指定**服务端一串报文，收集所有回帧。
+    async fn frames(s: &mut Server, input: &str) -> Vec<Value> {
+        let mut out = Vec::new();
+        s.serve(std::io::Cursor::new(input.as_bytes().to_vec()), &mut out)
+            .await
+            .unwrap();
+        String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("回帧必须是合法 JSON"))
+            .collect()
     }
 
     /// 用内存管道喂一串报文，收集所有回帧。
