@@ -586,13 +586,21 @@ impl App {
         self.navigate(which, target);
     }
 
-    /// 卷的起点路径。与 `switch_volume` 里那套一致：
-    /// 本地/WSL 卷从 home 起步，归档等虚拟卷没有 home，从卷根（空路径）开始。
+    /// 当前卷的起点路径 = **这个卷自己的根**，不是 home。
+    ///
+    /// 原来对 Local 卷一律回 `dirs_home()`：只有"本地↔归档↔WSL"三种卷时看不出来
+    /// （本地卷就是 home 那块盘），但侧栏能点 D:\ 之后，点一块盘却把人送到
+    /// `C:\Users\…`。归档/远程/WSL 卷没有 home 概念，照旧从卷根（空路径）开始。
+    ///
+    /// 两栏的起点和树的根**共用这一个函数**：各算一遍就会分叉，而分叉长出来的样子
+    /// 正是"两栏已经在 E:\，侧栏还长在 home 上"（UI-REWORK §1b 实测到的那条）。
     fn volume_root(&self) -> PathBuf {
-        match self.current_volume().map(|v| v.kind()) {
-            Some(fmnr_core::VolumeKind::Local) => dirs_home(),
-            _ => PathBuf::new(),
-        }
+        let kind = self.current_volume().map(|v| v.kind());
+        let id = self.current_volume_id.as_ref().map(|v| v.0.as_str());
+        volume_start(kind, id)
+            // 空路径 = 虚拟卷的卷根，它不在盘上，不该拿 `is_dir()` 去问它。
+            .filter(|p| p.as_os_str().is_empty() || p.is_dir())
+            .unwrap_or_else(dirs_home)
     }
 
     /// 重建树的根为"当前卷"。
@@ -665,21 +673,9 @@ impl App {
             return;
         }
         self.current_volume_id = Some(id);
-        let kind = self.current_volume().map(|v| v.kind());
-        // 起点 = **这个卷自己的根**，不是 home。
-        // 原来这里对 Local 卷一律回 `dirs_home()`：在只有"本地↔归档↔WSL"三种卷时
-        // 看不出来（本地卷就是 home 那块盘），但侧栏能点 D:\ 之后，
-        // 点一块盘却把人送到 `C:\Users\…` —— 那正好是这次要修的事本身。
-        // 归档/远程/WSL 卷没有 home 概念，照旧从卷根（空路径）开始。
-        let start = match kind {
-            Some(fmnr_core::VolumeKind::Local) => self
-                .current_volume_id
-                .as_ref()
-                .and_then(|v| local_root_of_volume_id(&v.0))
-                .filter(|p| p.is_dir())
-                .unwrap_or_else(dirs_home),
-            _ => PathBuf::new(),
-        };
+        // 起点 = 这个卷自己的根。算法在 [volume_root]，和树的根共用同一份——
+        // 分叉的样子是"两栏在 E:\，侧栏还长在 home 上"。
+        let start = self.volume_root();
         self.left_path = start.clone();
         self.right_path = start;
         self.left_selected = None;
@@ -3411,22 +3407,14 @@ impl App {
             if let Some(volume) = self.current_volume() {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 let opts = self.opts();
-                // 特殊文件夹只挂本地卷的起点下面：归档/远程卷没有"用户桌面"可言，
-                // 而挂到别的层会让树里凭空长出指回本地磁盘的节点。
-                let root = self.volume_root();
-                let local = matches!(volume.kind(), fmnr_core::VolumeKind::Local);
-                let specials = if local { special_folders() } else { Vec::new() };
                 for path in pending {
-                    let mut level = match rt.block_on(volume.list(&VPath(path.clone()), &opts)) {
+                    let level = match rt.block_on(volume.list(&VPath(path.clone()), &opts)) {
                         Ok(entries) => crate::tree::level_of(&path, &entries),
                         Err(e) => crate::tree::Level {
                             dirs: Vec::new(),
                             error: Some(e.to_string()),
                         },
                     };
-                    if local && path == root {
-                        level = crate::tree::merge_specials(level, &specials);
-                    }
                     self.tree.put_level(&path, level);
                 }
             }
@@ -3439,6 +3427,8 @@ impl App {
         let mut open_to: Option<PathBuf> = None;
         let mut want_pkg = false;
         let mut want_mount_local: Option<PathBuf> = None;
+        let mut want_quick: Option<PathBuf> = None;
+        let quick = special_folders();
 
         egui::SidePanel::left("tree")
             .default_width(220.0)
@@ -3504,6 +3494,28 @@ impl App {
                             .clicked()
                         {
                             want_mount_local = Some(d.root.clone());
+                        }
+                    }
+                }
+                // ---- 快速访问 ----
+                // 以前这四个是**嫁接进树根那一层**的（`merge_specials`）。树根改成
+                // "当前卷自己的根"之后那就成了谎：在 `E:\` 上时，下载/文档/图片/桌面
+                // 不是 E:\ 的孩子。做成扁平一节，点它 = 走 [goto_path]——
+                // 需要时先把本地卷挂上，再落进那个目录。
+                if !quick.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new("快速访问").strong().size(11.0).weak());
+                    for s in &quick {
+                        if ui
+                            .add(
+                                egui::Label::new(egui::RichText::new(&s.name).size(12.0))
+                                    .selectable(false)
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text(s.path.display().to_string())
+                            .clicked()
+                        {
+                            want_quick = Some(s.path.clone());
                         }
                     }
                 }
@@ -3579,6 +3591,12 @@ impl App {
         }
         if let Some(root) = want_mount_local {
             self.mount_spec(fmnr_mount::MountSpec::Local { root });
+        }
+        if let Some(p) = want_quick {
+            // 走 goto_path 而不是 navigate：这四个目录都在本地盘上，而当前卷可能是
+            // 归档/WSL 卷——直接 navigate 等于拿本地绝对路径去问那个卷要条目，必然列空。
+            let pane = self.active_pane;
+            self.goto_path(pane, &p.to_string_lossy());
         }
     }
 
@@ -4478,6 +4496,21 @@ fn local_root_of_volume_id(id: &str) -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
+/// 一个卷的起点该落在哪：本地卷 = **它自己的盘根**，虚拟卷 = 卷根（空路径）。
+/// `None` = 说是本地卷但 id 里解析不出路径，由调用方决定回落去哪。
+///
+/// 这条是 §1b 的判据。以前树的根（`volume_root`）和两栏的起点（`switch_volume`）
+/// 各算各的：#43 把后者修成"卷自己的根"，前者还在回 `dirs_home()`，
+/// 于是切到 `E:\` 之后两栏在 E:\、侧栏却长在 `C:\Users\…` 上——
+/// 同一帧里两个真相。收成一个函数之后两边不可能再分叉。
+fn volume_start(kind: Option<fmnr_core::VolumeKind>, id: Option<&str>) -> Option<PathBuf> {
+    match kind {
+        Some(fmnr_core::VolumeKind::Local) => id.and_then(local_root_of_volume_id),
+        Some(_) => Some(PathBuf::new()),
+        None => None,
+    }
+}
+
 /// 排序下拉的当前项文案。`SortOrder` 的 Debug 输出是英文枚举名，
 /// 直接 `format!("{:?}")` 会让按钮上写着 `Modified` 而菜单里写着"修改时间"。
 fn sort_label(order: SortOrder) -> &'static str {
@@ -5082,6 +5115,41 @@ mod mount_dialog_tests {
             local_root_of_volume_id("local:"),
             None,
             "空根要回落到 home，不是停在空路径"
+        );
+    }
+
+    /// §1b 的判据：**本地卷的起点是它自己的根，不是 home**。
+    /// 这条以前不存在，所以树的根和两栏的起点能各算各的——切到 E:\ 之后
+    /// 两栏在 E:\、侧栏还长在 `C:\Users\…` 上，同一帧里两个真相。
+    #[test]
+    fn a_local_volume_starts_at_its_own_root_not_the_home_directory() {
+        use fmnr_core::VolumeKind as K;
+        assert_eq!(
+            volume_start(Some(K::Local), Some(r"local:E:\")),
+            Some(PathBuf::from(r"E:\")),
+            "本地卷的起点必须是它自己的盘根"
+        );
+        assert_eq!(
+            volume_start(Some(K::Local), Some(r"local:E:\proj\x")),
+            Some(PathBuf::from(r"E:\proj\x")),
+            "挂在子目录上就该停在子目录"
+        );
+        // 虚拟卷没有 home 概念：起点 = 卷根（空路径），不是任何盘符。
+        for kind in [K::Archive, K::Remote, K::Unc, K::Wsl] {
+            assert_eq!(
+                volume_start(Some(kind), Some("wsl:Ubuntu-24.04")),
+                Some(PathBuf::new()),
+                "{kind:?} 卷的起点应是卷根"
+            );
+        }
+        // 反证：说是本地卷但解析不出路径 ⇒ None（调用方据此回落 home），
+        // 而不是悄悄给出别的盘的根、或干脆给出 home 让这条判据量不出来。
+        assert_eq!(volume_start(Some(K::Local), Some("local:")), None);
+        assert_eq!(volume_start(Some(K::Local), None), None);
+        assert_eq!(
+            volume_start(None, Some(r"local:E:\")),
+            None,
+            "没有卷就不该给起点"
         );
     }
 
