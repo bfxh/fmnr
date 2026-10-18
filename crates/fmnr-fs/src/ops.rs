@@ -8,6 +8,68 @@ use std::path::{Path, PathBuf};
 /// 拷贝缓冲：1 MiB。既够大以减少 syscall，又够小以让取消/进度有秒级响应。
 const BUF_SIZE: usize = 1 << 20;
 
+/// Windows 的共享掩码常量（`std::os::windows::fs::OpenOptionsExt::share_mode` 收的是
+/// 原始 `u32`，这里按文档值写死，不为两个常数把 `windows` 拉进编译面）。
+#[cfg(windows)]
+const FILE_SHARE_READ: u32 = 0x1;
+#[cfg(windows)]
+const FILE_SHARE_DELETE: u32 = 0x4;
+/// `ERROR_SHARING_VIOLATION`
+#[cfg(windows)]
+const ERROR_SHARING_VIOLATION: i32 = 32;
+
+/// 以"**不许别人同时写**"的共享掩码打开目标文件（写 + 建 + 截断）。
+///
+/// 为什么要有这一层：`std::fs::File::create` 在 Windows 上把共享掩码开成
+/// `READ|WRITE|DELETE`（全共享），于是往一个**别的程序正开着写**的文件上覆盖时
+/// CreateFile 照样成功——`truncate` 当场把对方已写进去的字节抹掉，两边继续各写各的，
+/// 最后得到一个混着零洞的文件，而 fmnr 报"成功、N 字节"。
+/// 本机实测（`share_mode` 对拍）：对方以 std 全共享持句柄并已写 8 字节时，
+/// std 默认开法得到 `Ok` 且目标长度变成 **0**；换成这里这种开法得到
+/// `ERROR_SHARING_VIOLATION(32)`。反过来，对方若只共享读（Explorer/Office 那一类），
+/// std 默认开法本来就会失败——也就是说**共享掩码才是主闸**，
+/// 要挡"对方开着写"必须自己先把写共享拒掉（`DESIGN` §4.3(a) 说的就是这个）。
+///
+/// 非 Windows 上退化成 `File::create`（下面另有一条同名的 `#[cfg(not(windows))]` 实现）：
+/// POSIX 没有共享语义可借，装出"锁住了"的样子比不装更糟。
+#[cfg(windows)]
+pub fn create_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .open(path)
+}
+
+/// 非 Windows：POSIX 的 `flock`/`fcntl` 都是**建议锁**，没有共享语义可借，
+/// 装出"锁住了"的样子比不装更糟（同 `DESIGN` §4.3(a) 那条口径），所以原样开。
+#[cfg(not(windows))]
+pub fn create_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(path)
+}
+
+/// 把"目标正被别的程序开着写"从一堆 io 错误里认出来，说成一句人话。
+///
+/// 只认 `ERROR_SHARING_VIOLATION` 这一个码，别的一律原样交给 `Error::Io`——
+/// 把不认识的错误都改写成"被占用"是另一种撒谎。
+#[cfg(windows)]
+pub fn in_use_error(path: &Path, e: std::io::Error) -> Error {
+    if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+        return Error::Other(format!(
+            "{} 正被另一个程序开着写，不能覆盖它（要覆盖请先关掉那个程序）",
+            path.display()
+        ));
+    }
+    Error::Io(e)
+}
+
+#[cfg(not(windows))]
+pub fn in_use_error(_path: &Path, e: std::io::Error) -> Error {
+    Error::Io(e)
+}
+
 /// 单个条目的处理结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemOutcome {
@@ -61,6 +123,19 @@ pub fn dir_stats(root: &Path) -> (u64, u64) {
         }
     }
     (bytes, files)
+}
+
+/// 整份写入的**唯一**入口：走 `create_exclusive` 的开法，所以"别人正开着写"
+/// 在这里会变成一条说得清的失败，而不是静默把对方的数据截掉。
+///
+/// `LocalVolume::write` 与拷贝落盘都汇到这一层——同一件政策只写一处
+/// （本轮 `.lnk` 那条的教训就是：同一句事实写两份，其中一份一定会先过期）。
+pub fn write_file(path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut f = create_exclusive(path).map_err(|e| in_use_error(path, e))?;
+    f.write_all(data).map_err(|e| in_use_error(path, e))?;
+    f.flush().map_err(|e| in_use_error(path, e))?;
+    Ok(())
 }
 
 /// 目标已存在时求一个不冲突的名字：`a.txt` → `a (2).txt` → `a (3).txt`。
@@ -172,7 +247,9 @@ fn copy_file(src: &Path, dest: &Path, progress: &Progress) -> Result<()> {
     use std::io::{Read, Write};
 
     let mut reader = std::fs::File::open(src).map_err(Error::Io)?;
-    let mut writer = std::fs::File::create(dest).map_err(Error::Io)?;
+    // 目标一律走"拒写共享"的开法：别人正开着写的文件不该被我们静默截断（见
+    // `create_exclusive` 的实测注释）。
+    let mut writer = create_exclusive(dest).map_err(|e| in_use_error(dest, e))?;
 
     // 缓冲区按**文件大小**封顶，不无脑开满 BUF_SIZE。
     // 实测判据（`cargo run -p fmnr-bench --bin io_throughput`）：原先每个文件都
@@ -445,6 +522,64 @@ mod tests {
         ));
         std::fs::create_dir_all(&base).unwrap();
         base
+    }
+
+    /// 🔴 门：往一个**别的程序正开着写**的文件上覆盖，必须失败并把原因说清楚，
+    /// 而不是把对方已写进去的字节截掉还回报成功。
+    ///
+    /// 语料形状就是量出这条机制的那次（`share_mode` 对拍）：对方以 std 默认的
+    /// 全共享（read+write）持着句柄并已写 8 字节——python / notepad 那一类。
+    /// 修前：`copy_file` 得到 `Ok`，目标长度变成 **0**；
+    /// 修后：得到 `ERROR_SHARING_VIOLATION` 翻成的人话，且对方的字节一个没动。
+    ///
+    /// 同一件事要先证明**没有竞争时照样能覆盖**，否则这条门是空转。
+    #[cfg(windows)]
+    #[test]
+    fn overwrite_refuses_a_file_another_writer_holds() {
+        use std::io::Write;
+
+        let d = tmpdir("busy");
+        let src = d.join("src.bin");
+        std::fs::write(&src, vec![b'A'; 64]).unwrap();
+        let target = d.join("x.bin");
+        std::fs::write(&target, b"peer-data").unwrap();
+
+        let prog = || Progress::new();
+        let mut peer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&target)
+            .unwrap();
+        peer.write_all(b"BUSY").unwrap(); // 从 0 号位盖掉对方的开头
+        peer.flush().unwrap();
+        // 拿"被拒之前它是什么"当锚，而不是硬编码字节：要护住的不变量是
+        // **我们没动过它**，不是"它一定等于某个我算出来的串"。
+        let before = std::fs::read(&target).unwrap();
+        assert_ne!(before, vec![b'A'; 64], "锚点得是别人的内容，不是源的副本");
+
+        let e = copy_file(&src, &target, &prog()).expect_err("对方正开着写，覆盖必须失败");
+        let msg = e.to_string();
+        assert!(msg.contains("正被另一个程序"), "{msg}");
+        let write_err = write_file(&target, b"zz").expect_err("write 路径同闸");
+        assert!(
+            write_err.to_string().contains("正被另一个程序"),
+            "{write_err}"
+        );
+
+        // 关键的一半：对方的数据必须还在
+        drop(peer);
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            before,
+            "被拒之后目标不该被动过——截成 0 就是修前那个行为"
+        );
+
+        // 对照组：没人占用时，同一次覆盖要照样成功（证明上面那条不是空转）
+        copy_file(&src, &target, &prog()).expect("没人占用时必须还能覆盖");
+        assert_eq!(std::fs::read(&target).unwrap(), vec![b'A'; 64]);
+        write_file(&target, b"free").expect("没人占用时 write_file 也要能写");
+        assert_eq!(std::fs::read(&target).unwrap(), b"free");
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]

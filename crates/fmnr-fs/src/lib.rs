@@ -238,7 +238,13 @@ impl Volume for LocalVolume {
 
     async fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
         let full = self.resolve(path);
-        tokio::fs::write(&full, data).await.map_err(Error::Io)
+        let data = data.to_vec();
+        // 走 ops::write_file 而不是 tokio::fs::write：那一层用全共享掩码开目标，
+        // 会把"别的程序正开着写"的文件静默截断（实测：对方已写 8 字节 → 长度变 0，
+        // 而调用方看到成功）。口径与拷贝路径共用同一个入口，政策只写一处。
+        tokio::task::spawn_blocking(move || ops::write_file(&full, &data))
+            .await
+            .map_err(|e| Error::Other(e.to_string()))?
     }
 
     fn writable(&self) -> bool {

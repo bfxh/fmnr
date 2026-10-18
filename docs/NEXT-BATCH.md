@@ -134,10 +134,44 @@ Rust 现状：`iroh` 1.3.0（62 个直接依赖，官方声明支持 iOS/Android
 
 ### 4.3 "文件需要钥匙"：这句话里是两个不同的东西
 
-**(a) 防止并发写**（真·文件锁）：✅ Windows `LockFileEx` 是 OS **强制**的字节区间锁，
-而 `CreateFile` 的共享模式才是主闸；POSIX 侧 `flock`/`fcntl` 都是**建议锁**（man7 原文）。
-Rust 现成件：`fs2`、`fd-lock`、`windows-rs`。这条便宜、无风险，可以做
-（预览/编辑时锁住，避免外部程序同时写）。
+**(a) 防止并发写**（真·文件锁）：✅ **2026-10-19 做了，而且不用 `LockFileEx`、不用新依赖**。
+- 原判断（"`CreateFile` 的共享模式才是主闸"）是对的，但**方向**要先实测才定得下来：
+  Windows 的共享检查是拿**已存在句柄**的掩码去判新来的访问请求，
+  而 `std::fs::File::create` 把自己的掩码开成**全共享**——于是往一个"别的程序正开着写"
+  的文件上覆盖时，CreateFile 直接成功并 `truncate` 掉对方的字节。
+  本机实测（沙盒 `crates/fmnr-fs/tests/share_mode_probe.rs`）：对方以 std 默认全共享
+  持句柄、已写 8 字节 ⇒ `File::create` 得到 `Ok`、目标长度变成 **0**；
+  换成 `share_mode(READ|DELETE)` 的开法得到 `ERROR_SHARING_VIOLATION(32)`。
+  反向也量了：对方只共享读（Explorer/Office 那一类）时 **std 默认开法本来就会失败**，
+  所以那一类从来不需要额外做什么。
+- **在 fmnr 自己的接口层上量到的修前行为**（沙盒 `concurrent_write_probe.rs`）：
+  对方持着写句柄、目标已存在时，`ops::transfer([src], dst, Overwrite, _)` 返回
+  `Ok(done=1, skipped=0, bytes=4096)` —— 也就是**整条链路报告"成功"**，
+  而对方的内容已经被换掉/截掉。修后同一次调用返回 `Err` 并带那句人话。
+  这条是为什么门要建在 `ops` 层而不是只测裸句柄：裸句柄只能证明机制，
+  证明不了"用户看到的那句话是假的"。
+- 落地的形状：`ops::create_exclusive`（Windows 用 std 自带的 `OpenOptionsExt::share_mode`，
+  掩码 `FILE_SHARE_READ|FILE_SHARE_DELETE`）+ `ops::write_file` 这一个唯一入口，
+  `copy_file` 与 `LocalVolume::write` 都汇到它；32 号错翻成一句人话
+  （"… 正被另一个程序开着写，不能覆盖它（要覆盖请先关掉那个程序）"），
+  其余 io 错误原样交给 `Error::Io`——把不认识的错误都改写成"被占用"是另一种撒谎。
+  **没有**引 `fs2` / `fd-lock` / 为了两个常数把 `windows` 拉进编译面。
+- **刻意没做的一半**：POSIX 没有共享语义可借（`flock`/`fcntl` 都是**建议锁**），
+  非 Windows 分支保持 `File::create` 原样，不装出"锁住了"的样子；
+- **刻意没做的一半**：POSIX 没有共享语义可借（`flock`/`fcntl` 都是**建议锁**），
+  非 Windows 分支保持 `File::create` 原样，不装出"锁住了"的样子；
+  **读取/预览侧不加锁**——读了就把别人写死是更糟的取舍，所以
+  "文件在预览期间被外部改掉"这一半仍然没处理（登记在这）。
+  还有第三格没接上：**fmnr 自己的落盘**（白板 `crates/fmnr-core/src/board.rs:165` 的
+  `std::fs::write`）走的仍是默认全共享。它挡不住"两个窗口同时存同一份白板"，
+  但把它接进来的正确做法要让 `fmnr-core` 依赖 `fmnr-fs`（方向是反的）或把这条政策
+  **复制到第二处**——后者正是本轮 `.lnk` 那条教训的形状（同一句事实写两份，
+  一定有一份先过期），所以宁可留空并登记在这里，不做复制。
+- 门：`ops::tests::overwrite_refuses_a_file_another_writer_holds`，
+  含对照组（没人占用时同一次覆盖必须照样成功，否则这条是空转）。
+  变异复打 **4/4 全判红**（沙盒 `mut_lock.py`，红在断言消息上，无崩溃红、无编译不过逃逸）：
+  掩码改成 `0x7`（全共享）、整段去掉 `.share_mode(...)`、拆掉 32 号错的映射、
+  `write_file` 绕回 `File::create`。
 
 **(b) 加密**（口令派生密钥）：
 - ✅ KDF 底线按 OWASP：Argon2id 19 MiB / t=2 / p=1（静态加密建议上调，🔶）。
