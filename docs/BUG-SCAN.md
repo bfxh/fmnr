@@ -251,5 +251,16 @@ oracle 对照脚本与三把 Python 尺都在沙盒 `D:\KF\fmnr-sbx\.scratch\`�
     缺 `DisplayName` 的有 25 个）⇒ 健壮性缺口，不是这台机器上的在用缺陷；
     按"不可达兜底臂不写假测试"的规矩，不为它编门。
   - `ops.rs dir_stats` 吞错让"释放字节数"虚低、`usage.rs` 的
-    `metadata().unwrap_or(0)`：**仍未动**，两者都是"数字偏小"而不是"结论说反"，
-    留作下轮候选。
+    `metadata().unwrap_or(0)`：**仍未动，但本轮把暴露面量出来了**（脚本
+    `D:\KF\fmnr-sbx\.scratch\exposure*.py` + 两个沙盒探针）：
+    - 构造面（icacls 拒访一个子目录，与 §1 那条门同一形状）：真值 4500 B / 2 文件，
+      `dir_stats` 报 **500 B / 1 文件 ⇒ 虚低 88%**，而且调用方无从知道；
+    - 自然面（本机真实树）：`Program Files (x86)` 2,671 层 + `ProgramData` 1,288 层 +
+      `AppData\Roaming` 25,267 层 + `AppData\Local\{Packages,Microsoft}` 3,595 层
+      = **29,626 层里打不开 0 层**；`14,373 个文件里 stat 失败 0 个`；
+    - 超长路径**不是**这条来源：305 字符的三层嵌套目录 `read_dir` 照样 `Ok`，
+      `dir_stats` 读数与真值一致（虚低 0）。
+      ⇒ 结论：这是"**别的机器 / 非管理员身份下会真发生**"的缺口，本机不触发。
+      要标注就得让它出通路——`OpReport.bytes` 已经在 MCP 的 JSON 里（`tools.rs:456`），
+      所以"加一个 `missed` 字段"属于对外契约变更，与 #38、#64 的 `Volume::search`
+      部分失败表达是同一批待拍板事项，本轮**没有**为一条本机 0 暴露的分支新写门。
