@@ -469,7 +469,7 @@ fn start_transfer(
             !job.copy,
         );
         let verb = if job.copy { "复制" } else { "移动" };
-        let parent = {
+        let (parent, own) = {
             let mut g = lock(&win);
             g.busy = false;
             g.status = match res {
@@ -483,12 +483,17 @@ fn start_transfer(
                 Err(e) => format!("搬运失败：{e}"),
             };
             g.reload(&reg);
-            g.parent
+            (g.parent, g.id)
         };
         {
             // 只通知主窗口重列：`drag` 在认领那一刻就已经清掉了。
             hub.lock().unwrap().dirty = true;
         }
+        // 两个都要点名催：状态行和重列后的列表**只画在这个子窗口里**，
+        // 而 egui 的 deferred 视口不随父视口重绘（`egui/src/viewport.rs:22`：
+        // "Deferred viewports are repainted independently of the parent viewport"）。
+        // 只催父窗口的话，这句话要等用户自己动一下弹出窗口才上屏。
+        ctx.request_repaint_of(own);
         ctx.request_repaint_of(parent);
     });
 }
@@ -546,5 +551,81 @@ mod tests {
             &reg(),
         );
         assert_eq!(win.title(), "fmnr · C:\\Users\\me");
+    }
+
+    /// 搬完之后，**子窗口自己**也要被点名催绘。
+    ///
+    /// 依据是 egui 的原话（`egui/src/viewport.rs:22`）：
+    /// 「Deferred viewports are repainted independently of the parent viewport.」
+    /// 父窗口重绘不会顺带画子窗口，而「复制 N 项 → 目录」这句话只画在子窗口里。
+    /// 无窗口量法：`set_request_repaint_callback` 在 `request_repaint_of` 里同步触发
+    /// （`context.rs:200`），所以两个视口 id 各自有没有被催过能直接读出来。
+    #[test]
+    fn transfer_completion_wakes_the_popped_viewport_too() {
+        let root = std::env::temp_dir().join(format!(
+            "fmnr-pop-repaint-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("from")).unwrap();
+        std::fs::create_dir_all(root.join("to")).unwrap();
+        let src = root.join("from").join("note.txt");
+        std::fs::write(&src, b"hello").unwrap();
+
+        let reg = VolumeRegistry::default();
+        let vid = reg.add(Arc::new(fmnr_fs::LocalVolume::new(root.clone())));
+        let reg = Arc::new(reg);
+
+        let win = PopWin::new(egui::ViewportId::ROOT, vid, root.join("to"), false, &reg);
+        let (own, parent_id) = (win.id, win.parent);
+        assert_ne!(own, parent_id, "夹具：两个视口必须是不同的 id");
+        let win = Arc::new(Mutex::new(win));
+        let hub = Arc::new(Mutex::new(Hub::default()));
+        // 和生产调用方一致：先占住 busy 再起线程，否则这里一读就是 false，
+        // 会在搬运真正发生之前跑出断言。
+        lock(&win).busy = true;
+
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ctx = egui::Context::default();
+        let mark = seen.clone();
+        ctx.set_request_repaint_callback(move |info| {
+            let bit = if info.viewport_id == own {
+                0b01
+            } else if info.viewport_id == parent_id {
+                0b10
+            } else {
+                0
+            };
+            mark.fetch_or(bit, Ordering::SeqCst);
+        });
+
+        start_transfer(
+            Job {
+                sources: vec![src],
+                dest: root.join("to"),
+                copy: true,
+            },
+            win.clone(),
+            hub.clone(),
+            reg.clone(),
+            ctx.clone(),
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while seen.load(Ordering::SeqCst) != 0b11 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let got = seen.load(Ordering::SeqCst);
+        let status = lock(&win).status.clone();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(
+            got, 0b11,
+            "状态行已生成（{status}），但催绘点名情况是 {got:b}：\
+             子窗口 bit=01、主窗口 bit=10，缺哪个都会让该说的话上不了屏"
+        );
     }
 }
