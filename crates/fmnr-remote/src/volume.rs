@@ -265,23 +265,16 @@ impl Volume for SshVolume {
             if name == "." || name == ".." {
                 continue;
             }
-            if !opts.show_hidden && name.starts_with('.') {
-                continue;
-            }
             // `Metadata` 就是 `FileAttributes`：这些是**字段**不是方法，
             // 且全是 Option——服务端不给 size/mtime 是合规行为，不能当成 0。
             let meta = de.metadata();
             let ft = de.file_type();
             let is_dir = ft.is_dir();
-            let mut attrs = Vec::new();
-            if ft.is_symlink() {
-                attrs.push(Attr::Symlink);
-            }
-            if let Some(perms) = meta.permissions {
-                // POSIX owner-writable 位为 0 视为只读。
-                if perms & 0o200 == 0 {
-                    attrs.push(Attr::ReadOnly);
-                }
+            // 先**标注**，再按显示开关筛——这两件事分开是本地卷上用真跑换来的：
+            // 把标注挂在显示开关的分支里，勾上"显示隐藏项"会让标记整个变空。
+            let attrs = remote_attrs(&name, ft.is_symlink(), meta.permissions);
+            if !opts.show_hidden && attrs.contains(&Attr::Hidden) {
+                continue;
             }
             entries.push(Entry {
                 name: name.clone(),
@@ -416,6 +409,30 @@ impl Volume for SshVolume {
 }
 
 /// 把 sftp 错误折成卷错误。
+/// 远程条目的属性标记。
+///
+/// 抽成纯函数和 `accept_host_key` 同一个理由：这一支没有可连的真实主机
+/// （见 `lib.rs` 的实测声明），能钉住的只有判定本身，不是握手。
+///
+/// POSIX 没有独立的隐藏位——**点开头就是约定**，所以 `.bashrc` 要标成 Hidden，
+/// 和 `\\wsl$` / 归档卷那边"勾上显示就能看到标记"的口径一致。
+fn remote_attrs(name: &str, is_symlink: bool, perms: Option<u32>) -> Vec<Attr> {
+    let mut attrs = Vec::new();
+    if is_symlink {
+        attrs.push(Attr::Symlink);
+    }
+    if name.starts_with('.') {
+        attrs.push(Attr::Hidden);
+    }
+    if let Some(p) = perms {
+        // POSIX owner-writable 位为 0 视为只读（是写位 0o200，不是读位 0o400）。
+        if p & 0o200 == 0 {
+            attrs.push(Attr::ReadOnly);
+        }
+    }
+    attrs
+}
+
 fn sftp_err(e: russh_sftp::client::error::Error, path: &str) -> Error {
     use russh_sftp::client::error::Error as Sftp;
     match e {
@@ -659,6 +676,44 @@ mod tests {
         assert!(
             matches!(e, Error::Unsupported(_)),
             "远程不能直接外置打开：{e}"
+        );
+    }
+
+    /// POSIX 约定：点开头就是隐藏。
+    ///
+    /// 这条锁的是实测发现的缺口——远程卷整个模块从没写过 `Attr::Hidden`，
+    /// 只在显示开关那一支按名字 `continue`。形状和本地卷 `1561693` 修掉的
+    /// 那条一模一样：**标注**与**筛选**是两件事，混做会让"显示隐藏项"
+    /// 打开后标记反而变空。
+    #[test]
+    fn dotfile_carries_hidden_while_write_bit_drives_readonly() {
+        let a = remote_attrs(".bashrc", false, Some(0o644));
+        assert!(a.contains(&Attr::Hidden), "点文件没标隐藏：{a:?}");
+        assert!(
+            !a.contains(&Attr::ReadOnly),
+            "0o644 属主可写，不该判只读：{a:?}"
+        );
+
+        // 只读看的是**写位** 0o200，不是读位 0o400。
+        let b = remote_attrs("notes", false, Some(0o400));
+        assert!(
+            b.contains(&Attr::ReadOnly),
+            "0o400 没有写位，该判只读：{b:?}"
+        );
+        assert!(!b.contains(&Attr::Hidden), "不带点的名字不该标隐藏");
+
+        // 服务端不给权限位是合规行为：这时不能猜只读。
+        let c = remote_attrs("link", true, None);
+        assert!(c.contains(&Attr::Symlink), "软链要标出来：{c:?}");
+        assert!(
+            !c.contains(&Attr::ReadOnly),
+            "没有权限位时不该判只读：{c:?}"
+        );
+
+        let d = remote_attrs(".profile", false, Some(0o444));
+        assert!(
+            d.contains(&Attr::Hidden) && d.contains(&Attr::ReadOnly),
+            "隐藏 + 只读要同时成立：{d:?}"
         );
     }
 }
