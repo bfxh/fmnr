@@ -2972,9 +2972,10 @@ impl App {
                     s.done,
                     s.elapsed_ms,
                     s.error.clone(),
+                    s.unreadable,
                 )
             });
-            let Some((hits, total, done, ms, err)) = started else {
+            let Some((hits, total, done, ms, err, unreadable)) = started else {
                 ui.label(
                     egui::RichText::new("输入即搜：不用回车，也不用等整棵树扫完才看到第一批结果。")
                         .weak(),
@@ -2984,7 +2985,14 @@ impl App {
 
             ui.horizontal(|ui| {
                 if done {
-                    ui.label(format!("{total} 个结果 · {ms} ms"));
+                    // 有层没读到就不能把结果报成完整结论——只说计数会误导，
+                    // 因为"没有"和"没搜到那一支"在用户眼里是同一句话。
+                    let note = if unreadable > 0 {
+                        format!(" · {unreadable} 个目录没读到，结果不全")
+                    } else {
+                        String::new()
+                    };
+                    ui.label(format!("{total} 个结果 · {ms} ms{note}"));
                 } else {
                     ui.label(format!("搜索中… 已列出 {} 个", hits.len()));
                 }
@@ -2996,6 +3004,10 @@ impl App {
                 // 而真正该看的是挂载还在不在、网络通不通。
                 let msg = match err {
                     Some(e) => format!("搜不动：{e}"),
+                    None if unreadable > 0 => format!(
+                        "「{}」在能读到的部分里没有匹配项，但有 {unreadable} 个目录没读到",
+                        self.search_text.trim()
+                    ),
                     None => format!("「{}」在这个子树里没有匹配项", self.search_text.trim()),
                 };
                 ui.label(egui::RichText::new(msg).weak());

@@ -45,6 +45,11 @@ pub struct SearchState {
     /// 必须有这个字段：没有它，"我搜不了"和"这里没有匹配"在界面上是同一句话，
     /// 而后者会把用户引去改关键词，前者才是要他去看挂载/网络。
     pub error: Option<String>,
+    /// 扫过的子树里有多少层**没读到**（权限、断链、卷错误）。
+    ///
+    /// 和 `error` 分开：`error` 是"整次没跑起来"，这里是"跑起来了但结果不全"。
+    /// 混在一起的话，一个坏目录会把已经搜到的结果一起作废。
+    pub unreadable: usize,
     rx: Receiver<Chunk>,
     started: Instant,
 }
@@ -53,6 +58,7 @@ pub struct SearchState {
 enum Chunk {
     Batch(Vec<Hit>),
     Failed(String),
+    Unreadable(usize),
 }
 
 impl SearchState {
@@ -68,6 +74,10 @@ impl SearchState {
                 }
                 Ok(Chunk::Failed(e)) => {
                     self.error = Some(e);
+                    got = true;
+                }
+                Ok(Chunk::Unreadable(n)) => {
+                    self.unreadable = n;
                     got = true;
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -108,9 +118,34 @@ pub fn spawn_search(query: Query) -> SearchState {
                 return;
             }
             let mut batch = Vec::with_capacity(BATCH);
+            let mut unreadable = 0usize;
             // skip_hidden：与默认列表行为一致，不在结果里混进隐藏目录
-            let walker = jwalk::WalkDir::new(&root).skip_hidden(true).into_iter();
-            for entry in walker.filter_map(|e| e.ok()) {
+            for e in jwalk::WalkDir::new(&root).skip_hidden(true).into_iter() {
+                let entry = match e {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        // 根读不了 = 整次搜不动，要说成失败；
+                        // 除此之外的一层读不到 = 结果不全，记一笔。
+                        if err.path().is_some_and(|p| p == root) {
+                            let _ = tx.send(Chunk::Failed(err.to_string()));
+                            return;
+                        }
+                        unreadable += 1;
+                        continue;
+                    }
+                };
+                // jwalk 0.9 把"这一层 read_dir 失败"写在**父条目**的
+                // `read_children.error` 里，不会变成 Err 条目
+                // （`dir_entry_iter.rs:91-93`；实测：ACL 拒访的子目录给出 Ok + 0 条 Err）。
+                // 不接住它，"有一支没扫"就报成"这里没有匹配项"。
+                if entry
+                    .read_children
+                    .as_ref()
+                    .and_then(|rc| rc.error())
+                    .is_some()
+                {
+                    unreadable += 1;
+                }
                 if batch.len() >= BATCH
                     && tx
                         .send(Chunk::Batch(std::mem::replace(
@@ -137,6 +172,9 @@ pub fn spawn_search(query: Query) -> SearchState {
             if !batch.is_empty() {
                 let _ = tx.send(Chunk::Batch(batch));
             }
+            if unreadable > 0 {
+                let _ = tx.send(Chunk::Unreadable(unreadable));
+            }
         })
         .expect("spawn search thread");
 
@@ -146,6 +184,7 @@ pub fn spawn_search(query: Query) -> SearchState {
         done: false,
         total: 0,
         error: None,
+        unreadable: 0,
         rx,
         started,
     }
@@ -195,6 +234,7 @@ pub fn spawn_volume_search(
             let mut queue = std::collections::VecDeque::new();
             queue.push_back(PathBuf::from(&root));
             let mut batch: Vec<Hit> = Vec::with_capacity(BATCH);
+            let mut unreadable = 0usize;
             while let Some(dir) = queue.pop_front() {
                 let entries = match rt.block_on(volume.list(&fmnr_core::VPath(dir.clone()), &opts))
                 {
@@ -202,8 +242,11 @@ pub fn spawn_volume_search(
                     Err(e) => {
                         // 根读不了要说出来；深处的单层失败跳过（权限/软链环），
                         // 否则一个坏目录就把整次搜索判死，用户看不到已经搜到的东西。
+                        // 但"跳过"不能等于"没说"——记进 unreadable。
                         if dir == root {
                             let _ = tx.send(Chunk::Failed(format!("{}：{e}", root.display())));
+                        } else {
+                            unreadable += 1;
                         }
                         continue;
                     }
@@ -237,6 +280,9 @@ pub fn spawn_volume_search(
             if !batch.is_empty() {
                 let _ = tx.send(Chunk::Batch(batch));
             }
+            if unreadable > 0 {
+                let _ = tx.send(Chunk::Unreadable(unreadable));
+            }
         })
         .expect("spawn volume search thread");
 
@@ -246,6 +292,7 @@ pub fn spawn_volume_search(
         done: false,
         total: 0,
         error: None,
+        unreadable: 0,
         rx,
         started,
     }
@@ -316,6 +363,80 @@ mod tests {
         assert_eq!(st.hits[0].name, "beta.txt");
         assert!(st.hits[0].path.ends_with("beta.txt"));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 有一支读不到时，要说成"结果不全"，不能报成"这个子树里没有匹配项"。
+    ///
+    /// 这条锁的是实测出来的机制：jwalk 0.9 把嵌套 `read_dir` 失败写在父条目的
+    /// `read_children.error`，而不是作为 Err 条目（`dir_entry_iter.rs:91-93`）。
+    /// 只在能落 DACL 的 Windows 卷上成立，造不出来就跳过并说明——
+    /// 静默跳过的绿门比没有门更糟，所以跳过分支要打印出来。
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_layer_is_reported_as_partial_not_as_no_match() {
+        use std::process::Command;
+
+        let root = std::env::temp_dir().join(format!("fmnr-search-denied-{}", std::process::id()));
+        let locked = root.join("locked");
+        if locked.exists() {
+            let _ = Command::new("icacls")
+                .arg(locked.as_os_str())
+                .arg("/reset")
+                .output();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(root.join("alpha-visible.txt"), b"1").unwrap();
+        std::fs::write(locked.join("alpha-hidden.txt"), b"2").unwrap();
+
+        let out = Command::new("icacls")
+            .arg(locked.as_os_str())
+            .args(["/deny", "*S-1-1-0:(OI)(CI)R"])
+            .output()
+            .expect("icacls 应可用");
+        if !out.status.success() || std::fs::read_dir(&locked).is_ok() {
+            let _ = Command::new("icacls")
+                .arg(locked.as_os_str())
+                .arg("/reset")
+                .output();
+            let _ = std::fs::remove_dir_all(&root);
+            println!("跳过：本机造不出拒访目录（非 NTFS 或域策略拦了 DACL）");
+            return;
+        }
+
+        let mut st = spawn_search(Query {
+            text: "alpha".into(),
+            root: root.clone(),
+            case_sensitive: false,
+        });
+        wait_done(&mut st);
+
+        let _ = Command::new("icacls")
+            .arg(locked.as_os_str())
+            .arg("/reset")
+            .output();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(
+            st.hits
+                .iter()
+                .filter(|h| h.name == "alpha-visible.txt")
+                .count(),
+            1,
+            "能读到的那部分要照实给结果，实得 {:?}",
+            st.hits.iter().map(|h| &h.name).collect::<Vec<_>>()
+        );
+        assert!(
+            st.unreadable > 0,
+            "读不到的那一层没被记账（hits={:?} error={:?}）",
+            st.hits.iter().map(|h| &h.name).collect::<Vec<_>>(),
+            st.error
+        );
+        assert!(
+            st.error.is_none(),
+            "单层读不到不等于整次搜不动：{:?}",
+            st.error
+        );
     }
 
     /// 走卷抽象的那条路：嵌套命中必须搜得到。

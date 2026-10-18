@@ -121,7 +121,11 @@ impl Running {
             // 阈值才动一下，"实时"就成了"最后一次性出来"。
             let mut since_publish = 0u64;
             let mut last_publish = std::time::Instant::now();
-            let mut err_paths = std::collections::HashSet::new();
+            // 每个桶**读不到的目录个数**。用计数而不是集合：
+            // 早先用 HashSet + 每次发布 `+= 1`，同一个失败目录会被后面每次发布
+            // 反复加一，扫得越久"没读到的目录"越大——那是把计数器当成了增量日志。
+            let mut err_dirs: std::collections::HashMap<PathBuf, u64> =
+                std::collections::HashMap::new();
             let mut root_err: Option<String> = None;
 
             for msg in jwalk::WalkDir::new(&root)
@@ -140,13 +144,14 @@ impl Running {
                 }
                 match msg {
                     Err(e) => {
-                        // jwalk 把"这一层读不了"作为条目错误报出来。
-                        // 记下来，别让它伪装成"这个目录是空的"。
+                        // 只有**根**读不了才走这条（嵌套层的失败不以 Err 条目报出来，
+                        // 见下面 Ok 分支里 read_children 那段）。仍然要记，
+                        // 别让它伪装成"这个目录是空的"。
                         match e.path().map(|x| x.to_path_buf()) {
                             Some(p) if p == root => root_err = Some(e.to_string()),
                             Some(p) => {
                                 if let Some(b) = bucket_of(&root, &p) {
-                                    err_paths.insert(b);
+                                    *err_dirs.entry(b).or_insert(0) += 1;
                                 }
                             }
                             // 报不出路径的错误（线程池忙）：记一条总的，不丢
@@ -158,6 +163,17 @@ impl Running {
                     }
                     Ok(entry) => {
                         let p = entry.path();
+                        // 这一层读不了：jwalk 0.9 不把它变成 Err 条目，而是塞进
+                        // **父条目**的 `read_children.error`（实测：ACL 拒访的子目录，
+                        // 迭代器给 Ok 若干条 + Err 0 条，错误只在字段里）。
+                        // 不读这个字段的话，那一支会被画成"这个目录是空的"。
+                        if let Some(rc) = entry.read_children.as_ref() {
+                            if rc.error().is_some() {
+                                if let Some(b) = bucket_of(&root, &p) {
+                                    *err_dirs.entry(b).or_insert(0) += 1;
+                                }
+                            }
+                        }
                         if entry.file_type().is_dir() {
                             continue;
                         }
@@ -188,9 +204,9 @@ impl Running {
                             since_publish = 0;
                             last_publish = std::time::Instant::now();
                             u.buckets = map.values().cloned().collect();
-                            for k in err_paths.iter() {
+                            for (k, n) in err_dirs.iter() {
                                 if let Some(b) = map.get_mut(k) {
-                                    b.errors += 1;
+                                    b.errors = *n;
                                 }
                             }
                             let _ = tx.send(u.clone());
@@ -198,9 +214,9 @@ impl Running {
                     }
                 }
             }
-            for k in err_paths.iter() {
+            for (k, n) in err_dirs.iter() {
                 if let Some(b) = map.get_mut(k) {
-                    b.errors += 1;
+                    b.errors = *n;
                 }
             }
             u.buckets = map.into_values().collect();
@@ -362,5 +378,76 @@ mod tests {
         assert_eq!(top[1].bytes, 10);
         assert_eq!(u.total(), 1010);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 拒访的子目录**必须报成"有 N 个目录没读到"**，不能画成"这个目录是空的"。
+    ///
+    /// 这条锁的是实测出来的机制：jwalk 0.9 不把嵌套 `read_dir` 失败变成 Err 条目，
+    /// 而是写进父条目的 `read_children.error`（`dir_entry_iter.rs:91-93`）。
+    /// 只处理 `Err(_)` 分支的写法在这类目录上永不触发——那一支的字节会整个不见，
+    /// 而图上看不出差别。
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_subdir_is_counted_instead_of_looking_empty() {
+        use std::process::Command;
+
+        let root = std::env::temp_dir().join(format!("fmnr-usage-denied-{}", std::process::id()));
+        let reset = |locked: &std::path::Path| {
+            if locked.exists() {
+                let _ = Command::new("icacls")
+                    .arg(locked.as_os_str())
+                    .arg("/reset")
+                    .output();
+            }
+        };
+        reset(&root.join("branch").join("locked"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("branch").join("locked")).unwrap();
+        std::fs::write(root.join("branch").join("visible.bin"), vec![3u8; 500]).unwrap();
+        std::fs::write(
+            root.join("branch").join("locked").join("hidden.bin"),
+            vec![9u8; 4000],
+        )
+        .unwrap();
+
+        let out = Command::new("icacls")
+            .arg(root.join("branch").join("locked").as_os_str())
+            .args(["/deny", "*S-1-1-0:(OI)(CI)R"])
+            .output()
+            .expect("icacls 应可用");
+        if !out.status.success() || std::fs::read_dir(root.join("branch").join("locked")).is_ok() {
+            // 这台机器造不出拒访目录（域策略/非 NTFS）：跳过并说明，
+            // 不让 CI 因环境永久判红——本机实测这一步是能落地的。
+            reset(&root.join("branch").join("locked"));
+            let _ = std::fs::remove_dir_all(&root);
+            println!("跳过：无法在本机造出拒访目录，这条判据需要能落 DACL 的卷");
+            return;
+        }
+
+        let mut r = Running::start(root.clone());
+        for _ in 0..200 {
+            if r.poll() && r.view().is_some_and(|u| u.done) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let u = r.view().expect("至少收到一条快照").clone();
+        reset(&root.join("branch").join("locked"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let branch = u
+            .sorted()
+            .into_iter()
+            .find(|b| b.name == "branch")
+            .expect("branch 这一支该在图里");
+        assert!(
+            branch.errors > 0,
+            "读不到的子目录没被记账：这一支的 {}/4500 字节其实没算到",
+            branch.bytes
+        );
+        assert_eq!(
+            branch.bytes, 500,
+            "能读的部分要照实算，读不到的部分不能凭空出现"
+        );
     }
 }

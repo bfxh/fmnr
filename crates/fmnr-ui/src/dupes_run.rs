@@ -162,11 +162,25 @@ fn run_scan(
     // 1) 先收文件名。整棵树的**路径**要留在内存里（哈希不留），
     //    一百万个路径约几十 MB，比留哈希或留内容都便宜。
     let mut files: Vec<PathBuf> = Vec::new();
-    for entry in jwalk::WalkDir::new(&root)
-        .skip_hidden(true)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+    for e in jwalk::WalkDir::new(&root).skip_hidden(true).into_iter() {
+        // "这一层读不了"在 jwalk 0.9 里**不是** Err 条目，而是写在父条目的
+        // `read_children.error`（`dir_entry_iter.rs:91-93`，实测：ACL 拒访的子目录
+        // 迭代器给 Ok + 0 条 Err）。不接住它，"这一支压根没扫"就会报成
+        // "这里没有重复文件"——那是对用户数据下结论，不是省事的近似。
+        if let Ok(entry) = &e {
+            if entry
+                .read_children
+                .as_ref()
+                .and_then(|rc| rc.error())
+                .is_some()
+            {
+                out.skipped.push(Skipped {
+                    path: entry.path(),
+                    reason: "读不了这一层，整支没参与查重".into(),
+                });
+            }
+        }
+        let Ok(entry) = e else { continue };
         if !entry.file_type().is_file() {
             continue;
         }
@@ -373,6 +387,69 @@ mod tests {
         assert!(!got.aborted);
         assert!(got.error.is_none());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 读不到的那一层要出现在"跳过"里，不能让整次扫描报成"这里没有重复"。
+    ///
+    /// 这条锁的是实测机制（jwalk 0.9 把嵌套 read_dir 失败写在父条目
+    /// `read_children.error`，不是 Err 条目）。造不出拒访目录的机器打印跳过并放行——
+    /// 但跳过必须说出来，静默跳过的绿门会被当成"这条判过了"。
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_layer_is_listed_as_skipped_not_as_clean() {
+        use std::process::Command;
+
+        let d = std::env::temp_dir().join(format!("fmnr-dupes-denied-{}", std::process::id()));
+        let locked = d.join("locked");
+        if locked.exists() {
+            let _ = Command::new("icacls")
+                .arg(locked.as_os_str())
+                .arg("/reset")
+                .output();
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&locked).unwrap();
+        // 两份内容相同：一份在能读的地方，一份在拒访目录里。
+        std::fs::write(d.join("keep.bin"), vec![7u8; 5000]).unwrap();
+        std::fs::write(locked.join("mirror.bin"), vec![7u8; 5000]).unwrap();
+
+        let out = Command::new("icacls")
+            .arg(locked.as_os_str())
+            .args(["/deny", "*S-1-1-0:(OI)(CI)R"])
+            .output()
+            .expect("icacls 应可用");
+        let unmake = |p: &std::path::Path| {
+            let _ = Command::new("icacls")
+                .arg(p.as_os_str())
+                .arg("/reset")
+                .output();
+        };
+        if !out.status.success() || std::fs::read_dir(&locked).is_ok() {
+            unmake(&locked);
+            let _ = std::fs::remove_dir_all(&d);
+            println!("跳过：本机造不出拒访目录");
+            return;
+        }
+
+        let mut r = Running::start(d.clone(), None);
+        let got = wait(&mut r);
+        unmake(&locked);
+        let _ = std::fs::remove_dir_all(&d);
+
+        assert!(
+            got.skipped.iter().any(|s| s.path.ends_with("locked")),
+            "读不到的那层没进跳过清单：{:?}（groups={}）",
+            got.skipped
+                .iter()
+                .map(|s| (&s.path, s.reason.as_str()))
+                .collect::<Vec<_>>(),
+            got.groups.len()
+        );
+        assert_eq!(
+            got.groups.len(),
+            0,
+            "能读的部分本来就没有成对文件——结论要停在「那一支没搜」"
+        );
     }
 
     /// 取消：结果必须带着 `aborted` 回来，而不是悄悄给一份看起来完整的清单。
