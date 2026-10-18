@@ -132,11 +132,87 @@ egui 原话（`egui-0.31.1/src/viewport.rs:22`）：
 先标注再按显示开关筛。门 `dotfile_carries_hidden_while_write_bit_drives_readonly` 钉住判定本身；
 🔴 **整条 listing 路径仍未在真实主机上点过**，这条只有纯函数层的证据。
 
+### 5. `.lnk` 的目标在 `LinkInfo` 里，而字段顺序与常见转述相反
+
+**怎么撞上的**：看桌面时随手点了个快捷方式，回头拿本机的 `WScript.Shell`
+（Windows 自己的解析器）当 oracle 逐个对质我们的 `target_of`，才发现这个解析器
+在真件上基本是错的。
+
+**语料**：桌面 + 公共桌面 + 两个开始菜单（递归）+ `Recent` 去重后 235 个 .lnk，其中 **230 个当场可读**
+（3 个在两次快照之间被卸载掉了，`UU远程.lnk`×2、`TRAE CN.lnk`），**183 个带结构完整的 LinkInfo**。
+下表**三档都在同一个快照、同一份 oracle 上跑**（尺：沙盒 `crates/fmnr-pkg/tests/lnk_oracle_probe.rs`
++ 三把 Python 尺，`D:\KF\fmnr-sbx\.scratch\`）。
+
+| 取法 | 对 | 错 | 报"没有" |
+| --- | --- | --- | --- |
+| 修前（只读 StringData 我以为的 DrivePath 那一格） | 26 | **155** | 49 |
+| 只读 LinkInfo 的 LocalBasePath（不接后缀） | 154 | 26 | 50 |
+| 本实现（LinkInfo + 后缀拼接规则） | **176** | 4 | 50 |
+| 本实现再拼 IDList 最后一个 FileEntryItem 的文件名 | 175 | 5 | 50 |
+
+修前那 155 个错答案的分类：**107 个返回的就是盘上一个真实存在的目录**、
+20 个返回 `.ico`（IconLocation 那一格）、17 个给成前缀（oracle 在它下面）、其他 11 个。
+
+**三条实测结论**（都由这几把尺钉住，不是照文档抄的）：
+
+1. **StringData 根本没有 DrivePath 那一格**。五格是 Name / RelativePath /
+   WorkingDir / CommandLineArguments / IconLocation。旧代码把 `0x80` 当
+   "有 LocalBasePath"用，而 `0x80` 是 `IsUnicode`；`0x40` 是 HasIcon，
+   旧代码把它当 EnableTargetMetadata。这一格错位就是把"解不出"变成"返回一个错
+   答案"的元凶——155 个错答案里 107 个返回的就是盘上一个真目录。
+2. **LinkInfo 头部的 `+8` 是 LinkInfoFlags、`+12` 是 LinkInfoHeaderSize**，
+   与常见转述的先后相反。证据：183 个件里 `+8` 恒为小位掩码（1 有 160 个、3 有 23 个）、
+   `+12` 恒为 28；`+16` 当偏移去指串时取出的正是 oracle 给的路径。
+   按转述的顺序解，183 个一个都取不出。同一批件里 `+16`/`+24` 的偏移 0 个越出
+   `LinkInfoSize`，所以按块尾收口不误伤真件。
+3. **`CommonPathSuffix` 只在"不是尾巴"时拼上去**：`C:\Users\` + `dev\AppData\…\GitHubDesktop.exe`
+   这种要拼（GitHub Desktop 那类），而 Blender 那种 LocalBasePath 已含整条路径、
+   后缀只是末尾的 `exe`，拼了就错。这一条把只读 LocalBasePath 的 154 对提到 **176 对**。
+
+**两条被推翻的说法（原文留着）**：
+- "目标文件名只在 IDList 里，必须解 `LinkTargetIDList`" —— 那是拿**错位后的** StringData
+  读法量出来的假象（当时 54 个桌面件里 29 个返回目录）。LinkInfo 读对以后拼 IDList
+  名字是**净负**：176 对变 175 对，因为 LocalBasePath 本来就含文件名。
+  IDList 解析因此一行都不需要，代码比修前**更短**。
+- 本轮我自己写过一个"316 个真件"的说法，是双算（`Recent` 那把尺扫的 133 个
+  与 oracle 语料大量重叠）。去重后的真实数是 235 个件 / 183 个带 LinkInfo，已更正。
+
+**剩下 50 个报"没有目标"的**：一律是**没有 LinkInfo** 的件。量过兜底值：
+用 RelativePath + .lnk 所在目录只多复原 7 条，且多数是 `%windir%\system32\narrator.exe`
+这种要环境变量展开的系统入口 ⇒ 按范围硬约束不做，只把"不猜"钉成测试
+（`never_invents_a_target_from_the_bytes_after_linkinfo`）。
+那 4 条"错"是形如 `C:\Users\<装机那台机器的用户名>\…` 这种在别人机器上做出来的件，
+Windows 会用 IDList 重新落到本机同名目录，我们不跟这个行为。
+
+**门**：`crates/fmnr-pkg/src/lnk.rs` 单测 16 条 + `tests/lnk_fuzz.rs` 4 条。
+9 条变异**全部判红**，且都红在断言消息上（无崩溃红、无编译不过逃逸）：
+字段 16→12、24→20、后缀一律拼、允许偏移指回头部、不校验绝对路径、
+编码签名恒判 ANSI、头长下限 28→4、ANSI 允许高位字节、不跳 IDList。
+🔴 第一轮跑的时候有 **4 条逃逸**，原因是两条真缺陷：
+(a) 夹具直接引用被测代码的常数，常数改错夹具跟着改 ⇒ 现在夹具里写**字面量** 16/24；
+(b) `at >= end` 那道守卫是**死代码**（两条读法本身就被 `end` 收口）⇒ 删掉，
+不留"看着安全其实不承重"的行。
+另外把 Windows 自己写出来的 78 字节 LinkInfo 块（`Node.js command prompt.lnk`，
+VolumeID 段抹平）当字面量钉进 `parses_a_real_windows_written_link_info_block`，
+这样**不依赖本机文件**也能在 CI 上判红。
+
+🔴 这轮还撞出一个关于"独立夹具"的教训：`fmnr-ui` 的 `shortcut_check_tests` 里
+另有一个自拼的 `.lnk` builder，注释写着"和解析器各写一遍，builder 错了两边一起错
+就测不出东西"。听起来对，**但它两个都是从同一段记错的规格推出来的**——
+所以门全绿了五轮，而真件上 155 个错答案。改对解析器之后那三条 UI 门立刻判红，
+才把这个假独立性暴露出来。结论：**各写一遍不叫独立，能从外部权威（真字节 / oracle）
+倒推回来的才叫**；本轮起 `fmnr-pkg` 那条 real-bytes 门就是那个权威。
+
+**已知边界**（写清没证到的）：183 个件的 LocalBasePath 全是 ANSI，
+UTF-16 那一档只有合成夹具测过；`LinkInfoHeaderSize > 28`（Unicode 版偏移字段）
+本机 0 件，**没实现也没猜位置**；带中文的 ANSI 路径按"宁可报没有"处理。
+oracle 对照脚本与三把 Python 尺都在沙盒 `D:\KF\fmnr-sbx\.scratch\`，不入库（含本机路径）。
+
 ## 证否（跑了才敢说没有）
 
 | 怀疑 | 尺 | 结果 |
 | --- | --- | --- |
-| 手写 `.lnk` 解析器面对畸形件会 panic | 137 次截断 × 64 组标志 × 42 组虚报长度 × 2 组字符串 + 3000 个随机字节 | **0 次 panic**。12 条 clippy 命中全是假阳（被 `.get()` / 短路挡住）。门转正为 `crates/fmnr-pkg/tests/lnk_fuzz.rs` |
+| 手写 `.lnk` 解析器面对畸形件会 panic | 137 次截断 × 64 组标志 × 42 组虚报长度 × 2 组字符串 + 3000 个随机字节 | **0 次 panic**。12 条 clippy 命中全是假阳（被 `.get()` / 短路挡住）。门转正为 `crates/fmnr-pkg/tests/lnk_fuzz.rs`。🔴 但这只证明"不崩"，**不证明"对"**：正确性是上面 §5 那 155 个错答案 |
 | egui 的 hover-Sense 死点击（`Label` 上挂 `clicked()`） | 自写尺，扫生产代码 | **0 命中，0 个未解析接收者**。这把尺先用两个诱饵证明过它会响（v1 漏了跨行 `ui.horizontal(...)`，修成取链首变量才两个都抓到） |
 | 方块图除零 / NaN 标签 | 读码 + `total <= 0.0` 早退 + `squarify` 过滤非正值 | 挡得住，不可达 |
 | 盘根时 `parent()` 为 `None` → 空路径当目录用 | 扫 `parent().unwrap_or_default()` 两个落点 | 都有 `is_empty()` 守卫或走 `Option` |

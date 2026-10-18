@@ -1,7 +1,10 @@
 //! `.lnk` 是手写的字节解析器（`src/lnk.rs`），输入来自磁盘上任意一个快捷方式。
 //!
-//! 这把门钉的是：畸形件（截断、虚报长度、压根不是 lnk）必须变成 `LnkError`，
-//! 不能变成 panic——一个坏快捷方式不该带崩整个包管理器面板。
+//! 这把门钉两件事：
+//! 1. 畸形件（截断、虚报长度、压根不是 lnk）必须变成 `LnkError`，不能变成 panic
+//!    ——一个坏快捷方式不该带崩整个包管理器面板。
+//! 2. 不能**编**：隔壁字节里看着像路径的串（旧实现就是从 StringData 那一格取的
+//!    目标）在 LinkInfo 拿不到路径时必须判"没有目标"，而不是返回它。
 
 use fmnr_pkg::lnk::{target_of, LnkError};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -28,7 +31,9 @@ const CLSID: [u8; 16] = [
 const F_IDLIST: u32 = 0x1;
 const F_LINKINFO: u32 = 0x2;
 const F_NAME: u32 = 0x4;
-const F_PREFIX: u32 = 0x40;
+/// 0x40 是 HasIcon（**不是**"有 LocalBasePath"：目标只在 LinkInfo 里，
+/// StringData 没有那一格）。这里只是拿它当额外的标志位噪声。
+const F_ICON: u32 = 0x40;
 
 /// 头 + 可选 IDList(声明 size) + 可选 LinkInfo(声明 size) + StringData。
 /// 声明的长度**不需要**和真实字节数一致——这正是畸形件的做法：
@@ -72,7 +77,7 @@ fn quiet() {
 fn truncation_sweep_never_panics() {
     quiet();
     let good = build(
-        F_IDLIST | F_LINKINFO | F_NAME | F_PREFIX,
+        F_IDLIST | F_LINKINFO | F_NAME | F_ICON,
         6,
         28,
         &["A name", "C:\\Windows\\notepad.exe"],
@@ -156,26 +161,22 @@ fn random_bytes_never_panic() {
     assert_eq!(panicked, 0, "随机字节把解析器打崩了 {panicked} 次");
 }
 
-/// 4) 这条不是防 panic，是问「会不会编出假路径」：
-///    LinkInfoSize 声明成 0 时 off 不前进，解析器会从哪里继续读？
-///    先量出实际行为，再决定它算不算缺陷。
+/// 4) 反编造：整条绝对路径**只**存在于 LinkInfo 块后面的 StringData 里
+///    （旧实现取的正是那一格，所以 230 个可读真件里有 155 个返回了错答案）。
+///    LinkInfo 里一个偏移字段都没写对 ⇒ 必须判"没有目标"，不许拿隔壁那条当目标。
 #[test]
-fn measure_linkinfo_zero_behavior() {
-    let base = build(F_LINKINFO | F_PREFIX, 0, 28, &["C:\\Windows\\notepad.exe"]);
-    let zeroed = build(F_LINKINFO | F_PREFIX, 0, 0, &["C:\\Windows\\notepad.exe"]);
-    println!("BASE  len={} -> {:?}", base.len(), target_of(&base));
-    println!("ZERO  len={} -> {:?}", zeroed.len(), target_of(&zeroed));
-
-    // 一个压根没有 StringData 的文件（头 + 声明了巨大 LinkInfo 但后面没字节）
-    let no_strings = build(F_LINKINFO | F_NAME | F_PREFIX, 0, 8, &[]);
-    println!(
-        "NOSTR len={} -> {:?}",
-        no_strings.len(),
-        target_of(&no_strings)
+fn never_invents_a_target_from_the_bytes_after_linkinfo() {
+    // LinkInfo 声明 28 字节、实际补的字节全为 0 ⇒ 各偏移字段都是坏偏移
+    let d = build(
+        F_LINKINFO | F_NAME | F_ICON,
+        0,
+        28,
+        &["C:\\Windows\\notepad.exe"],
     );
+    let got = target_of(&d);
+    println!("LinkInfo 全 0 + 后面跟着一条看着像目标的串 -> {got:?}");
     assert!(
-        target_of(&no_strings).is_err() || target_of(&no_strings).unwrap() == String::new(),
-        "没有串数据的 lnk 却返回了非空目标，说明它在编"
+        matches!(got, Err(LnkError::NoTarget)),
+        "LinkInfo 里没目标却返回了 {got:?}——那只能是从隔壁字节里编的"
     );
-    let _ = LnkError::NoTarget;
 }

@@ -5539,23 +5539,32 @@ mod mount_dialog_tests {
 mod shortcut_check_tests {
     use super::*;
 
-    /// 造一个结构正确的最小 `.lnk`：76 字节头 + DESCRIPTION 空格 + LOCALBASE。
-    /// 字节布局按 MS-SHLLINK 手拼，和 `fmnr-pkg` 那边的解析器各写一遍——
-    /// 两边共用一个 builder 的话，builder 错了就两边一起错，测不出东西。
+    /// 造一个结构正确的最小 `.lnk`：76 字节头 + 一个真件形状的 LinkInfo 块
+    /// （+16 = LocalBasePathOffset、+24 = CommonPathSuffixOffset 留 0、串从 +49 起）。
+    ///
+    /// 🔴 这一版原先拼的是「头 + 两格 StringData」，那是照着我记错的规格写的，
+    /// 和解析器犯了**同一个错**——两边都由同一张错的表推导，所以这个"独立"夹具
+    /// 什么都没抓到。真正的独立依据只能是 Windows 自己写出来的字节，
+    /// 那条门在 `fmnr-pkg::lnk::tests::parses_a_real_windows_written_link_info_block`。
     fn make_lnk(target: &str) -> Vec<u8> {
+        let mut li = vec![0u8; 49];
+        let size = (li.len() + target.len() + 1) as u32;
+        li[0..4].copy_from_slice(&size.to_le_bytes());
+        li[4..8].copy_from_slice(&28u32.to_le_bytes()); // Version
+        li[8..12].copy_from_slice(&1u32.to_le_bytes()); // LinkInfoFlags
+        li[12..16].copy_from_slice(&28u32.to_le_bytes()); // LinkInfoHeaderSize
+        li[16..20].copy_from_slice(&49u32.to_le_bytes()); // LocalBasePathOffset
+        li.extend_from_slice(target.as_bytes());
+        li.push(0);
         let mut d = vec![0u8; 76];
         d[0..4].copy_from_slice(&76u32.to_le_bytes());
         d[4..20].copy_from_slice(&[
             0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x46,
         ]);
-        // LinkFlags = HasTargetPrefix(0x40) ⇒ 只有 LOCALBASE 那格有用
-        d[20..24].copy_from_slice(&0x40u32.to_le_bytes());
-        for s in ["", target] {
-            let units: Vec<u8> = s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
-            d.extend_from_slice(&(s.encode_utf16().count() as u16).to_le_bytes());
-            d.extend_from_slice(&units);
-        }
+        // LinkFlags = HasLinkInfo(0x2) ⇒ 目标只从 LinkInfo 读
+        d[20..24].copy_from_slice(&0x2u32.to_le_bytes());
+        d.extend_from_slice(&li);
         d
     }
 

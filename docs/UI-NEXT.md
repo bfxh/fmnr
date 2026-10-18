@@ -311,6 +311,9 @@ edition 2024，license **MIT**。
 ### 4.1 先把对象锚定（本机实测，不是猜）
 
 `C:\Users\lbx13\Desktop\UniGetUI.lnk` → `D:\rj\GJ\UniGetUI.x64\UniGetUI.exe`。
+（🔴 2026-10-19 更正：本仓 `.lnk` 解析器原先**给不出**这一条，返回的是目标所在目录，
+我当时把"底账里没有这条"当成了正确结论。修好后 `target_of` 与 Windows 自己的
+`WScript.Shell` 在这一件上一致，见 `docs/BUG-SCAN.md` §5。）
 VersionInfo：**2026.3.1**，CompanyName **Devolutions Inc.**，签名有效
 （GlobalSign EV，2028-12-05 到期）。`last-update-attempt.log` 写 build 107 /
 **Auto-launch: False**。
