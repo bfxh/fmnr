@@ -1607,6 +1607,7 @@ dependencies = [
  "flate2",
  "fmnr-core",
  "futures",
+ "sevenz-rust2",
  "tar",
  "thiserror 2.0.21",
  "tokio",
@@ -2830,6 +2831,12 @@ checksum = "fde178a3caf126c440fa15628147772d8ee590a39477d711353fbe2e58a73a5b"
 dependencies = [
  "sha2 0.11.1",
 ]
+
+[[package]]
+name = "lzma-rust2"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1c46f3fcd2e888afdb01a07efc071cb21300e07c68d32c3e8b01b5c8cb1fcaa"
 
 [[package]]
 name = "malloc_buf"
@@ -4524,6 +4531,18 @@ checksum = "66cf8fedced2fcf12406bcb34223dffb92eaf34908ede12fed414c82b7f00b3e"
 dependencies = [
  "base16ct",
  "serde",
+]
+
+[[package]]
+name = "sevenz-rust2"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f0c68c0e8289bfd09e49ef433e8de02c7c464afc1d7f5a275c99749a880e301"
+dependencies = [
+ "crc32fast",
+ "js-sys",
+ "lzma-rust2 0.23.0",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -6623,7 +6642,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "indexmap 2.14.2",
- "lzma-rust2",
+ "lzma-rust2 0.21.0",
  "memchr",
  "nix",
  "pbkdf2",

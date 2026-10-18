@@ -2822,7 +2822,7 @@ impl App {
                         if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                             submit = true;
                         }
-                        ui.label("支持 zip / tar / tar.gz / tgz / tar.bz2；只读");
+                        ui.label("支持 zip / tar / tar.gz / tgz / 7z；只读");
                     }
                     MountKind::Wsl => match &mut dlg.wsl_distros {
                         Some(Ok(list)) if !list.is_empty() => {

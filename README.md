@@ -100,7 +100,7 @@ MCP：`cargo run -p fmnr-ai` 走 stdio；加 `--serve 127.0.0.1:PORT` 走 HTTP�
 ```
 crates/fmnr-core     核心模型：Volume trait / Entry / 打开决策 / 进度 / Board / WSL 路径
 crates/fmnr-fs       本地卷实现：ops（复制移动删除）、assoc（默认程序注册与回滚）
-crates/fmnr-archive  归档只读卷：zip / tar / tar.gz，进卷时建条目索引、内容按需读
+crates/fmnr-archive  归档只读卷：zip / tar / tar.gz / 7z，进卷时建条目索引、内容按需读
 crates/fmnr-remote   SSH/SFTP 卷（接口层，未真机验证）
 crates/fmnr-icons    图标管线：内置 SVG 集 → 光栅化 → egui 纹理，自绘
 crates/fmnr-plugins  WASM 宿主（wasmi）+ 插件注册表，可以做预览和图标插件
@@ -135,7 +135,7 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
 | M4 | MCP / HTTP / CLI / `fmnr://` / 拖放 | ✅ |
 | M5 | WASM 插件宿主 + 真插件验收 | ✅ |
 | M6 | 白板布局 + 持久化 + 恢复 | ✅ |
-| M7a | 归档只读卷（zip/tar/tgz）+ WSL UNC 识别 + wslpath | ✅ 内核层**真机实测**；UI 侧见 M8 |
+| M7a | 归档只读卷（zip/tar/tgz/7z）+ WSL UNC 识别 + wslpath | ✅ 内核层**真机实测**；UI 侧见 M8 |
 | M7b | SSH/SFTP 卷 | ⚠️ 只有接口与纯逻辑测试，**未连过真实主机** |
 | M9 | `is`：增量扫描 + 归档预索引 + 小功能合集 | ❌ **撤案**（2026-10-19）：方案文档点名的 10 个文件一个没建过、文件地图与仓内布局不符，已删；两条还活着的口子（增量目录扫描 / 扫描缓存）挪进 `docs/NEXT-BATCH.md` §21 |
 | M8 | 卷注册表 + 挂载入口（让用户真的能打开 zip / 切到 WSL / 连 SSH） | ⚠️ 入口在 UI 里；**挂 zip 实测通过**（对话框填路径→挂上→两栏列出包内内容）；**挂 WSL 实测通过**（WSL 页发现到 `Ubuntu-24.04`（来自 `wsl -l -q`）→ 挂上 → 顶栏变 `wsl:Ubuntu-24.04`、两栏与目录树都列出该发行版的根）；**SSH 那条没实测**（本机没有可连的真实主机） |
@@ -168,6 +168,10 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
   **挂一个 zip → 顶栏变成 `archive:…\sample.zip`、两栏列出包内目录与文件**。
   **没实测的**：在归档卷里双击一个文件（预览/外置打开的语义）、
   往只读卷粘贴会不会被拒得干净、SSH 那条挂载路径。
+  🔴 **7z 到"真进程"为止，没到"界面"为止**：门是拿真 7-Zip 26.00 写出的字节建的（挂上、列出、
+  读成员、加密件判红），另外用 `fmnr volumes / ls / cat` 在真 CLI 进程里端到端点过一遍；
+  `fmnr-ui` 这边只改了挂载对话框那句写错的标签（`tar.bz2`→`7z`，**没在真窗口拍过图**），
+  挂载逻辑一行没动，**界面里从没挂过 `.7z`**。
   别把"挂上了"读成"整条链都能用"。
   **WSL 挂载这一轮补测过了**：「📦 挂载」→ WSL 页发现到 `Ubuntu-24.04`
   （列表来自 `wsl -l -q`）→ 挂上 → 顶栏变 `wsl:Ubuntu-24.04`、
@@ -200,8 +204,12 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
   仍未实测的只有「未安装 WSL」那条错误文案，因此代码里不按文案判可用性，
   只看退出码。
 - **远程卷与归档卷都不做 hash 图标覆盖**（取 hash 的代价与本地不在一个量级）。
-- **归档卷只读**：进卷时一次建好条目索引（zip 读中央目录；tar/tar.gz 要顺序扫过头块，gz 还要整条 inflate），
+- **归档卷只读**：进卷时一次建好条目索引（zip 读中央目录；tar/tar.gz 要顺序扫过头块，gz 还要整条 inflate；
+  7z 读头表——名字/大小/时间/属性都在头里，成员内容按需才解压），
   成员内容按需才读——**列目录不解压**，但建索引这一步不是懒的（实测数字见 `docs/NEXT-BATCH.md` §21-2）。
+- **7z 只解主流编码**：`sevenz-rust2` 以 `default-features = false` 引入，能解 COPY/LZMA/LZMA2/BCJ/DELTA；
+  AES（加密件）与 bzip2/PPMd/deflate/lz4/zstd 的特征**没开**，撞上时明确报错、不挂一个看着像空的卷。
+  这一版也没有输口令的入口，所以加密件是"读不了"而不是"要密码"。
 - Liquid Glass 是 egui 上的 acrylic **近似**，不是像素级多层模糊。
 - 不做：音视频转码（不内嵌 FFmpeg）、文件同步、云盘挂载、系统级 Shell 扩展。
 

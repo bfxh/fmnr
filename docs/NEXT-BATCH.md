@@ -593,3 +593,75 @@ stdin 一行一条 `{"tool":"…","args":{…}}`，stdout 一行一条
      `crates/fmnr-archive/tests\index_cost_probe.rs`（沙盒，不入库）。
 
 并发写锁那条在 §4，不在这里重复。
+
+## 22. 7z 只读卷：接线 + 三条实测口径（2026-10-19）
+
+`sevenz-rust2 0.24.1`，`default-features = false`。锁文件净增 **2 个包**
+（`sevenz-rust2` 本体 + 第二份 `lzma-rust2 0.23.0`，`zip` 那侧已经带了 `0.21.0`），
+`wasm-bindgen`/`js-sys`/`crc32fast` 都在原有依赖图里 ⇒ 没有新 C 绑定、没有新构建工具要求。
+
+三条**实测出来的**口径（不是读文档读来的，都记在 `crates/fmnr-archive/tests/rawname_probe`
+那条尺上，沙盒、不入库）：
+
+1. **7z 头表的分隔符是 `/`**。本机 `7-Zip (r) 26.00` 写的件、以及两个别人打包的现成件
+   （`KswordARK-5.1.5.1.7z` 91 条、`hashcat-7.1.2.7z` 3,156 条）合计 3,358 条里
+   **0 条含反斜杠**。即使命令行给的是 `dir\deep.bin`，头里存的仍是 `dir/deep.bin`。
+   ⇒ `index_7z` 里那句 `replace('\\', "/")` **没有门能钉**（造不出这种真件），
+   留着只为和查询侧 `key_of` 同一套规范化。这条**登记**在下方"没锁住的"。
+2. **`read_file` 精确匹配原始名，不做任何分隔符转换**：拿 `dir\deep.bin` 去查一个存
+   `dir/deep.bin` 的件报 `FileNotFound`，反过来也一样。
+3. 🔴 **我先前写下的机制是错的，已改**：第一版 `read_7z_entry` 注释写的是
+   "Windows 上 7-Zip 存的是反斜杠形态，直接拿 key 查会存在但读不到"——上面第 1 条把这句话
+   判死了。那版还带一次"读每个成员都重解析一遍头表"的开销（每读一条 = 重建一次索引）。
+   现在直接按 key 读，注释换成实测口径。
+
+**反目项（anti-item）造不出来**：两次尝试（`-ms=on` + `-u!d`，以及先合成单块再 `-u!d`）
+一份带反目项的件都没产出，第二次 7zr 直接 `System ERROR: 文件不存在`。
+⇒ `index_7z` 里跳过 `is_anti_item` 那三行同样**登记为没有门**。
+按口径这两条不给假测试。
+
+**加密/编码边界**：AES 那条有真件门（`enc.7z`，报错原文
+`7z 打开失败：UnsupportedCompressionMethod("AES256_SHA256")`）。
+bzip2 / PPMd 这两类**连语料都造不出**——`7zr i` 的 codec 表里根本没有 BZip2/PPMd
+（只有 BCJ*/Copy/Delta/LZMA/LZMA2/7zAES），本机也没有全量 `7z.exe`。
+⇒ 其余未开特征的报错通路是同一段代码的推论，**没钉成门**，写进"已知边界"。
+
+**变异复打：8 条，锁住 6 条**。判红的靠什么红（按口径只有断言/expect 消息红才算钉住）：
+
+| 变异 | 红在哪 | 靠什么红 |
+| --- | --- | --- |
+| 分流里去掉 `"7z"` 那一臂 | 三条集成门 | `expect` 消息，原文 `7-Zip 自己写的件必须挂得上: Unsupported("归档格式 7z 暂不支持（zip / tar / tar.gz / 7z）")`（实测抓的，不是推的） |
+| 去掉 NT 时间**上限** | `nt_time_conversion_never_panics_and_bounds_garbage` | 被测函数自己 panic（`SystemTime + Duration` 溢出）——这条门测的就是"不崩 + 返回 None"，所以 panic 红就是被测行为 |
+| 去掉 NT 时间**下限** | 同一条 | 被测函数自己 panic（`raw - epoch` 减法下溢），同上 |
+| 隐藏位 `0x2` 认成 `0x1` | `windows_hidden_attribute_is_used_only_when_present` | `assert!(!windows_hidden(0x10, true), "只读位不是隐藏位")` 的断言消息 |
+| 检测表放回 `tar.bz2`/`tbz2` | `detection_uses_a_dot_boundary_and_only_offers_what_opens` | 断言消息（"…fmnr-archive 打不开它，别在检测表里声称支持"） |
+| 检测表退回不看点号边界 | 同一条 | 断言消息（`我做个zip`/`backup7z` 被判成归档） |
+| 索引不规范化反斜杠 | **绿（没锁住）** | 见上方第 1 条：没有反斜杠形态的件可造 |
+| 不跳过反目项 | **绿（没锁住）** | 见上方：7zr 造不出反目件 |
+
+另有一条**先量后删**的：把 `read_7z_entry` 里"库报 FileNotFound 就翻成 `Error::NotFound`"
+改成不翻，那条 `NotFound` 门照样绿 ⇒ 说明成员不存在的判定根本到不了这里
+（`read_stream` 先查头表索引就返回 `NotFound` 了）。既然够不到，这段映射已删，
+不留一条"看着像防御其实是死路"的分支。
+
+尺：`D:\KF\fmnr-sbx\.scratch\mut_7z.py`（9 条里 1 条随代码删除而作废）+
+`mut_7z_msg.py`（补"靠什么判红"）；夹具 `crates/fmnr-archive/tests/fixtures/{plain,enc}.7z`
+是本仓**第一批二进制夹具**（223 B / 286 B，内容只有 `hello.txt`/`.hide`/`dir/deep.bin`，
+无个人信息，头部只 4 条相对名 ⇒ 公开仓可提交），重造命令写在 `tests/sevenzip.rs` 文件头。
+
+**真进程端到端点过了（CLI，不是界面）**：`D:\tmp\e2e\pack.7z`（7zr 现造）放在当前目录，
+`fmnr volumes` 里出现 `archive:D:\tmp\e2e\pack.7z` / `kind: Archive`（走的正是
+`looks_like_archive` 那条检测）；`fmnr ls` 根出 `dir`(目录) + `hello.txt`(9 B)，
+`ls …/dir` 出 `deep.bin`(10 B)，`fmnr cat …/hello.txt` 回 `"hello 7z\n"` 9 字节、
+`binary:false`。加密件 `secret.7z` 那条：stderr 打
+`挂载失败：…7z 打开失败：UnsupportedCompressionMethod("AES256_SHA256")`，
+且**卷表里没有它**——不会挂一个看着像空的卷。`.hide` 在默认（不显示隐藏）下不出现。
+
+🔴 顺着这条路**量到一个既有的毛刺**（不是这轮引入的，登记）：挂载失败之后再去
+`ls archive:<那个件>`，因为卷压根没进注册表，路由兜底落到默认本地卷，报的是
+`io: D:\tmp\e2eenc\archive:D:\tmp\e2eenc\secret.7z: 文件名、目录名或卷标语法不正确 (os error 123)`
+——一句和"这个卷挂失败、原因是 AES"毫无关系的话。挂载失败的原因**已经**在 stderr 里给过了，
+所以不算吞错，但第二次调用给的错法没用。要做的是"寻到一个已知挂载失败的卷 ⇒ 直接回那条原因"，
+属于卷路由，不在 7z 这轮里顺手改。
+
+

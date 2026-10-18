@@ -28,7 +28,7 @@ pub use fmnr_archive::ArchiveVolume;
 pub enum MountError {
     #[error("路径不存在：{0}")]
     NotFound(PathBuf),
-    #[error("不是可识别的归档（支持 zip/tar/tar.gz/tgz/tar.bz2）：{0}")]
+    #[error("不是可识别的归档（支持 zip/tar/tar.gz/tgz/7z）：{0}")]
     NotAnArchive(PathBuf),
     #[error("归档打不开：{path}：{source}")]
     ArchiveOpen {
@@ -143,13 +143,22 @@ fn resolve(spec: &MountSpec) -> Result<Arc<dyn fmnr_core::Volume>, MountError> {
 ///
 /// **不能只看 extension()**：test.tar.gz 的 extension 是 gz，
 /// a.tar.bz2 是 bz2——只看最后一段会漏掉这些常见组合。
+///
+/// 两个口径要同时守住：
+/// - **必须带点号边界**。早先写的是 `name.ends_with("zip")`，于是 `我传zip`、
+///   `backuptar` 这种名字也会被认成归档（点开→挂载失败→用户看到一句莫名的错）。
+///   现在一律比 `.{suffix}`，`tgz`/`7z` 这类单词后缀同样要前面是点。
+/// - **只列 fmnr-archive 真能解的**。`tar.bz2` / `tbz2` 原先在表里，而索引器按
+///   扩展名分流时看到的是 `bz2` ⇒ 直接 `不支持`，而 CHANGELOG 还写着支持
+///   ——那是**声称有、实测没有**，不是功能。要真做得先引 bzip2 解码（C 绑定），
+///   本轮按"不占位声明"的规矩先把它从表里撤掉，等有人要再做。
 pub fn looks_like_archive(path: &Path) -> bool {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_lowercase();
-    const SUFFIXES: &[&str] = &["zip", "tar", "tar.gz", "tgz", "tar.bz2", "tbz2"];
+    const SUFFIXES: &[&str] = &[".zip", ".tar", ".tar.gz", ".tgz", ".7z"];
     SUFFIXES.iter().any(|s| name.ends_with(s))
 }
 
@@ -270,19 +279,42 @@ mod tests {
 
     #[test]
     fn archive_suffix_detection_handles_compound_extensions() {
-        // 只看 extension() 的话这三个都会漏：gz / bz2 / 无扩展名。
+        // 只看 extension() 会漏掉复合扩展名（test.tar.gz 的 extension 是 gz）。
         assert!(looks_like_archive(Path::new("a.zip")));
         assert!(looks_like_archive(Path::new("a.tar")));
         assert!(looks_like_archive(Path::new("a.tar.gz")));
         assert!(looks_like_archive(Path::new("a.tgz")));
-        assert!(looks_like_archive(Path::new("a.tar.bz2")));
-        assert!(looks_like_archive(Path::new("a.tbz2")));
+        assert!(looks_like_archive(Path::new("a.7z")));
         // 大小写不敏感
         assert!(looks_like_archive(Path::new("A.ZIP")));
+        assert!(looks_like_archive(Path::new("A.7Z")));
         assert!(!looks_like_archive(Path::new("a.txt")));
         assert!(!looks_like_archive(Path::new("a.rs")));
         // 「名字里带 zip」但不是归档后缀，不能误判
         assert!(!looks_like_archive(Path::new("zipnotes.md")));
+    }
+
+    /// 🔴 两条一起钉住：
+    /// 1. **必须看点号边界**。原先是 `ends_with("zip")` 这类写法，于是 `我做个zip`、
+    ///    `backup7z` 都被认成归档 ⇒ 用户点开只得到一句莫名的挂载失败。
+    /// 2. **表里不许留打不开的东西**。`tar.bz2`/`tbz2` 原先在这张表里，而
+    ///    `fmnr-archive` 按扩展名分流时看到的是 `bz2` ⇒ 挂了必失败；CHANGELOG 却
+    ///    把它列为支持格式。现在两边对齐：真能解的才进表（要支持 bz2 得先引
+    ///    bzip2 解码，那之前它就是"不支持"，别用检测表假装支持）。
+    #[test]
+    fn detection_uses_a_dot_boundary_and_only_offers_what_opens() {
+        assert!(!looks_like_archive(Path::new("我做个zip")));
+        assert!(!looks_like_archive(Path::new("backup7z")));
+        assert!(!looks_like_archive(Path::new("mytar")));
+        assert!(
+            !looks_like_archive(Path::new("a.tar.bz2")),
+            "bz2 还留在检测表里，但 fmnr-archive 打不开它"
+        );
+        assert!(!looks_like_archive(Path::new("a.tbz2")));
+        assert!(looks_like_archive(Path::new("a.7z")));
+        // 空名字/只有点号也不能崩
+        assert!(!looks_like_archive(Path::new("")));
+        assert!(!looks_like_archive(Path::new(".")));
     }
 
     #[test]

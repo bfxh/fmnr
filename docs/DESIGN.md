@@ -122,7 +122,7 @@ fmnr/
 ├── crates/
 │   ├── fmnr-core/      # 纯库：卷/文件树/操作/搜索/配置（无 UI 依赖）
 │   ├── fmnr-fs/        # 本地文件系统 Volume（jwalk + tokio）
-│   ├── fmnr-archive/   # zip/tar/tar.gz 只读挂载 Volume（7z 未实现）
+│   ├── fmnr-archive/   # zip/tar/tar.gz/7z 只读挂载 Volume（7z 只解主流编码，见 §依赖）
 │   ├── fmnr-remote/    # SSH/SFTP Volume（russh / russh-sftp）— 仅接口，未连过真实主机
 │   ├── fmnr-icons/     # 图标解析/渲染：内置集+覆盖解析+光栅化
 │   ├── fmnr-plugins/   # WASM 插件宿主（wasmi 解释器 + 自定义 core-module ABI）
@@ -280,7 +280,7 @@ egui immediate-mode **无原生 backdrop blur**。方案：
 | GUI | egui + eframe + egui_extras | latest | 自绘 |
 | 图标渲染 | resvg / usvg / tiny-skia | latest | SVG→纹理 |
 | 语法高亮 | ~~syntect~~ **未实现** | — | 预览是纯文本渲染，代码里 0 处高亮逻辑；`syntect` 从未出现在 `Cargo.lock` |
-| 归档 | zip 9.0 / tar 0.4 / flate2 1.0 | 实测版本 | 只读；索引进卷时建全、内容按需读（见 `docs/NEXT-BATCH.md` §21-2 的实测表）。**7z 未实现**（原计划 sevenz-rust，今天没有可验证的需求，不做占位声明） |
+| 归档 | zip 9.0 / tar 0.4 / flate2 1.0 / sevenz-rust2 0.24.1 | 实测版本 | 只读；索引进卷时建全、内容按需读（见 `docs/NEXT-BATCH.md` §21-2 的实测表）。7z 走 `sevenz-rust2` 且 `default-features = false`：能解 COPY/LZMA/LZMA2/BCJ/DELTA（7z 的默认与主流编码），**没开** AES/bzip2/PPMd/deflate/lz4/zstd 那几个可选特征——撞上时明确报错，不挂空卷。锁文件净增 2 个包（`sevenz-rust2` + 第二份 `lzma-rust2`），全是纯 Rust，没有 C 绑定 |
 | SSH/SFTP | russh / russh-sftp | 0.64.1 / 3.0.1 | **须 `default-features = false` + `ring`**：默认 `aws-lc-rs` 要 CMake+NASM，windows-gnu 编不动（实测 ring 变体 168 依赖可编） |
 | HTTP | axum | latest | |
 | MCP | 自实现 JSON-RPC over stdio（薄封装） | 视生态 | 可控 |

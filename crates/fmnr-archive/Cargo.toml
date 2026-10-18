@@ -15,6 +15,11 @@ futures = "0.3"
 zip = "9.0"
 tar = "0.4"
 flate2 = "1.0"
+sevenz-rust2 = { version = "0.24", default-features = false }
+# ^ 故意一个特征都不开：开着的只有 COPY/LZMA/LZMA2/BCJ/DELTA 这一档（= 主流 7z 用的编码）。
+#   aes256/bzip2/ppmd/deflate/lz4/zstd 各自拉 C 绑定或额外纯 Rust 依赖，
+#   而预览面板根本没有"输密码"这条入口，加密件照样读不出来；
+#   非 LZMA 编码会明确报错，不静默给出半截内容（有门钉着）。
 
 [dev-dependencies]
 tokio = { workspace = true }

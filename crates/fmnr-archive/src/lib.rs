@@ -9,7 +9,7 @@ use std::sync::Arc;
 /// 路径解析错误。Invalid 留给外包一层包装，未知后缀落到此。
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
-    #[error("不是支持的归档格式（zip 或 tar）: {0}")]
+    #[error("不是支持的归档格式（zip / tar / tar.gz / 7z）: {0}")]
     UnsupportedFormat(String),
     #[error("路径不在归档内: {0}")]
     OutsideArchive(String),
@@ -17,7 +17,7 @@ pub enum PathError {
     Invalid(String),
 }
 
-/// 归档卷：把 zip/tar 以只读方式挂载为 Volume。
+/// 归档卷：把 zip / tar / tar.gz / 7z 以只读方式挂载为 Volume。
 ///
 /// 进卷时把**全量条目索引**建好（zip 读中央目录；tar/tar.gz 顺序扫头块，gz 要整条
 /// inflate），成员内容按需才读——列目录不解压、不占内存，但建索引这一步不是懒的。
@@ -124,14 +124,96 @@ fn index(path: &Path) -> Result<BTreeMap<String, Entry>> {
     match ext.as_str() {
         "zip" => index_zip(path, &mut map)?,
         "tar" | "tgz" | "gz" => index_tar(path, &mut map)?,
+        "7z" => index_7z(path, &mut map)?,
         other => {
             return Err(Error::Unsupported(format!(
-                "归档格式 {other} 暂不支持（仅 zip/tar）"
+                "归档格式 {other} 暂不支持（zip / tar / tar.gz / 7z）"
             )))
         }
     }
     ensure_parent_dirs(&mut map);
     Ok(map)
+}
+
+/// 7z：只读挂载，编码面**故意只开一档**。
+///
+/// `sevenz-rust2` 用 `default-features = false` 引入，所以这里能解的是
+/// COPY / LZMA / LZMA2 / BCJ / DELTA（= 7z 的默认与主流编码）。
+/// `bzip2` / `PPMd` / `deflate` / `lz4` / `zstd` / AES 各自的可选依赖**没开**：
+/// 一是这一版没有"输密码"的入口（加密件照样读不出来，开了解密特征等于白引依赖），
+/// 二是 `bzip2` 那类是 C 绑定。撞上时会**明确报错**，不会给出半截或错内容。
+/// 🔴 有门的只有 AES 那一条（`encrypted_7z_fails_loudly_instead_of_mounting_empty`，
+/// 拿 7-Zip 26.00 真写的加密件）：本机 `7zr` 的 codec 表里根本没有 BZip2/PPMd，
+/// 也找不到全量 `7z.exe`，**造不出那几类的真件**，所以其余编码的报错通路只是
+/// 同一段代码的推论，没钉成门。
+fn index_7z(path: &Path, map: &mut BTreeMap<String, Entry>) -> Result<()> {
+    let ar =
+        sevenz_rust2::Archive::open(path).map_err(|e| Error::Other(format!("7z 打开失败：{e}")))?;
+    for e in &ar.files {
+        // 反目项（anti-item，增量更新里表示"这里被删了"）不是文件，列出来会变成
+        // 一个点不开的幽灵条目。
+        if e.is_anti_item {
+            continue;
+        }
+        // 分隔符与查询侧（`key_of`）保持同一套规范化。实测 7z 头表用的是 `/`
+        // （本机 7-Zip 26.00 写的件 + 两个现成件共 3,358 条，0 条含反斜杠），
+        // 🔴 所以这一句**没有门能钉**：造不出反斜杠形态的真件。留着是因为查询侧
+        // 本来就做同样的转换，两边口径不一致会比多做一次更糟。
+        let name = e.name.replace('\\', "/");
+        let key = name.trim_end_matches('/').to_string();
+        if key.is_empty() {
+            continue;
+        }
+        let is_dir = e.is_directory;
+        let mut attrs = Vec::new();
+        if is_unix_hidden(&key) || windows_hidden(e.windows_attributes, e.has_windows_attributes) {
+            attrs.push(Attr::Hidden);
+        }
+        map.insert(
+            key.clone(),
+            Entry {
+                name: key.rsplit('/').next().unwrap_or(&key).to_string(),
+                is_dir,
+                size: if is_dir { None } else { Some(e.size) },
+                modified: nt_mtime(e.has_last_modified_date, e.last_modified_date),
+                icon_key: icon_for(&key, is_dir),
+                attrs,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// 7z 的 Windows 属性位（`FILE_ATTRIBUTE_HIDDEN = 0x2`）；件里没带属性就不判。
+fn windows_hidden(attrs: u32, present: bool) -> bool {
+    present && (attrs & 0x2) != 0
+}
+
+/// NT 时间（1601 年起、100 ns 一格）→ `SystemTime`。
+///
+/// 不用 crate 给的 `From<NtTime> for SystemTime`：它先算
+/// `UNIX_EPOCH - 369 年`，而 `SystemTime` 的减法在"结果早于平台零"时**会 panic**——
+/// 一个日期字段写坏的 7z 就能把列目录打崩（本机实测：走 crate 的 `From` 时
+/// `raw = u64::MAX` **panic** 在 `time.rs:98`；而 `raw = 0/1` 那种 1970 年前的反倒不崩）。
+/// 自己做减法就得自己收两端：1970 之前、或晚于「epoch + 400 年」的（明显是坏头部）
+/// 一律 `None` —— 列出来就是"没有修改时间"，不装、不崩，也不会显示一个荒谬年份。
+fn nt_mtime(present: bool, t: sevenz_rust2::NtTime) -> Option<std::time::SystemTime> {
+    use std::time::{Duration, SystemTime};
+    if !present {
+        return None;
+    }
+    let raw = u64::from(t);
+    let epoch = u64::from(sevenz_rust2::NtTime::UNIX_EPOCH);
+    if raw < epoch {
+        return None;
+    }
+    /// 100 ns 一格 × 400 年：真实文件日期远在这之前，越过即坏数据。
+    const MAX_TICKS: u64 = 400 * 366 * 86_400 * 10_000_000;
+    let d = raw - epoch;
+    if d > MAX_TICKS {
+        return None;
+    }
+    Some(SystemTime::UNIX_EPOCH + Duration::new(d / 10_000_000, ((d % 10_000_000) * 100) as u32))
 }
 
 fn index_zip(path: &Path, map: &mut BTreeMap<String, Entry>) -> Result<()> {
@@ -387,6 +469,7 @@ impl Volume for ArchiveVolume {
             match ext.as_str() {
                 "zip" => read_zip_entry(&archive_path, &key),
                 "tar" | "tgz" | "gz" => read_tar_entry(&archive_path, &key),
+                "7z" => read_7z_entry(&archive_path, &key),
                 other => Err(Error::Other(format!("不支持的归档格式：{other}"))),
             }
         })
@@ -550,6 +633,32 @@ fn read_tar_entry(archive_path: &Path, key: &str) -> Result<Vec<u8>> {
     )))
 }
 
+/// 读 7z 里的一个成员。
+///
+/// 直接拿规范化后的 key 交给 `read_file`。这里**实测过**才这么写的：
+/// `read_file` 按头表里的原始名**精确匹配**，不做任何分隔符转换
+/// （`dir\deep.bin` 查 `dir/deep.bin` 报 FileNotFound，反过来也一样），
+/// 而 7z 头表里的分隔符实测就是 `/`——本机 7-Zip 26.00 写的件、
+/// 以及两个别人打包的现成件（91 条 + 3,156 条，共 3,358 条）里**一条反斜杠都没有**。
+/// 所以不再为了"可能存在反斜杠形态"在每次读取前重解析一遍头表：
+/// 那等于每读一个成员就把整个索引重建一次。
+/// 若真遇到那种件，列目录仍走 `index_7z` 的规范化，读取会明确报错，
+/// 不会给出空内容或错内容。
+///
+/// 「成员不存在」在这里够不到：`read_stream` 先查头表索引，缺的那条在进这里之前
+/// 就返回 `NotFound` 了（实测：把下面的错法改成"不认 FileNotFound"，那条门照样绿）。
+/// 所以这里只把库的错原样带出去，不装出一副"我也能判不存在"的样子。
+fn read_7z_entry(archive_path: &Path, key: &str) -> Result<Vec<u8>> {
+    let mut reader =
+        sevenz_rust2::ArchiveReader::open(archive_path, sevenz_rust2::Password::empty())
+            .map_err(|e| Error::Other(format!("7z 打开失败：{e}")))?;
+    // 未开启的编码（bzip2 / PPMd / deflate / lz4 / zstd / AES）在这里由库明确报错，
+    // 原样带出去——绝不返回一个"看着像成功"的空内容。
+    reader
+        .read_file(key)
+        .map_err(|e| Error::Other(format!("7z 读取 {key} 失败：{e}")))
+}
+
 fn sort_entries(entries: &mut [Entry], order: SortOrder) {
     match order {
         SortOrder::Name => entries.sort_by(|a, b| {
@@ -575,5 +684,56 @@ fn sort_entries(entries: &mut [Entry], order: SortOrder) {
                 .then_with(|| a.extension().cmp(&b.extension()))
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NT 时间的换算必须**在任何输入下都不 panic**，且坏数据落到"没有修改时间"。
+    ///
+    /// 这条不是凭空写的防御：`sevenz-rust2` 自带的 `From<NtTime> for SystemTime`
+    /// 在本机实测对 `raw = u64::MAX` 直接 panic（`time.rs:98`）。头表里的日期是文件
+    /// 给的，一个写坏的 7z 不该把列目录打崩。
+    #[test]
+    fn nt_time_conversion_never_panics_and_bounds_garbage() {
+        // 1970 之前（含 0 与 1 tick）：None，不是"1601 年"这种看着像真日期的东西
+        for raw in [0u64, 1, 1_000_000] {
+            assert_eq!(
+                nt_mtime(true, sevenz_rust2::NtTime::from(raw)),
+                None,
+                "raw={raw}"
+            );
+        }
+        // 荒谬的大值（含 u64::MAX）：None 而不是 panic
+        for raw in [u64::MAX, u64::MAX - 1, 1u64 << 62] {
+            assert_eq!(
+                nt_mtime(true, sevenz_rust2::NtTime::from(raw)),
+                None,
+                "raw={raw}"
+            );
+        }
+        // 没有日期字段：None
+        assert_eq!(nt_mtime(false, sevenz_rust2::NtTime::from(0)), None);
+        // 合法日期要能读出来。这里喂的是**自己算的** ticks（不是从夹具抄的秒数）：
+        // 钉的是"NT→SystemTime 的换算本身不错"，夹具那条日期由集成门
+        // `modified.is_some()` 管。年份只断言区间——7-Zip 存本地时间还是 UTC 我不赌。
+        let secs = 1_792_394_990u64; // 2026-10-19 07:29:50 UTC
+        let ticks = u64::from(sevenz_rust2::NtTime::UNIX_EPOCH) + secs * 10_000_000;
+        let got = nt_mtime(true, sevenz_rust2::NtTime::from(ticks));
+        assert!(got.is_some(), "合法日期不该被判成坏数据");
+        let since = got.unwrap().duration_since(std::time::UNIX_EPOCH).unwrap();
+        assert_eq!(since.as_secs(), secs);
+        let year = 1970 + since.as_secs() / (365 * 86_400);
+        assert!((2020..2100).contains(&year), "年份看着不像话：{year}");
+    }
+
+    /// Windows 属性位只在件里真带了属性时才参与判断。
+    #[test]
+    fn windows_hidden_attribute_is_used_only_when_present() {
+        assert!(windows_hidden(0x2, true), "FILE_ATTRIBUTE_HIDDEN");
+        assert!(!windows_hidden(0x2, false), "没带属性表就不该判隐藏");
+        assert!(!windows_hidden(0x10, true), "只读位不是隐藏位");
     }
 }
