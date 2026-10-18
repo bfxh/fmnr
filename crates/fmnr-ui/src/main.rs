@@ -6,6 +6,7 @@ mod dupes_run;
 mod fonts;
 mod icons;
 mod ops;
+mod popwin;
 mod preview;
 mod search;
 mod theme;

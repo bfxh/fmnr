@@ -5,7 +5,7 @@ use fmnr_core::{ListOpts, SortOrder, VPath, Volume, VolumeId};
 use fmnr_mount::{MountSpec, MountTable};
 use futures::StreamExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// 外置打开角标的颜色：按程序名归类着色。
 /// 条目出现在这个函数里，就说明**那个进程此刻确实还活着**——进程退出后
@@ -34,7 +34,10 @@ fn color_for(program: &str) -> Color32 {
 }
 
 pub struct App {
-    volume_registry: VolumeRegistry,
+    /// 用 `Arc` 是因为弹出窗口的回调拿不到 `App`（签名要求 `'static + Send + Sync`），
+    /// 只能拿一份共享句柄。挂上去的卷必须**全窗口同一本**，
+    /// 所以传的是注册表本身而不是快照——快照会让新挂的卷在旧窗口里查不到。
+    volume_registry: Arc<VolumeRegistry>,
     current_volume_id: Option<VolumeId>,
     /// 挂载记录（哪些挂上了、哪些失败了）——失败原因要留档，不能只闪一条状态。
     mount_table: MountTable,
@@ -162,6 +165,14 @@ pub struct App {
     drag: Option<DragPayload>,
     /// 本帧指针悬在哪个目录上（可以收这次拖拽）。每帧开头清空。
     drop_target: Option<PathBuf>,
+    /// 弹出的独立窗口，每个一份状态（一把锁）。见 `popwin` 模块头。
+    pops: Vec<Arc<Mutex<crate::popwin::PopWin>>>,
+    /// 主窗口与弹出窗口之间的共享：在途拖拽 + "该重列了"。
+    ///
+    /// 拖拽要放这儿而不是留在 `self.drag`：光标越过窗口边界之后，
+    /// 松手那一下只会投递给光标所在的窗口，主窗口收不到 release，
+    /// `self.drag` 会永远挂着——所以"谁收到谁落地"，另一方只看这里被取走没有。
+    hub: Arc<Mutex<crate::popwin::Hub>>,
     /// 上一帧的画布区域。用于把「视图中心」换算成画布坐标（钉节点、适应全部）。
     board_viewport: egui::Rect,
 }
@@ -213,6 +224,7 @@ enum RowAction {
     CopyPath,
     PinToBoard,
     OpenInOtherPane,
+    OpenInNewWindow,
 }
 
 /// 一次应用内拖拽搬的那批路径。
@@ -353,7 +365,7 @@ impl App {
         // M8 卷接线：启动时用 fmnr_mount 的默认计划挂载（本地 home 起步，
         // 归档/WSL/SSH 由顶栏「挂载」入口随时补挂），与 CLI 共用同一套逻辑。
         let home = dirs_home();
-        let registry = VolumeRegistry::new();
+        let registry = Arc::new(VolumeRegistry::new());
         let specs = fmnr_mount::default_plan(&home, None);
         let mount_table = fmnr_mount::mount_plan(&registry, &specs);
         // 当前卷取挂载成功的第一个 id —— 不硬编码：LocalVolume::new(home)
@@ -432,6 +444,8 @@ impl App {
             board_cam: crate::board_view::Camera::default(),
             drag: None,
             drop_target: None,
+            pops: Vec::new(),
+            hub: Arc::new(Mutex::new(crate::popwin::Hub::default())),
             board_drag: None,
             board_viewport: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)),
         };
@@ -502,7 +516,7 @@ impl App {
     ///
     /// 空目录和"读不了"必须能区分：前者显示"这里没有文件"，
     /// 后者显示路径 + 错误，用户才知道要挂卷还是改权限。
-    fn list_dir(
+    pub(crate) fn list_dir(
         rt: &tokio::runtime::Runtime,
         volume: &Arc<dyn Volume>,
         path: &Path,
@@ -2381,10 +2395,38 @@ impl eframe::App for App {
 
         // 拖拽落地：释放那一帧才知道目标，而目标正是上面画两栏时记下的。
         if self.drag.is_some() {
-            let released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
-            let copy = ctx.input(|i| i.modifiers.command);
+            // 本窗口在屏幕上的原点，和指针/按键状态一次读齐。
+            // 读指针要在 `ctx.input` 里，画图必须在闭包**外**（见下面注释）。
+            let (released, hover, copy, origin) = ctx.input(|i| {
+                (
+                    i.pointer.button_released(egui::PointerButton::Primary),
+                    i.pointer.hover_pos(),
+                    i.modifiers.command,
+                    i.viewport()
+                        .inner_rect
+                        .map(|r| r.min)
+                        .unwrap_or(egui::Pos2::ZERO),
+                )
+            });
             if released {
-                self.finish_drag(copy);
+                // Windows 把鼠标**隐式捕获**给收到按下那一下的窗口，所以拖到别的
+                // 窗口上松手时，release 仍然只投给发起方，而 `drop_target` 还是
+                // 发起方窗口里最后一次悬停的那一格。实测踩过两次：
+                // ① 从主窗口拖 beta.txt 进弹出窗口，主窗口报
+                //    「移动 beta.txt → E:\Program Files：完成 1 项」；
+                // ② 想用"指针已离开本窗口"当判据也拦不住——弹出窗口是**盖在**
+                //    主窗口 1296×839 的矩形里面的，松手点仍在"我自己的矩形"内。
+                // 所以判据是"松手点被哪个 fmnr 弹出窗口盖住"，交给它去落地。
+                let target = hover.and_then(|p| self.pop_covering(origin + p.to_vec2()));
+                match (target, hover) {
+                    (Some(id), Some(p)) => self.hand_off_drag(ctx, origin + p.to_vec2(), copy, id),
+                    _ => {
+                        self.finish_drag(copy);
+                        // 不管是搬成了、被 plan_drop 挡了、还是没落在目录上，
+                        // 这一帧之后在途拖拽就结束了——弹出窗口那边靠这个清零。
+                        self.hub.lock().unwrap().drag = None;
+                    }
+                }
             } else {
                 // 指针位置要在 `ctx.input` 里读出来，但**画图必须在闭包外**：
                 // `Context::input` 拿的是 Context 的写锁，而 `layer_painter()`
@@ -2447,6 +2489,88 @@ impl eframe::App for App {
                 self.preview = None;
             }
         }
+
+        // 弹出窗口放在最后：`show_viewport_deferred` 只是登记"这一帧它还要在"，
+        // 真正的画在中央区之后、这一帧结束时才发生。
+        self.sync_pops(ctx);
+    }
+}
+
+impl App {
+    /// 每帧收两件事（关掉的窗口摘掉、弹出窗口搬完要重列），然后把每个
+    /// 弹出窗口登记进这一帧。见 `popwin` 模块头：这一步不能省，
+    /// `show_viewport_deferred` 少调一帧，那个子视口就被拆掉。
+    fn sync_pops(&mut self, ctx: &egui::Context) {
+        self.pops.retain(|w| !w.lock().unwrap().closed);
+        if self.pops.is_empty() {
+            return;
+        }
+        // 拖拽被弹出窗口认领走了：主窗口这边收不到 release，
+        // 只能靠 `hub.drag` 变回来推断"这一批已经不归我了"。
+        if self.drag.is_some() && self.hub.lock().unwrap().drag.is_none() {
+            self.drag = None;
+            self.drop_target = None;
+        }
+        if std::mem::take(&mut self.hub.lock().unwrap().dirty) {
+            // 文件是从这两栏里搬走的，不重列就会看见一排已经不在的行。
+            self.refresh();
+        }
+        for w in &self.pops {
+            crate::popwin::show_every_frame(ctx, w, &self.hub, &self.volume_registry);
+        }
+    }
+
+    /// 把某个目录弹成一个独立的 OS 窗口。
+    fn spawn_pop(&mut self, path: PathBuf) {
+        let Some(volume_id) = self.current_volume_id.clone() else {
+            self.status = "没有当前卷，弹不出窗口".to_string();
+            return;
+        };
+        let win = crate::popwin::PopWin::new(
+            // 弹出窗口的"爸爸"始终是主窗口那一层：搬完东西要点名催它重绘。
+            egui::ViewportId::ROOT,
+            volume_id,
+            path.clone(),
+            self.show_hidden,
+            &self.volume_registry,
+        );
+        self.status = format!("已弹出窗口：{}", path.display());
+        self.pops.push(Arc::new(Mutex::new(win)));
+    }
+
+    /// 松手点（屏幕坐标）被哪个弹出窗口盖住。弹出窗口自己每帧回填它的屏幕矩形。
+    fn pop_covering(&self, pt: egui::Pos2) -> Option<egui::ViewportId> {
+        for w in &self.pops {
+            let g = w.lock().unwrap();
+            if g.screen_rect.is_some_and(|r| r.contains(pt)) {
+                return Some(g.id);
+            }
+        }
+        None
+    }
+
+    /// 把在途拖拽委托给指定的弹出窗口，由它在自己那一帧认领并搬运。
+    ///
+    /// 只有发起方收得到 release（见调用处注释），所以这里只负责**交出去**：
+    /// 点名让那个窗口重绘。
+    fn hand_off_drag(
+        &mut self,
+        ctx: &egui::Context,
+        pt: egui::Pos2,
+        copy: bool,
+        id: egui::ViewportId,
+    ) {
+        let Some(drag) = self.drag.take() else { return };
+        self.drop_target = None;
+        let n = drag.paths.len();
+        self.hub.lock().unwrap().drag = None;
+        self.hub.lock().unwrap().landing = Some(crate::popwin::Landing {
+            paths: drag.paths,
+            copy,
+            pt,
+        });
+        self.status = format!("已交给目标窗口：{n} 项");
+        ctx.request_repaint_of(id);
     }
 }
 
@@ -3110,6 +3234,20 @@ impl App {
                     self.set_selection_for(other, &name);
                 }
             }
+            RowAction::OpenInNewWindow => {
+                // 目录就开它自己，文件开它所在的目录——弹出来的窗口是一栏列表，
+                // 给它一个文件路径没有意义。
+                let to = if is_dir {
+                    path.to_path_buf()
+                } else {
+                    path.parent().map(PathBuf::from).unwrap_or_default()
+                };
+                if to.as_os_str().is_empty() {
+                    self.status = "看不出该弹出哪个目录".to_string();
+                } else {
+                    self.spawn_pop(to);
+                }
+            }
         }
     }
 
@@ -3716,6 +3854,13 @@ impl App {
                         self.clipboard_text = Some(full.clone());
                         self.status = "已复制完整路径".to_string();
                     }
+                    if ui
+                        .small_button("新窗口")
+                        .on_hover_text("把这一栏弹成一个独立窗口，可以拖文件进去")
+                        .clicked()
+                    {
+                        self.spawn_pop(self.path_of(which).clone());
+                    }
                 });
 
                 let mut filter_focused = false;
@@ -3984,12 +4129,18 @@ impl App {
                                 ui.separator();
                                 pick(ui, RowAction::CopyPath, "复制完整路径");
                                 pick(ui, RowAction::OpenInOtherPane, "在对栏打开");
+                                pick(ui, RowAction::OpenInNewWindow, "在新窗口打开");
                                 pick(ui, RowAction::PinToBoard, "钉到白板");
                             });
                         }
                     });
 
                 if let Some(d) = drag_began {
+                    // 同时抄一份进 `hub`：光标一旦越过窗口边界，release 就只发给
+                    // 另一个窗口，这里永远等不到。落地权归"看到 release 的那个窗口"。
+                    self.hub.lock().unwrap().drag = Some(crate::popwin::Drag {
+                        paths: d.paths.clone(),
+                    });
                     self.drag = Some(d);
                 }
                 // 没落在任何文件夹行上、但落点还在这一栏里，且这一栏确实列出了
@@ -4090,7 +4241,7 @@ impl App {
 /// 拆成纯函数是为了能单测：`handle_dropped_files` 里全是 egui 上下文与
 /// 长操作副作用，判定规则混在里面就只能靠手点验证。规则本身跟 UI 无关。
 #[derive(Debug, PartialEq, Eq)]
-enum DropPlan {
+pub(crate) enum DropPlan {
     /// 不动手，只给一句状态栏说明。
     Ignore(String),
     /// 拷这些源到目标目录。
@@ -4103,7 +4254,7 @@ enum DropPlan {
 /// - 路径不存在：拖放源可能来自已被删掉/移走的窗口；
 /// - 源已在目标目录里：会拷成 `a.txt` 和 `a (1).txt` 之类的重复；
 /// - 目标在源的子树内：`copy_tree` 会在自己刚建的目录里继续发现新内容，无限递归。
-fn plan_drop(dropped: &[PathBuf], dest: &Path) -> DropPlan {
+pub(crate) fn plan_drop(dropped: &[PathBuf], dest: &Path) -> DropPlan {
     let sources: Vec<PathBuf> = dropped.iter().filter(|p| p.exists()).cloned().collect();
     if sources.is_empty() {
         return DropPlan::Ignore("拖入的路径都不可用".to_string());
@@ -4448,7 +4599,7 @@ fn rename_target(old: &str, input: &str) -> String {
 
 /// 条目大小的一行显示。目录不给大小（列了也不等于 anything 有用），
 /// 用 "—" 占位比留空更不容易被读成"这一列坏了"。
-fn fmt_size(bytes: u64) -> String {
+pub(crate) fn fmt_size(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut value = bytes as f64;
     let mut unit = 0;
