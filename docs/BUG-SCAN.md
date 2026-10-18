@@ -126,3 +126,7 @@ egui 原话（`egui-0.31.1/src/viewport.rs:22`）：
   `startup.rs` 的 `mirror_entries().unwrap_or_default()` 会丢掉恢复入口、
   `app.rs` 白板载入失败静默而后续保存会覆盖、`archive` 的 `size().unwrap_or(0)`）
   复核**成立但影响面小**，本轮没动，记在这里当下轮候选。
+  其中注册表那条的**可达性已量过**：本机三棵 Uninstall 树 196 + 77 + 26 = 299 个子键，
+  `Get-ItemProperty` 读属性失败 **0 个**（同一次测量里无 `DisplayName` 的有 25 个）。
+  ⇒ 那是健壮性缺口，不是这台机器上的在用缺陷；按"不可达兜底臂不写假测试"的规矩，
+  别为它编一个造不出语料的门。
