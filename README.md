@@ -100,7 +100,7 @@ MCP：`cargo run -p fmnr-ai` 走 stdio；加 `--serve 127.0.0.1:PORT` 走 HTTP�
 ```
 crates/fmnr-core     核心模型：Volume trait / Entry / 打开决策 / 进度 / Board / WSL 路径
 crates/fmnr-fs       本地卷实现：ops（复制移动删除）、assoc（默认程序注册与回滚）
-crates/fmnr-archive  归档只读卷：zip / tar / tar.gz，懒加载挂载
+crates/fmnr-archive  归档只读卷：zip / tar / tar.gz，进卷时建条目索引、内容按需读
 crates/fmnr-remote   SSH/SFTP 卷（接口层，未真机验证）
 crates/fmnr-icons    图标管线：内置 SVG 集 → 光栅化 → egui 纹理，自绘
 crates/fmnr-plugins  WASM 宿主（wasmi）+ 插件注册表，可以做预览和图标插件
@@ -200,7 +200,8 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
   仍未实测的只有「未安装 WSL」那条错误文案，因此代码里不按文案判可用性，
   只看退出码。
 - **远程卷与归档卷都不做 hash 图标覆盖**（取 hash 的代价与本地不在一个量级）。
-- **归档卷只读**，且懒加载：只读中央目录/头，不解压成员。
+- **归档卷只读**：进卷时一次建好条目索引（zip 读中央目录；tar/tar.gz 要顺序扫过头块，gz 还要整条 inflate），
+  成员内容按需才读——**列目录不解压**，但建索引这一步不是懒的（实测数字见 `docs/NEXT-BATCH.md` §21-2）。
 - Liquid Glass 是 egui 上的 acrylic **近似**，不是像素级多层模糊。
 - 不做：音视频转码（不内嵌 FFmpeg）、文件同步、云盘挂载、系统级 Shell 扩展。
 

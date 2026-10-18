@@ -3,7 +3,7 @@
 //! 夹具在测试里现场生成，不入库二进制；这样格式假设一旦不成立，
 //! 测试会立刻炸而不是悄悄通过。
 
-use fmnr_archive::{index_note, split_path, ArchiveVolume};
+use fmnr_archive::{split_path, ArchiveVolume};
 use fmnr_core::{Error, ListOpts, Progress, SortOrder, VPath, Volume, VolumeKind};
 use futures::StreamExt;
 use std::io::{Read, Write};
@@ -311,12 +311,4 @@ fn search_finds_nested_members_bounded() {
         .unwrap();
     assert_eq!(limited.len(), 1, "limit 必须生效");
     std::fs::remove_dir_all(&dir).ok();
-}
-
-/// 提示文案不能是空话：`index_note` 要如实说明「懒加载只读」。
-#[test]
-fn index_note_states_read_only_lazy() {
-    let n = index_note();
-    assert!(n.contains("只读"), "{n}");
-    assert!(n.contains("懒加载"), "{n}");
 }

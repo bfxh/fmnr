@@ -173,7 +173,8 @@ pub struct Entry {
 Zexor 有文件夹封面。轻量版：右键「设为封面」，存 `folder.svg`/`cover.png`，仅白板/大图标视图显示。**分表存储**，避免与文件图标规则混用。
 
 ### 4.6 虚拟视图（组合）
-- **归档挂载**：zip/tar/7z 暴露为 `Volume`，路径 `archive:/D/x/a.zip/sub/dir`，只读、懒加载目录。
+- **归档挂载**：zip/tar/7z 暴露为 `Volume`，路径 `archive:/D/x/a.zip/sub/dir`，只读；
+  条目索引在**进卷时一次建全**（实测：111,100 条的合成 zip 1,247 ms），懒的只有成员内容。
 - **白板模式**：布局层非 Volume。`Board` 记录节点（文件引用+画布坐标+连线），持久化 `board.json`。文件双击经 `native_path` 交系统默认程序（本地）或拉取后打开（远程）。
 - **搜索**：即时搜索 = 遍历当前子树 `Entry` 流 + 谓词过滤（jwalk 并行 + 谓词下推）。全盘索引引擎 v2 候选。
 
@@ -279,7 +280,7 @@ egui immediate-mode **无原生 backdrop blur**。方案：
 | GUI | egui + eframe + egui_extras | latest | 自绘 |
 | 图标渲染 | resvg / usvg / tiny-skia | latest | SVG→纹理 |
 | 语法高亮 | ~~syntect~~ **未实现** | — | 预览是纯文本渲染，代码里 0 处高亮逻辑；`syntect` 从未出现在 `Cargo.lock` |
-| 归档 | zip 9.0 / tar 0.4 / flate2 1.0 | 实测版本 | 只读、懒加载。**7z 未实现**（原计划 sevenz-rust，今天没有可验证的需求，不做占位声明） |
+| 归档 | zip 9.0 / tar 0.4 / flate2 1.0 | 实测版本 | 只读；索引进卷时建全、内容按需读（见 `docs/NEXT-BATCH.md` §21-2 的实测表）。**7z 未实现**（原计划 sevenz-rust，今天没有可验证的需求，不做占位声明） |
 | SSH/SFTP | russh / russh-sftp | 0.64.1 / 3.0.1 | **须 `default-features = false` + `ring`**：默认 `aws-lc-rs` 要 CMake+NASM，windows-gnu 编不动（实测 ring 变体 168 依赖可编） |
 | HTTP | axum | latest | |
 | MCP | 自实现 JSON-RPC over stdio（薄封装） | 视生态 | 可控 |
@@ -343,7 +344,7 @@ egui immediate-mode **无原生 backdrop blur**。方案：
 | 图标 hash 覆盖在远程卷失效 | 中 | 远程卷只走扩展名/文件名覆盖 |
 | ~~WSL 无法本机验证~~ → **已消解** | 低 | 2026-10-16 本机装了 WSL2，`wsl_live.rs` 用真 distro 跑通「UNC 可 read_dir + wslpath 往返落同一文件」；剩余风险只在「无 WSL 的 CI 机器」，测试据此自动跳过而非判红 |
 | MCP 生态协议变更 | 中 | 薄封装，协议层可替换 |
-| 归档/远程卷性能 | 中 | 只读 + 懒加载；大 zip 不全量枚举 |
+| 归档/远程卷性能 | 中 | 只读；**大 zip 是全量枚举条目**（但不解压内容）——实测 111k 条 open 1.25 s、单层 list 9 ms，代价落在进卷那一下 |
 | 单 EXE 与 VCRT 静态链接体积/兼容 | 低 | 默认静态链接 CRT |
 
 ---

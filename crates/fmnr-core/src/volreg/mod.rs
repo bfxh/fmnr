@@ -159,7 +159,7 @@ fn display_name(v: &dyn Volume) -> String {
 
 fn note_for(v: &dyn Volume) -> String {
     match v.kind() {
-        crate::VolumeKind::Archive => "只读挂载，懒加载目录".to_string(),
+        crate::VolumeKind::Archive => "只读挂载，进卷时建好条目索引".to_string(),
         crate::VolumeKind::Wsl => "WSL 卷".to_string(),
         crate::VolumeKind::Remote => "SSH/SFTP 远程卷".to_string(),
         _ => String::new(),
@@ -255,6 +255,35 @@ mod tests {
         ) -> Result<Vec<VPath>> {
             panic!("not used in dummy");
         }
+    }
+
+    /// 侧栏与 CLI 上那句归档说明，必须是**量出来的**事实。
+    ///
+    /// 🔴 原话是「只读挂载，懒加载目录」，而实测 `ArchiveVolume::open` 走的就是
+    /// `index()`：进卷时一次性把全量条目索引建好（111,100 条 / 11,100 层的合成 zip
+    /// 要 1,247 ms；9.3 MiB 的 tar.gz 因为没有中央目录要整条扫过，要 509 ms），
+    /// 真正按需的只有成员内容。数字与尺见 `docs/NEXT-BATCH.md` §21-2。
+    /// 这条门同时钉住"不许再说懒加载目录"——同一句事实写两份文案就是本轮改错的源头。
+    #[test]
+    fn archive_note_states_eager_index_not_lazy_listing() {
+        let reg = VolumeRegistry::new();
+        reg.add(Arc::new(DummyVol {
+            id: VolumeId("archive:/x/a.zip".into()),
+            kind: crate::VolumeKind::Archive,
+            entries: Vec::new(),
+        }));
+        let info = reg
+            .list()
+            .into_iter()
+            .find(|v| v.kind == crate::VolumeKind::Archive)
+            .expect("归档卷该列得出来");
+        assert!(info.note.contains("只读"), "{}", info.note);
+        assert!(info.note.contains("索引"), "{}", info.note);
+        assert!(
+            !info.note.contains("懒加载"),
+            "{}：条目索引是进卷时一次建好的，「懒加载目录」是说反了",
+            info.note
+        );
     }
 
     #[test]

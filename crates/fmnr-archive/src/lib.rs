@@ -6,14 +6,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// 卷的说明文案，UI 侧直接展示。
-///
-/// 刻意把「只读」和「懒加载」写进同一句：用户看到归档能列目录，
-/// 很容易以为可以往里拖文件——写清楚比事后报错好。
-pub fn index_note() -> String {
-    "归档卷：只读挂载，懒加载目录（不预解压成员内容）".to_string()
-}
-
 /// 路径解析错误。Invalid 留给外包一层包装，未知后缀落到此。
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
@@ -27,7 +19,8 @@ pub enum PathError {
 
 /// 归档卷：把 zip/tar 以只读方式挂载为 Volume。
 ///
-/// 懒加载：构造时只读中央目录/头，不解压任何文件内容。
+/// 进卷时把**全量条目索引**建好（zip 读中央目录；tar/tar.gz 顺序扫头块，gz 要整条
+/// inflate），成员内容按需才读——列目录不解压、不占内存，但建索引这一步不是懒的。
 /// 路径形如 `archive:/abs/path/a.zip/sub/dir`。
 pub struct ArchiveVolume {
     id: VolumeId,
