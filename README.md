@@ -4,7 +4,7 @@
 > file manager in rust
 
 > 命名说明：仓库、crate、二进制、`fmnr://` 协议字面量一律保留 `fmnr`，
-> 全量重命名推迟到发布范围确定后单独做，理由见 [`docs/IS-CONTRIBUTION.md`](docs/IS-CONTRIBUTION.md) §0。
+> 全量重命名推迟到发布范围确定后单独做（发布压缩包名也保留 `fmnr-<版本>-<平台>.zip`：非 ASCII 文件名在下载地址里会被百分号编码，脚本和 `SHA256SUMS.txt` 都容易踩坑）。
 
 不接管系统、不依赖 Explorer 的文件管理器。三个跟别人不一样的卖点：
 
@@ -112,15 +112,15 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
 ```
 
 设计文档见 [`docs/DESIGN.md`](docs/DESIGN.md)（唯一事实源）。
-下一步的实测盘点与取舍见 [`docs/UI-NEXT.md`](docs/UI-NEXT.md)
-（缺口清单按 grep 证据列、顺带查出两个真缺陷、磁盘占用视图与包更新提示的可行性数字）。
+界面的**实测记录与机制**见 [`docs/UI-NEXT.md`](docs/UI-NEXT.md)
+（为什么这么设计、当时量到多少、哪条路被证否；交付结论看 CHANGELOG）。
 
 [`docs/NEXT-BATCH.md`](docs/NEXT-BATCH.md)：跨设备连接、7z 与"比它更强"、重复文件、
 加密与文件锁、卸载残留、MCP 是不是瓶颈——每条标了一手来源/推断/未找到，
 并写明哪三条我不同意提法本身（§6 尤其）。
 
-[`docs/IS-CONTRIBUTION.md`](docs/IS-CONTRIBUTION.md)：下一次 `is` 提交的完整实施方案——
-增量目录扫描（is-scan）、归档预索引、五个小功能，附待决策项的方案 A/B 与风险清单。
+[`docs/BUG-SCAN.md`](docs/BUG-SCAN.md)：用本地工具在独立沙盒里扫 bug 的记录——
+确证并修掉的、被实测推翻的、以及**证否**（跑了发现没有）的，都留了可复算的判据。
 
 ---
 
@@ -137,7 +137,7 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
 | M6 | 白板布局 + 持久化 + 恢复 | ✅ |
 | M7a | 归档只读卷（zip/tar/tgz）+ WSL UNC 识别 + wslpath | ✅ 内核层**真机实测**；UI 侧见 M8 |
 | M7b | SSH/SFTP 卷 | ⚠️ 只有接口与纯逻辑测试，**未连过真实主机** |
-| M9 | `is`：增量扫描 + 归档预索引 + 小功能合集 | 📋 **方案已定稿未实现**：[`docs/IS-CONTRIBUTION.md`](docs/IS-CONTRIBUTION.md) |
+| M9 | `is`：增量扫描 + 归档预索引 + 小功能合集 | ❌ **撤案**（2026-10-19）：方案文档点名的 10 个文件一个没建过、文件地图与仓内布局不符，已删；两条还活着的口子（增量目录扫描 / 扫描缓存）挪进 `docs/NEXT-BATCH.md` §21 |
 | M8 | 卷注册表 + 挂载入口（让用户真的能打开 zip / 切到 WSL / 连 SSH） | ⚠️ 入口在 UI 里；**挂 zip 实测通过**（对话框填路径→挂上→两栏列出包内内容）；**挂 WSL 实测通过**（WSL 页发现到 `Ubuntu-24.04`（来自 `wsl -l -q`）→ 挂上 → 顶栏变 `wsl:Ubuntu-24.04`、两栏与目录树都列出该发行版的根）；**SSH 那条没实测**（本机没有可连的真实主机） |
 | 拖拽 | 应用内两栏拖放搬运（含原地/自嵌套预检、Ctrl=复制） | ✅ 四条落地路径 computer-use 点过并 `ls` 对账；**Ctrl+drag 未点验**（自动化按不住修饰键） |
 | 包更新 | 「包管理器」面板：可升级（winget）+ 已装清单（注册表底账）+ 详情 + 拖入快捷方式认应用；**浏览到某程序的目录时栏顶给一行弱提示** | ✅ 本机真跑：可升级 11 项、底账 273 条（与独立计数一致）、详情/过滤/复制命令点过；打开面板就同时装载两份数据；**不代跑升级**（提示里也只复制 `winget upgrade --id …`）。目录归属判定层拿真注册表自洽跑过（67/67 认出自己、放弃 0 条），**但那一行提示的渲染没在真窗口看到过**，见下面「已知边界」。GitHub 上游只认出仓名，联网查询未接 |
@@ -149,7 +149,7 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
 | 多卷寻址 | MCP/HTTP 每次调用按参数选卷（与 CLI 共用 `fmnr-core` 那一份规则），空表明确报错而不是列空 | ✅ 探针卷测试钉住"选错卷立刻显形"（第一版用两个本地卷的测试把路由摘掉照样过，已作废重写）；**独立 MCP 进程仍挂不了 zip**，那是依赖决定 |
 | 子树搜索 | 归档/远程卷走 `Volume::list` 逐层遍历（本地仍走 jwalk），根读不了说成"搜不动"而不是 0 命中 | ✅ 归档卷真跑：包内 `inner/deep-readme-4471.md` 搜 `deep` 命中（1 结果 · 1 ms）；**远程卷未实测**（本机无 SSH 目标） |
 | 特殊文件夹 | 目录树起点下挂 下载/文档/图片/桌面（走系统已知文件夹，不拼 `home\Downloads`） | ✅ 真跑点过：点「下载」→ 栏头/面包屑/状态栏三处都是 `C:\Users\lbx13\Downloads`；被重定向的文件夹也拿得到真实位置 |
-| 路径串 | 面包屑/栏头与列出的内容必须指向同一个目录 | ✅ 已确诊并修：旧面包屑按 `components()` 取前 N 个重拼，Windows 上第一跳给的是 `E:`（盘相对，按该盘 CWD 解析）。现在标签与目标同源走 `ancestors()`，枚举层 `LocalVolume::resolve` 把 `E:` 补成 `E:\`（MCP/HTTP/CLI 那条腿客户端可以直接传 `"path":"E:"`）。真跑验过：`E:\tmp\adv-mut` 点「tmp」→ 栏头 `E:\tmp`、列的是 tmp 的内容。见 `docs/UI-NEXT.md` §10 |
+| 路径串 | 面包屑/栏头与列出的内容必须指向同一个目录 | ✅ 已确诊并修：旧面包屑按 `components()` 取前 N 个重拼，Windows 上第一跳给的是 `E:`（盘相对，按该盘 CWD 解析）。现在标签与目标同源走 `ancestors()`，枚举层 `LocalVolume::resolve` 把 `E:` 补成 `E:\`（MCP/HTTP/CLI 那条腿客户端可以直接传 `"path":"E:"`）。真跑验过：`E:\tmp\adv-mut` 点「tmp」→ 栏头 `E:\tmp`、列的是 tmp 的内容。机制与实测见 `docs/UI-NEXT.md` §10 |
 | CI | 五道门禁（lint / 双平台测试 / 插件行为 / 插件字节可复现 / 客户端契约） | ✅ `85f8ba9`（run 38979552946）全绿 |
 
 本地跑门用 [`scripts/gate.sh`](scripts/gate.sh)：按 CI 的顺序跑，最后一步

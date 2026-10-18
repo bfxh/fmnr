@@ -3,8 +3,8 @@
 > 唯一事实源。合并了 v1（架构/范围/论文/选型）与 v2（打开语义/Liquid Glass 视觉/Zexor 借避/仓库）。
 > 输入：对 Zexor（https://zex.leoog.com/）UX 的认可 + 用户需求（独立于系统、自绘文件图标、统一预览+状态可见、iOS 26 Liquid Glass 视觉、跨协议/AI 兼容、WSL 感知）+ Rust 最新工具链。
 > 版本：v1（2026-10-15）。后续改动只改本文件，并在 §12 记台账。
-> 下一次 `is` 提交的实施方案（增量扫描 / 归档预索引 / 小功能合集）另立于 [`IS-CONTRIBUTION.md`](IS-CONTRIBUTION.md)；
-> 产品名定为「**终**」、仓库/crate/`fmnr://` 字面量保留 `fmnr`（决策理由见该文件 §0）。
+> 产品名定为「**终**」、仓库/crate/`fmnr://` 字面量保留 `fmnr`，全量重命名推迟到发布范围确定后单独做。
+> M9「is 提交」的方案文档已于 2026-10-19 删除：那份方案点名的 10 个文件一个都没建过，且它写的文件地图与仓内实际布局不符（`fmnr-ui/src/space.rs`、`fmnr-archive/src/archive_volume.rs` 都不存在）。两条还活着的口子挪到 `NEXT-BATCH.md` §21。
 
 ---
 
@@ -383,7 +383,8 @@ egui immediate-mode **无原生 backdrop blur**。方案：
 | v1.1 | 2026-10-15 | 文档收进仓内（`docs/DESIGN.md` 成为唯一事实源）；§11 落实远端 `bfxh/fmnr` + MIT。**里程碑实况：M0–M6 已完成并提交**（M6 分两笔：core 的 board 模型、UI 的白板视图），workspace 测试 168 passed / 0 failed / 2 ignored |
 | v1.2 | 2026-10-16 | M8 卷接线 UI 侧补齐：顶栏卷选择器 + `switch_volume()` + 修正 `current_volume_id` 硬编码错配（详见 §10 M8 行）。**如实降级**：归档/WSL/SSH 卷仍无注册入口，M8 出口判据未满足 |
 | v1.3 | 2026-10-16 | M8 **挂载入口落地**：新建 `fmnr-mount` 聚合 crate（`MountSpec` 意图 / `mount()` / `MountTable::mount_all()` / `discover_wsl_distros()` / `discover_archives()`），UI 顶栏「📦 挂载」三选一对话框 + CLI 改走同一套计划，归档/WSL/SSH 卷首次真正能注册进 registry。顺带修掉 CLI 侧与 UI 同源的 `local:.` 硬编码 id 坑。详见 §10 M8 行 |
-| v1.4 | 2026-10-17 | 命名决策落档：产品名「终」（README 顶部标注），仓库/crate/二进制/`fmnr://` 字面量保留 `fmnr`，全量重命名推迟到发布范围确定后（[`IS-CONTRIBUTION.md`](IS-CONTRIBUTION.md) §0）。同文件定稿 M9 方案：is-scan 增量扫描 + 归档预索引 + 五个小功能（文件锁/磁盘占用增量/拖放进度/插件预览/协议注册回滚），含待决策项方案 A/B 与风险清单 |
+| v1.4 | 2026-10-17 | 命名决策落档：产品名「终」（README 顶部标注），仓库/crate/二进制/`fmnr://` 字面量保留 `fmnr`，全量重命名推迟到发布范围确定后。同文件定稿 M9 方案：is-scan 增量扫描 + 归档预索引 + 五个小功能（文件锁/磁盘占用增量/拖放进度/插件预览/协议注册回滚），含待决策项方案 A/B 与风险清单 |
+| v1.5 | 2026-10-19 | 删掉 `IS-CONTRIBUTION.md`（M9 方案：点名的 10 个文件一个没建过，文件地图与仓内布局不符）；`UI-NEXT.md` 的 §1/§8 收档（缺口清单过半过期、六件待拍全被已上线代码回答）。M9 剩下的两条活口（增量目录扫描 / 扫描缓存）挪进 `NEXT-BATCH.md` §21 |
 
 ---
 
