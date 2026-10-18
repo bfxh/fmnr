@@ -1,5 +1,25 @@
 use eframe::egui::{self, Color32, CornerRadius, FontId, Stroke, TextStyle, Vec2, Visuals};
 
+/// 行内"大小"列的宽度。原来给到 110，名字列和数字之间是一片void；
+/// 目录行还填一个「—」，那列对目录本来就没有意义，纯属噪音。
+pub const SIZE_COL_W: f32 = 74.0;
+/// 图标 + 角标占掉的行首宽度。名字列 = 可用宽 − 这两项，
+/// 算在两处就会分叉，所以收成常量。
+pub const ROW_LEAD_W: f32 = 26.0;
+/// 状态栏左右两段之间的间隔。
+pub const STATUS_GAP: f32 = 14.0;
+
+/// 一行的两列宽度：`(名字列, 大小列)`。
+///
+/// 收成函数是因为这两处以前各写各的字面量（名字列 `avail_w − 130`、
+/// 大小列 `110`），改一个忘一个就会让名字和数字重叠或留出一大片空隙。
+/// 不变量：两列加起来正好等于可用宽，且不出现负数。
+pub fn row_cols(avail_w: f32) -> (f32, f32) {
+    let size_w = SIZE_COL_W;
+    let name_w = (avail_w - ROW_LEAD_W - size_w).max(60.0);
+    (name_w, size_w)
+}
+
 /// 用浅色半透明层次和细描边近似 Liquid Glass，不做背景模糊。
 pub fn apply_liquid_glass(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
@@ -121,5 +141,26 @@ mod tests {
         ] {
             assert_eq!(style.text_styles.get(&role), Some(&expected));
         }
+    }
+
+    /// 行的两列必须**正好铺满**可用宽：以前名字列写 `avail_w − 130`、
+    /// 大小列写 `110`，两处各算各的，改一边就出现"名字和数字重叠"或
+    /// "中间一片空白"。这条把"加起来等于 avail_w"钉住。
+    #[test]
+    fn row_columns_tile_the_available_width() {
+        for avail in [640.0_f32, 320.0, 120.0] {
+            let (name, size) = row_cols(avail);
+            assert_eq!(size, SIZE_COL_W, "大小列宽度是定死的列基线");
+            assert!(name > 0.0 && name <= avail);
+            // 只有窄到名字列触底（60）时才允许铺不满——那时是被 .max(60) 兜住，
+            // 不是两列各算各的。
+            let sum = ROW_LEAD_W + name + size;
+            assert!(
+                (sum - avail).abs() < 0.5 || name == 60.0,
+                "avail={avail} 两列合计 {sum}"
+            );
+        }
+        // 反证用：极窄时名字列停在 60 而不是变负数。
+        assert_eq!(row_cols(40.0).0, 60.0);
     }
 }

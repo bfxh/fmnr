@@ -2184,13 +2184,13 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("fmnr").strong());
                 ui.separator();
-                if ui.button("⬅ 上级").clicked() {
+                if ui.button("上级").clicked() {
                     self.go_up();
                 }
-                if ui.button("⟳ 刷新").clicked() {
+                if ui.button("刷新").clicked() {
                     self.refresh();
                 }
-                if ui.button("🔎 搜索").clicked() {
+                if ui.button("搜索").clicked() {
                     self.open_search();
                 }
                 ui.separator();
@@ -2223,34 +2223,34 @@ impl eframe::App for App {
                     }
                 }
                 // M8 挂载入口：归档/WSL/SSH 卷在这里注册进同一个 registry。
-                if ui.button("📦 挂载").clicked() {
+                if ui.button("挂载").clicked() {
                     self.mount_dialog = Some(MountDialog::new());
                 }
-                if ui.button("⚙ 设置").clicked() {
+                if ui.button("设置").clicked() {
                     self.open_settings();
                 }
-                if ui.button("📊 空间").clicked() {
+                if ui.button("空间").clicked() {
                     self.open_usage();
                 }
                 // 入口留在顶栏常驻（用户要的是"随时能看到、随时能改"），
                 // 但它开的是设置停靠区里的那一节，不再有自己的窗。
-                if ui.button("🚀 自启动").clicked() {
+                if ui.button("自启动").clicked() {
                     self.open_startup();
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // 只在白板视图里有意义：平移走远后靠它找回自己的东西。
-                    if self.view == ViewMode::Board && ui.button("🔍 适应全部").clicked() {
+                    if self.view == ViewMode::Board && ui.button("适应全部").clicked() {
                         self.fit_board();
                     }
                     if ui
-                        .selectable_label(self.view == ViewMode::Board, "🗺 白板")
+                        .selectable_label(self.view == ViewMode::Board, "白板")
                         .clicked()
                     {
                         self.view = ViewMode::Board;
                     }
                     if ui
-                        .selectable_label(self.view == ViewMode::Panes, "▥ 双栏")
+                        .selectable_label(self.view == ViewMode::Panes, "双栏")
                         .clicked()
                     {
                         self.view = ViewMode::Panes;
@@ -2259,25 +2259,25 @@ impl eframe::App for App {
             });
 
             ui.horizontal(|ui| {
-                if ui.button("📋 复制").clicked() {
+                if ui.button("复制").clicked() {
                     self.put_clipboard(crate::ops::ClipMode::Copy);
                 }
-                if ui.button("✂ 剪切").clicked() {
+                if ui.button("剪切").clicked() {
                     self.put_clipboard(crate::ops::ClipMode::Cut);
                 }
-                if ui.button("📥 粘贴").clicked() {
+                if ui.button("粘贴").clicked() {
                     self.paste();
                 }
-                if ui.button("🗑 删除").clicked() {
+                if ui.button("删除").clicked() {
                     self.delete_selected();
                 }
-                if ui.button("✎ 重命名").clicked() {
+                if ui.button("重命名").clicked() {
                     self.begin_rename();
                 }
-                if ui.button("＋ 新建目录").clicked() {
+                if ui.button("新建目录").clicked() {
                     self.begin_new_dir();
                 }
-                if ui.button("📌 钉到白板").clicked() {
+                if ui.button("钉到白板").clicked() {
                     self.pin_selected_to_board();
                 }
                 ui.separator();
@@ -2287,7 +2287,11 @@ impl eframe::App for App {
                     self.refresh();
                 }
                 let mut sort_changed = false;
-                egui::ComboBox::new("sort", "排序")
+                // egui 的 ComboBox 把自带 label 画在按钮**右边**（combo_box.rs 里
+                // `ir.response |= ui.label(label)`），于是"排序"两个字孤零零吊在
+                // 下拉框后面，看不出它是这个框的名字。改成自己先写标签。
+                ui.label("排序");
+                egui::ComboBox::new("sort", "")
                     .selected_text(sort_label(self.sort))
                     .show_ui(ui, |ui| {
                         for (order, name) in [
@@ -2324,7 +2328,15 @@ impl eframe::App for App {
                     ui.label(&self.status);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(self.clipboard.summary());
+                    // 右段是常驻状态（剪贴板 / 缺字体 / 插件告警），左段是"刚刚发生了什么"
+                    // 的回显。两者同字号同灰度时，回显会被读成常驻信息，
+                    // 于是"到底搬没搬成"要看半天。加一条竖线 + 右段转弱色。
+                    // 竖线只在左边**真有东西**时才画：空状态栏上浮一条孤线像坏了。
+                    if self.running.is_some() || !self.status.is_empty() {
+                        ui.separator();
+                        ui.add_space(crate::theme::STATUS_GAP);
+                    }
+                    ui.label(egui::RichText::new(self.clipboard.summary()).weak());
                     // 没装到 CJK 字体时整屏中文都是豆腐块，而用户分不清
                     // "程序坏了"和"这台机没字体"——这条必须一直挂在状态栏上。
                     if !self.cjk_font_ok {
@@ -3605,25 +3617,37 @@ impl App {
                             .current_volume()
                             .is_some_and(|v| v.kind() == fmnr_core::VolumeKind::Local);
                         let free = d.space.map(|s| fmt_size(s.free));
-                        let label = format!(
-                            "{} {}{}",
-                            d.kind.glyph(),
-                            d.display(),
-                            match &free {
-                                Some(f) => format!("  剩 {f}"),
-                                None => "  （容量读不到）".to_string(),
-                            }
+                        // 名字在左、剩余量在右，且右对齐到同一列基线。
+                        // 原先是 `"E:\ 文档 剩 887.2 MB"` 一整串：盘名长短不一，
+                        // 剩余量就每行错位，扫一眼对不出哪块快满了。
+                        let name = format!("{} {}", d.kind.glyph(), d.display());
+                        let free_text = match &free {
+                            Some(f) => format!("剩 {f}"),
+                            None => "容量读不到".to_string(),
+                        };
+                        let row = ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(name).size(12.0));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(free_text)
+                                            .size(12.0)
+                                            .weak()
+                                            .monospace(),
+                                    );
+                                },
+                            );
+                        });
+                        // 整行可点要自己盖一层 interact：`horizontal(..).response`
+                        // 的 Sense 只有 hover（这一节先前就栽在 `.selectable(false)`
+                        // 上，那次修的是 Sense，不是对齐）。
+                        let hit = ui.interact(
+                            row.response.rect,
+                            ui.id().with(("drive", &d.root)),
+                            egui::Sense::click(),
                         );
-                        if ui
-                            .add(
-                                egui::Label::new(egui::RichText::new(label).size(12.0))
-                                    .selectable(false)
-                                    // 🔴 `Label` 的默认 Sense 是 **hover**，
-                                    // `.selectable(false)` 只关掉选中文字、不给点击。
-                                    // 少了这一行 `.clicked()` 恒 false ⇒ 整节看着能点、
-                                    // 点了什么都没有（真跑时才发现，单测抓不到）。
-                                    .sense(egui::Sense::click()),
-                            )
+                        if hit
                             .on_hover_text(if cur {
                                 "挂这块盘并切过去"
                             } else {
@@ -3773,49 +3797,70 @@ impl App {
                     .filter(|(p, _)| *p == which)
                     .map(|(_, s)| s.clone());
                 let mut goto: Option<String> = None;
-                if let Some(mut buf) = editing {
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut buf)
-                            .hint_text("贴一个路径，回车过去")
-                            .desired_width((width - 28.0).max(80.0)),
-                    );
-                    if !resp.has_focus() {
-                        resp.request_focus();
-                    }
-                    let (enter, esc) = ui
-                        .ctx()
-                        .input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
-                    if resp.has_focus() && esc {
-                        self.path_edit = None;
-                    } else if resp.has_focus() && enter {
-                        goto = Some(buf);
-                    } else if let Some(cur) = self.path_edit.as_mut() {
-                        cur.1 = buf;
-                    }
-                } else {
-                    // 中间省略：路径的尾巴才是"你在哪"，掐尾等于把最有用的那段切掉。
-                    let shown = middle_ellipsis(&full, char_budget(width));
-                    let head_text = if active {
-                        egui::RichText::new(format!("● {shown}"))
-                            .color(Color32::from_rgb(0, 122, 255))
-                            .strong()
+                // 栏头一行：左边"我在哪"，右边"对这一栏动手"。
+                // 那两个按钮原先贴在面包屑末尾，读起来像面包屑的一段。
+                ui.horizontal(|ui| {
+                    if let Some(mut buf) = editing {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut buf)
+                                .hint_text("贴一个路径，回车过去")
+                                .desired_width((width - 132.0).max(80.0)),
+                        );
+                        if !resp.has_focus() {
+                            resp.request_focus();
+                        }
+                        let (enter, esc) = ui
+                            .ctx()
+                            .input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
+                        if resp.has_focus() && esc {
+                            self.path_edit = None;
+                        } else if resp.has_focus() && enter {
+                            goto = Some(buf);
+                        } else if let Some(cur) = self.path_edit.as_mut() {
+                            cur.1 = buf;
+                        }
                     } else {
-                        egui::RichText::new(format!("○ {shown}")).weak()
-                    };
-                    let head = ui
-                        .add(
-                            egui::Label::new(head_text)
-                                .truncate()
-                                .sense(egui::Sense::click()),
-                        )
-                        .on_hover_text(format!("{full}\n单击=设为当前栏，双击=改路径"));
-                    if head.clicked() {
-                        self.active_pane = which;
+                        // 中间省略：路径的尾巴才是"你在哪"，掐尾等于把最有用的那段切掉。
+                        // 给右侧两个按钮留出位子。标签本身不用 truncate——
+                        // 文字已经按这个预算做过中间省略了，再截一次反而会把
+                        // "尾巴（你在哪）"切掉，而中间省略保的就是尾巴。
+                        let shown = middle_ellipsis(&full, char_budget(width - 132.0));
+                        let head_text = if active {
+                            egui::RichText::new(format!("● {shown}"))
+                                .color(Color32::from_rgb(0, 122, 255))
+                                .strong()
+                        } else {
+                            egui::RichText::new(format!("○ {shown}")).weak()
+                        };
+                        let head = ui
+                            .add(egui::Label::new(head_text).sense(egui::Sense::click()))
+                            .on_hover_text(format!("{full}\n单击=设为当前栏，双击=改路径"));
+                        if head.clicked() {
+                            self.active_pane = which;
+                        }
+                        if head.double_clicked() {
+                            self.path_edit = Some((which, full.clone()));
+                        }
                     }
-                    if head.double_clicked() {
-                        self.path_edit = Some((which, full.clone()));
-                    }
-                }
+                    // 贴右画：这两个动作作用在**整栏**上，不是面包屑的又一段。
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("新窗口")
+                            .on_hover_text("把这一栏弹成一个独立窗口，可以拖文件进去")
+                            .clicked()
+                        {
+                            self.spawn_pop(self.path_of(which).clone());
+                        }
+                        if ui
+                            .small_button("复制")
+                            .on_hover_text("复制当前目录的完整路径")
+                            .clicked()
+                        {
+                            self.clipboard_text = Some(full.clone());
+                            self.status = "已复制完整路径".to_string();
+                        }
+                    });
+                });
                 if let Some(raw) = goto {
                     self.path_edit = None;
                     self.goto_path(which, &raw);
@@ -3845,21 +3890,6 @@ impl App {
                         if i + 1 < crumbs.len() {
                             ui.label("›");
                         }
-                    }
-                    if ui
-                        .small_button("复制")
-                        .on_hover_text("复制当前目录的完整路径")
-                        .clicked()
-                    {
-                        self.clipboard_text = Some(full.clone());
-                        self.status = "已复制完整路径".to_string();
-                    }
-                    if ui
-                        .small_button("新窗口")
-                        .on_hover_text("把这一栏弹成一个独立窗口，可以拖文件进去")
-                        .clicked()
-                    {
-                        self.spawn_pop(self.path_of(which).clone());
                     }
                 });
 
@@ -3975,6 +4005,9 @@ impl App {
                 // 留 16px 给纵向滚动条：不留的话右栏整行会顶出窗口右缘，
                 // 大小那一列被切掉半个字。
                 let avail_w = (ui.available_width() - 16.0).max(120.0);
+                // 名字列与大小列各占多少，交给 theme 里那把尺算：以前两处各写各的
+                // 字面量（−130 / 110），改一个忘一个就会出现重叠或一大片空。
+                let (name_w, size_w) = crate::theme::row_cols(avail_w);
 
                 // 闭包内不借用 self（避免与 selected 冲突），事件收集到闭包外处理。
                 let mut dbl_pick: Option<(String, bool)> = None;
@@ -4064,7 +4097,7 @@ impl App {
                                 // 所以两列各自占固定宽，整行 = avail_w。
                                 let label = ui
                                     .allocate_ui_with_layout(
-                                        egui::vec2((avail_w - 130.0).max(60.0), row_h),
+                                        egui::vec2(name_w, row_h),
                                         egui::Layout::left_to_right(egui::Align::Center),
                                         |ui| {
                                             // selectable(false)：Label 默认可选文本，
@@ -4082,12 +4115,18 @@ impl App {
                                     label.on_hover_text(format!("已在 {} 中打开", o.program));
                                 }
                                 ui.allocate_ui_with_layout(
-                                    egui::vec2(110.0, row_h),
+                                    egui::vec2(size_w, row_h),
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        let size =
-                                            e.size.map(fmt_size).unwrap_or_else(|| "—".to_string());
-                                        ui.label(egui::RichText::new(size).weak().monospace());
+                                        // 目录不填占位：这一列对它本来就没有意义，
+                                        // 一排「—」只会让眼睛以为"这里有个值没加载出来"。
+                                        if let Some(sz) = e.size {
+                                            ui.label(
+                                                egui::RichText::new(fmt_size(sz))
+                                                    .weak()
+                                                    .monospace(),
+                                            );
+                                        }
                                     },
                                 );
                             });
@@ -4433,12 +4472,16 @@ fn treemap_view(
             );
         }
         let pct = c.bytes as f64 / total * 100.0;
-        if r.width() > 62.0 && r.height() > 30.0 {
-            let head = c.label.clone();
-            let sub = format!("{} · {pct:.1}%", fmt_size(c.bytes));
+        // 标签按块宽裁。`layout_no_wrap` 自己不裁字，长名字会直接溢到隔壁块上
+        // （实测：`.codex.backup-20261009195020` 压住了右边两块）。
+        // 档位：宽≥40 且高>18 才画名字；高>44 再加一行"大小 · 占比"。
+        let avail_chars = ((r.width() - 12.0) / 6.2).max(0.0) as usize;
+        if r.width() > 40.0 && r.height() > 18.0 {
+            let head = clip_label(&c.label, avail_chars);
             let g = painter.layout_no_wrap(head, egui::FontId::proportional(11.0), ink);
             painter.galley(r.min + egui::vec2(6.0, 4.0), g, ink);
             if r.height() > 44.0 {
+                let sub = clip_label(&format!("{} · {pct:.1}%", fmt_size(c.bytes)), avail_chars);
                 let g2 = painter.layout_no_wrap(sub, egui::FontId::proportional(10.0), ink);
                 painter.galley(r.min + egui::vec2(6.0, 19.0), g2, ink);
             }
@@ -4789,6 +4832,27 @@ fn char_budget(width: f32) -> usize {
     ((width - 28.0) / 7.0).max(12.0) as usize
 }
 
+/// 按字符数裁一行标签，超了就补省略号。
+///
+/// 方块图里必须裁：`Painter::layout_no_wrap` 不裁剪，长名字会画到隔壁块上。
+/// 按字符估宽（CJK 与 ASCII 混排时误差在几个像素），宁可少画也不压邻块。
+fn clip_label(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars || max_chars == 0 {
+        return if max_chars == 0 {
+            String::new()
+        } else {
+            s.to_string()
+        };
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let mut out: String = chars[..max_chars - 1].iter().collect();
+    out.push('…');
+    out
+}
+
 /// 长路径的中间省略。**掐中间**是因为尾巴才是"你在哪"：
 /// 掐头看不出哪个盘，掐尾看不出哪个目录。
 /// 丢的必须是**整段**（连着它的分隔符），剩下的拼起来才不是一眼假。
@@ -4997,6 +5061,24 @@ mod name_tests {
         ] {
             assert_eq!(middle_ellipsis(s, 200), s, "预算够用时不该改写：{s:?}");
         }
+    }
+
+    /// 方块图的标签必须裁到块宽以内：`layout_no_wrap` 不裁字，
+    /// 实测 `.codex.backup-20261009195020` 会压住右边两块。
+    #[test]
+    fn clip_label_never_exceeds_the_char_budget() {
+        assert_eq!(clip_label("AppData", 40), "AppData");
+        assert_eq!(clip_label("AppData", 7), "AppData");
+        assert_eq!(clip_label("AppData", 6), "AppDa…");
+        // 挤不下就等于不画，而不是画一个省略号糊弄。
+        assert_eq!(clip_label("AppData", 0), "");
+        assert_eq!(clip_label("AppData", 1), "…");
+        // 按字符数裁，不按字节：中文名字不能把一个字切一半（切开会 panic）。
+        // 省略号**算进预算**，所以裁完的总长正好 = max_chars。
+        let cjk = "文档下载目录";
+        assert_eq!(clip_label(cjk, 3), "文档…");
+        assert_eq!(clip_label(cjk, 6), cjk);
+        assert!(clip_label(cjk, 3).chars().count() <= 3);
     }
 
     /// 掐的是**中间**：盘和最深那一层都必须活着，中间的段**从右往左**留
