@@ -130,13 +130,14 @@ pub fn specs() -> Vec<ToolSpec> {
         //   dispatch_payload，一处补齐三处就有，反之会分叉成"CLI 能读、MCP 不能"。
         ToolSpec {
             name: "read_file",
-            description: "读一个文件的文本内容。超过 max_bytes 会截断并在 truncated 里说明；非 UTF-8 内容不返回正文，只报 binary=true 与字节数。",
+            description: "读一个文件的文本内容。超过 max_bytes 会截断并在 truncated 里说明；非 UTF-8 内容不返回正文，只报 binary=true 与字节数。max_bytes 有服务端上限 64 MiB，超出按截断处理。",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "绝对文件路径"},
-                    "max_bytes": {"type": "integer", "minimum": 1, "default": 262144,
-                        "description": "读取上限，默认 256 KiB"}
+                    "max_bytes": {"type": "integer", "minimum": 1, "maximum": READ_CAP,
+                        "default": 262144,
+                        "description": "读取上限，默认 256 KiB，服务端最多 64 MiB"}
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -278,6 +279,12 @@ struct ReadArgs {
 fn default_max_bytes() -> usize {
     256 * 1024
 }
+
+/// 服务端天花板。没有它，上面那句理由就由客户端说了算：
+/// 实测 `max_bytes: usize::MAX` 会被 serde 照收，于是"读一个 4 GB 文件"
+/// 真把 4 GB 收进 `Vec` —— 保护性默认值变成了可关闭的开关。
+/// 超cap不报错，按截断处理（`truncated` 会说），与"截断一定在返回里说明"一致。
+const READ_CAP: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -473,13 +480,14 @@ pub async fn dispatch_payload(
             // 按块读到上限就停，而不是先整读再截断：
             // 后者读一个 4 GB 文件时会先把机器打满。
             let mut truncated = false;
-            while buf.len() < a.max_bytes {
+            let budget = a.max_bytes.min(READ_CAP);
+            while buf.len() < budget {
                 let chunk = match stream.next().await {
                     None => break,
                     Some(Err(e)) => return Err(RpcError::new(INTERNAL_ERROR, e.to_string())),
                     Some(Ok(b)) => b,
                 };
-                let room = a.max_bytes - buf.len();
+                let room = budget - buf.len();
                 if chunk.len() > room {
                     buf.extend_from_slice(&chunk[..room]);
                     truncated = true;
@@ -487,7 +495,7 @@ pub async fn dispatch_payload(
                 }
                 buf.extend_from_slice(&chunk);
             }
-            if !truncated && buf.len() == a.max_bytes {
+            if !truncated && buf.len() == budget {
                 // 正好停在边界：再问一块确认后面真的没有了，
                 // 否则会把"截断了"和"刚好读完整个文件"混成一种。
                 if let Some(Ok(extra)) = stream.next().await {
@@ -496,11 +504,14 @@ pub async fn dispatch_payload(
                     }
                 }
             }
-            match String::from_utf8(buf.clone()) {
+            // 先把长度取出来再交出 buf：`from_utf8(buf.clone())` 会在
+            // 这个已经是天花板大小的缓冲上再翻一倍内存。
+            let read_len = buf.len();
+            match String::from_utf8(buf) {
                 Ok(text) => Ok(json!({
                     "path": a.path,
                     "binary": false,
-                    "bytes": buf.len(),
+                    "bytes": read_len,
                     "truncated": truncated,
                     "text": text,
                 })),
@@ -509,7 +520,7 @@ pub async fn dispatch_payload(
                     // 要二进制内容请走 native_path + 自己读，这里不装。
                     "path": a.path,
                     "binary": true,
-                    "bytes": buf.len(),
+                    "bytes": read_len,
                     "truncated": truncated,
                 })),
             }
@@ -903,6 +914,33 @@ mod tests {
         assert_eq!(r["bytes"], 100);
         assert_eq!(r["truncated"], true);
         assert_eq!(r["text"].as_str().unwrap().len(), 100);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `max_bytes` 的天花板是**服务端**的，不是客户端愿给多大就多大。
+    ///
+    /// 这条锁的是实测出来的缺陷：`max_bytes: usize::MAX` 会被 serde 照收，
+    /// 于是 `default_max_bytes` 注释里那句"别把一个 4 GB 的文件读进内存"
+    /// 由调用方一句话关掉。删掉 `.min(READ_CAP)` 这里必须判红。
+    #[tokio::test]
+    async fn max_bytes_cannot_exceed_the_server_ceiling() {
+        let d = tmp_dir("ceiling");
+        let p = d.join("over-cap.txt");
+        std::fs::write(&p, vec![b'k'; READ_CAP + 64 * 1024]).unwrap();
+        let r = dispatch_payload(
+            vol(),
+            "read_file",
+            json!({"path": p.display().to_string(), "max_bytes": usize::MAX}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r["bytes"].as_u64(),
+            Some(READ_CAP as u64),
+            "要了 usize::MAX 就照单全收 ⇒ 保护性默认值没起作用"
+        );
+        assert_eq!(r["truncated"], true, "封顶了就必须说明还有后续");
+        assert_eq!(r["text"].as_str().map(str::len), Some(READ_CAP));
         let _ = std::fs::remove_dir_all(&d);
     }
 
