@@ -154,11 +154,26 @@ egui 原话（`egui-0.31.1/src/viewport.rs:22`）：
 - 跨窗口拖放写死 `ConflictPolicy::Skip`，而主窗口同一步走"让用户显式选"的冲突弹窗
   ⇒ 同一个手势两种政策。补弹窗要给子窗口加一套冲突 UI，属于设计决定，未动；
   现状至少把跳过数报在状态行里。
-- 评审代理另给的几条（`fmnr-pkg/registry.rs` 枚举被拒子键静默缺项、
-  `startup.rs` 的 `mirror_entries().unwrap_or_default()` 会丢掉恢复入口、
-  `app.rs` 白板载入失败静默而后续保存会覆盖、`archive` 的 `size().unwrap_or(0)`）
-  复核**成立但影响面小**，本轮没动，记在这里当下轮候选。
-  其中注册表那条的**可达性已量过**：本机三棵 Uninstall 树 196 + 77 + 26 = 299 个子键，
-  `Get-ItemProperty` 读属性失败 **0 个**（同一次测量里无 `DisplayName` 的有 25 个）。
-  ⇒ 那是健壮性缺口，不是这台机器上的在用缺陷；按"不可达兜底臂不写假测试"的规矩，
-  别为它编一个造不出语料的门。
+- 评审代理另给的几条，逐条复算后的**实际处置**：
+  - `app.rs` 白板载入失败静默而后续保存会覆盖 → **已修**。`BoardError::Io` 能区分
+    `NotFound`（首次运行，正常，不报警）与权限/损坏（必须说，且说清"这次改动会覆盖它"）。
+    门 `app::board_notice_tests::missing_is_silent_but_unreadable_is_not`。
+  - `fmnr-archive` 的 `header.size().unwrap_or(0)` 会把损坏尺寸显示成 0 字节空文件
+    → **前提不成立（实测推翻）**：把 tar 头块的 size 字段改成非法八进制后，
+    tar 读取器在**更早的迭代阶段**就报
+    `numeric field was not a number: zzzzzzzzzzz when getting size for one.txt`，
+    卷直接返回 Err，根本走不到那一行。改动仍做了（`.ok()` 严格更对），
+    但**没为它写门**——为一个不可达分支写测试就是假安全。
+  - `startup.rs` 的 `mirror_entries().unwrap_or_default()` "会丢掉恢复入口"
+    → **前提也不成立**：`read_run_values` 对"键不存在"同样返回 Err，
+    而镜像键在用户**第一次关掉某个启动项之前本来就不存在**。
+    那个 `unwrap_or_default()` 是承重的"还没有"，不是吞错。
+    真要改进的话是让 `read_run_values` 分开 `ERROR_FILE_NOT_FOUND` 与拒绝访问——
+    那是另一件事，登记不动。
+  - `fmnr-pkg/registry.rs` 枚举被拒子键静默缺项：可达性已量过——本机三棵
+    Uninstall 树 196 + 77 + 26 = 299 个子键，读属性失败 **0 个**（同一次测量里
+    缺 `DisplayName` 的有 25 个）⇒ 健壮性缺口，不是这台机器上的在用缺陷；
+    按"不可达兜底臂不写假测试"的规矩，不为它编门。
+  - `ops.rs dir_stats` 吞错让"释放字节数"虚低、`usage.rs` 的
+    `metadata().unwrap_or(0)`：**仍未动**，两者都是"数字偏小"而不是"结论说反"，
+    留作下轮候选。

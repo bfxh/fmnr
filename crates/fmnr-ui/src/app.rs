@@ -453,11 +453,16 @@ impl App {
         let (plugins, warnings) = fmnr_plugins::registry::PluginSet::load_dir(&plugins_dir());
         app.plugins = plugins;
         app.plugin_warnings = warnings;
-        // 白板：能读就恢复，读不到（首次运行/文件坏了）就用空板，不阻塞启动。
-        if let Ok(b) =
-            fmnr_core::board::Board::load(&fmnr_core::board::Board::default_path("default"))
-        {
-            app.board = b;
+        // 白板：首次运行没有板文件是**正常状态**，不该报警；但"文件在、读不出来"
+        // 必须说出来——不然用户看到的是一张空板，而下一次保存会把他的原文件盖掉。
+        let board_path = fmnr_core::board::Board::default_path("default");
+        match fmnr_core::board::Board::load(&board_path) {
+            Ok(b) => app.board = b,
+            Err(e) => {
+                if let Some(msg) = board_load_notice(&e, &board_path) {
+                    app.status = msg;
+                }
+            }
         }
         app.refresh();
         app.reset_tree_roots();
@@ -4728,6 +4733,24 @@ fn sort_label(order: SortOrder) -> &'static str {
     }
 }
 
+/// 白板没读进来时，要不要跟用户说话、说什么。
+///
+/// 两种"失败"必须分开：`NotFound` 是首次运行，正常，不该报警；
+/// 其余（权限、文件损坏、JSON 解析不了）都得说出来——因为紧接着的任意一次保存
+/// 都会把那份读不出来的文件盖掉，而用户看到的只是一张空板。
+fn board_load_notice(e: &fmnr_core::board::BoardError, path: &std::path::Path) -> Option<String> {
+    if matches!(
+        e,
+        fmnr_core::board::BoardError::Io(io) if io.kind() == std::io::ErrorKind::NotFound
+    ) {
+        return None;
+    }
+    Some(format!(
+        "白板没读进来：{e}（{} 还在原处，但这次改动会覆盖它）",
+        path.display()
+    ))
+}
+
 fn dirs_home() -> PathBuf {
     std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
@@ -5802,5 +5825,37 @@ fn render_dupes_section(
         Some(plan)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod board_notice_tests {
+    use super::board_load_notice;
+    use fmnr_core::board::BoardError;
+    use std::path::Path;
+
+    /// 首次运行（没有板文件）不该报警；"文件在却读不出来"必须报，
+    /// 而且要说清下一次保存会覆盖它。
+    #[test]
+    fn missing_is_silent_but_unreadable_is_not() {
+        let p = Path::new("board.json");
+        let missing = BoardError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "nope"));
+        assert_eq!(
+            board_load_notice(&missing, p),
+            None,
+            "首次运行被当成故障，会每次启动吓用户一次"
+        );
+
+        for e in [
+            BoardError::Parse("多了一个逗号".into()),
+            BoardError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "拒绝访问",
+            )),
+        ] {
+            let n = board_load_notice(&e, p).expect("这类失败必须说出来");
+            assert!(n.contains("覆盖"), "得提醒会被盖掉：{n}");
+            assert!(n.contains("board.json"), "得说清是哪份文件：{n}");
+        }
     }
 }

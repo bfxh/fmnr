@@ -248,7 +248,10 @@ fn index_tar(path: &Path, map: &mut BTreeMap<String, Entry>) -> Result<()> {
             size: if is_dir {
                 None
             } else {
-                Some(header.size().unwrap_or(0))
+                // 尺寸读不出来（损坏的八进制字段、非 GNU 的 sparse 头）要报"不知道"，
+                // 不能报 0 —— 0 在界面上是一个确凿的空文件。
+                // 同一条口径见 drives.rs：读不到就 Err/None，别用 0 顶。
+                header.size().ok()
             },
             modified: header
                 .mtime()
