@@ -3712,14 +3712,12 @@ impl App {
                 // 「更新」和目录树同一排：这一排是"这台机器上有什么"的入口，
                 // 包盘点问的正是"有什么该动了"。它不列文件，所以不放栏头工具条。
                 ui.horizontal(|ui| {
+                    // 🔴 与页签**同一格**判三态：这里原先自己写了一份 if/else，
+                    // 而且那份把"还没扫"和"扫完是 0 个"都印成光秃秃的「更新」——
+                    // 正是刚在页签上修掉的同一个歧义，一处修两处才不算白修。
                     let n = self.pkg.rows.len();
-                    let label = if self.pkg.rx.is_some() {
-                        "更新 · 盘点中…".to_string()
-                    } else if n > 0 {
-                        format!("更新 {n}")
-                    } else {
-                        "更新".to_string()
-                    };
+                    let label =
+                        pkg_count_label("更新", n, self.pkg.rx.is_some(), self.pkg.error.is_some());
                     if ui
                         .button(label)
                         .on_hover_text("问一次 winget 有哪些包可升级。只列清单，不代跑升级。")
