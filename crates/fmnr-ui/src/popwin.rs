@@ -303,7 +303,11 @@ impl PopWin {
                     );
                 }
                 if rows.is_empty() && self.error.is_none() {
-                    ui.weak("这里没有文件");
+                    // 🔴 「这里没有文件」只对**真没文件**成立。这一栏有过滤词，
+                    // 过滤后为空却说"这里没有文件" ⇒ 用户以为目录本身是空的，
+                    // 会去翻父目录或重挂卷，而该做的只是删掉两个字母。
+                    // 主栏同一件事写的是「没有匹配这个过滤词的条目」，两处口径要一致。
+                    ui.weak(empty_notice(needle.is_empty()));
                 }
                 for (i, e) in rows.iter().enumerate() {
                     let selected = self.selected.as_deref() == Some(e.name.as_str());
@@ -444,6 +448,17 @@ fn render(
     }
 }
 
+/// 「这一栏是空的」这句要区分**目录本身空**与**过滤后空**：
+/// 后者说"这里没有文件"是对用户的数据下错结论——该做的只是删掉过滤词。
+/// 主栏（`app.rs` 列表那一格）用的是同一句话，两处口径要一致。
+fn empty_notice(needle_is_empty: bool) -> &'static str {
+    if needle_is_empty {
+        "这里没有文件"
+    } else {
+        "没有匹配这个过滤词的条目"
+    }
+}
+
 fn lock(win: &Arc<Mutex<PopWin>>) -> MutexGuard<'_, PopWin> {
     win.lock().unwrap()
 }
@@ -504,6 +519,26 @@ mod tests {
 
     fn reg() -> VolumeRegistry {
         VolumeRegistry::default()
+    }
+
+    /// 过滤后为空 ≠ 目录为空：那句空态文案不能对用户的数据下错结论。
+    #[test]
+    fn the_empty_notice_separates_filtered_from_truly_empty() {
+        assert!(
+            !empty_notice(false).contains("没有文件"),
+            "有过滤词时不许说「这里没有文件」：实得 {}",
+            empty_notice(false)
+        );
+        assert!(
+            empty_notice(true).contains("没有文件"),
+            "真空目录要直说「这里没有文件」，实得 {}",
+            empty_notice(true)
+        );
+        assert_ne!(
+            empty_notice(true),
+            empty_notice(false),
+            "两句一样就等于没区分"
+        );
     }
 
     /// 空注册表里查不到卷：要报"这个卷已经卸载了"，不能显示成空目录。

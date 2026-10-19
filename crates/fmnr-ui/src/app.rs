@@ -270,6 +270,19 @@ struct PkgPanel {
     shortcuts: Vec<PathBuf>,
 }
 
+/// 页签上的计数要区分**没数出来**与**数出来是 0**（与占用视图那条 `Option<Usage>` 同形状）：
+/// 盘点是外部进程，"还在问"和"问到了 0 个"在用户眼里是两件事——
+/// 前者等就行，后者才轮到"这台机器没什么可升"这个结论。
+fn pkg_count_label(what: &str, n: usize, scanning: bool, failed: bool) -> String {
+    if scanning {
+        format!("{what} …")
+    } else if failed {
+        format!("{what} ？")
+    } else {
+        format!("{what} {n}")
+    }
+}
+
 /// 冲突弹窗：已把请求暂存，等用户选策略。
 struct ConflictPrompt {
     kind: crate::ops::OpKind,
@@ -1456,17 +1469,28 @@ impl App {
         let ledger = self.pkg.ledger.clone();
         let rows = self.pkg.rows.clone();
         let tab = self.pkg.tab;
+        // 在途/失败要在进闭包前先取出来（闭包里不能再借 `self` 一次）。
+        let scanning = self.pkg.rx.is_some();
+        let failed = self.pkg.error.is_some();
+        let ledger_scanning = self.pkg.ledger_rx.is_some();
+        let ledger_failed = self.pkg.ledger_error.is_some();
 
         let keep = dock(ctx, "dock_pkg", "包管理器", 620.0, |ui| {
             ui.horizontal(|ui| {
                 if ui
-                    .selectable_label(tab == PkgTab::Upgrades, format!("可升级 {}", rows.len()))
+                    .selectable_label(
+                        tab == PkgTab::Upgrades,
+                        pkg_count_label("可升级", rows.len(), scanning, failed),
+                    )
                     .clicked()
                 {
                     self.pkg.tab = PkgTab::Upgrades;
                 }
                 if ui
-                    .selectable_label(tab == PkgTab::Ledger, format!("已装清单 {}", ledger.len()))
+                    .selectable_label(
+                        tab == PkgTab::Ledger,
+                        pkg_count_label("已装清单", ledger.len(), ledger_scanning, ledger_failed),
+                    )
                     .clicked()
                 {
                     self.pkg.tab = PkgTab::Ledger;
@@ -6320,6 +6344,35 @@ mod dupes_root_notice_tests {
             body.contains(&eyebrow) && body.contains("f.root") && body.contains("ui.label"),
             "重复清单没写它是从哪个根扫出来的。后果：换过根之后上半（占用）与\
              下半（重复）不同源，界面上却一个字都没说，两份数被读成一件事。"
+        );
+    }
+}
+
+/// 页签计数不许把"还没数出来"报成"数出来是 0"。
+///
+/// 与占用视图那条 `Option<Usage>` 同形状：`可升级 0` 是一句**结论**
+/// （"这台机器没什么可升"），而盘点是个外部进程，问还没回来。
+#[cfg(test)]
+mod pkg_count_label_tests {
+    use super::pkg_count_label;
+
+    #[test]
+    fn a_zero_only_appears_when_the_scan_actually_returned_zero() {
+        assert_eq!(pkg_count_label("可升级", 0, true, false), "可升级 …");
+        assert_eq!(pkg_count_label("可升级", 0, false, true), "可升级 ？");
+        assert_eq!(pkg_count_label("可升级", 0, false, false), "可升级 0");
+        // 在途/失败时**不许**出现裸数字：否则用户读到的是"0 项可升级"。
+        for (scanning, failed) in [(true, false), (false, true), (true, true)] {
+            let s = pkg_count_label("可升级", 0, scanning, failed);
+            assert!(
+                !s.contains('0'),
+                "还没问到结果却报了个数：{s}（scanning={scanning} failed={failed}）"
+            );
+        }
+        assert_eq!(
+            pkg_count_label("已装清单", 273, false, false),
+            "已装清单 273",
+            "真数到手时要照常报"
         );
     }
 }
