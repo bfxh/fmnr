@@ -818,15 +818,39 @@ run 39207052882）。三条成因都是"本机只有一个平台 ⇒ 结构性�
 ②这段路径在另一个平台上还**绝对**吗；③如果它在另一个平台先被别的闸门拦掉，我这条断言会不会
 **因为错的原因**变绿。第③句是本轮最贵的：假绿比红难发现得多。
 
-⚠ **修完上面三条，ubuntu 仍红一条**（run 39212381794：7 过 1 红，`copy_lands_on_the_other_volume`），
-windows job 这次是绿的。那条红的形状是：回执 `done:1`、`bytes:6`，但目标卷根下 `read` 拿到 `ENOENT`——
-**这不是门的数据问题，是一个本机不复现（三遍全绿）、CI 才给的行为差异**，我不猜成因。
-做法是把取证做进断言：`read_landed(..)` 读不到文件时，把**整棵临时根里的全部文件相对路径**一起打出来，
-下一轮 CI 直接说那 6 个字节落在哪儿，而不是只留一个 `os error 2`。
-（顺带把临时根收成 `<temp>/fmnr-xdiv-<pid>` 一层、每测试独占短名子目录、**建目录之前不再先
-`remove_dir_all`**——Windows 上"已标记删除"的目录会在原地挂一会儿，那是上一轮 windows 那两条
-`ERROR_PATH_NOT_FOUND(3)` 的**候选**成因之一，未证。）
+⚠ 修完这三条，两个 job **仍各红一条**（ubuntu 的 `copy_lands_on_the_other_volume`：回执
+`done:1 / bytes:6`，可 `read` 拿到 `ENOENT`；windows 的 `move_is_not_special_cased…`：
+`create_dir_all` 刚成功、紧接着 `write` 报 `ERROR_PATH_NOT_FOUND(3)`）。**那两条不是平台问题**，
+真成因与对我的撤回写在下一条（第九）里——本机三遍不复现，别把它读成「不是缺陷」。
 
+### 🔴 第九条：那两条"本机不复现"的红，凶手是**我自己的测试在删别人的夹具**
+
+第二笔修完，ubuntu 仍红一条（`copy_lands_on_the_other_volume`：回执 `done:1 / bytes:6`，可
+`read` 拿 `ENOENT`），windows 又红另一条（`create_dir_all` 刚成功、紧接着 `write` 报
+`ERROR_PATH_NOT_FOUND(3)`）。两条本机三遍都不复现。第三笔把取证做进断言
+（`read_landed` 读不到就把**整棵临时根的文件清单**打进 panic），CI 一趟就给死答案：
+
+```text
+读 /tmp/fmnr-xdiv-9219/b-8/note.txt 失败：No such file or directory (os error 2)
+临时根 /tmp/fmnr-xdiv-9219 里的全部文件：["a-10/deeper/m.txt", "ex-dst-11/member.bin", "ex-src-9/member.bin"]
+```
+
+**这个测试自己的两个目录（源和目标）整个不见了**，而同批别的测试的还在 ⇒ 不是代码搬错地方，
+是被同批另一个测试**收尾时删掉的**。凶手是 `a_bare_absolute_dest_…` 里那句
+`remove_dir_all(b.parent())`：把临时根收成 `<temp>/fmnr-xdiv-<pid>` 一层之后，
+`b.parent()` **正好等于所有测试共用的那层根**，于是它一收尾就把别人的夹具连锅端。
+（它原先就写错了——那时 `b` 直接挂在 TEMP 下，`parent()` 是 TEMP 本身，已经是越权删除；
+收成一层只是把这件一直存在的错**放大到可见**。）
+
+🔴 **要撤回到处的两条我自己的解释**：
+① 上一节第 3 条我写的"windows 那两条的候选成因是 Windows 的 delete-pending（已标记删除的目录
+挂在原地）"——**不是**，真成因就是这条越权删除，delete-pending 那条假设没被证据支持，作废；
+② 我一度把这条判成"又一个只有 CI 能抓的平台差异"——也不是 ubuntu 特有，**两个平台都真**，
+只是本机跑得快、删除恰好落在别人读完之后。**并发批次的测试互相踩数据，本机不复现不等于不是缺陷。**
+
+**定下来的规矩**：一个测试**只许删自己创建的那一格**（`remove_dir_all(&a)`，`a` 是它自己拿到的路径），
+任何"往上一层去删"（`x.parent()`、公共根）在这一族测试里一律禁止；`tmpdir()` 的注释里把它写成第②条。
+配合 `read_landed`（失败就打印整棵临时根），下次再有这种红，一趟就能定位，不用再猜三轮。
 
 
 

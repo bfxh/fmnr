@@ -162,10 +162,14 @@
   探针卷剥卷前缀时顺手 `trim_start_matches('/')`（unix 上把前导斜杠削掉 ⇒ 相对路径 ⇒ 拼出不存在的目录；
   Windows 因为路径以盘符开头看不出来）、路由判据写死 `C:\Foo`（Linux 上 `is_absolute()` 为 false ⇒
   `.expect()` 那类必红、`is_none()` 那类**因为错的原因变绿**）。⇒ 计数改成 524/40，大小写那条上了 `#[cfg(windows)]`。
-  🔴 **修完这三轮，ubuntu 仍红一条**（run 39212381794：7 过 1 红，`copy_lands_on_the_other_volume`——
-  回执 `done:1 / bytes:6`，可目标卷根下 `read` 拿到 `ENOENT`；本机三遍不复现）。
-  ⇒ 这条**不记成"已解决"**：把取证做进断言（`read_landed` 读不到就把整棵临时根的文件清单一起打出来），
-  下一轮 CI 直接给那 6 个字节的落点，而不是靠猜。
+  🔴 **修完这三轮，两个 job 仍各红一条**（run 39212381794 / 39217000234：ubuntu 的
+  `copy_lands_on_the_other_volume` 拿到 `done:1 / bytes:6` 却 `read` 不到那个文件；windows 的
+  `move_is_not_special_cased…` 在 `create_dir_all` 刚成功后 `write` 报 `ERROR_PATH_NOT_FOUND(3)`，
+  本机三遍都不复现）。把取证做进断言（`read_landed`：读不到就把整棵临时根的文件清单打进 panic）之后，
+  CI 一趟给死答案：**是我自己的测试在删别人的夹具**——`remove_dir_all(b.parent())` 在把临时根收成
+  一层之后**正好等于所有测试共用的那层根**。⇒ 规矩定死：一个测试只许删自己创建的那一格。
+  🔴 同时撤回我给这两条起过的两个名头：「只有 CI 能抓的平台差异」**不成立**（两个平台都真，
+  本机只是跑得快没撞上），上一轮写的"候选成因是 Windows 的 delete-pending"也**作废**（没有证据支持）。
 
 ### 已知边界（这一版没做完的事）
 

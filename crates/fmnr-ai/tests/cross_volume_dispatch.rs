@@ -29,12 +29,12 @@ fn root() -> PathBuf {
 
 /// 每个测试一个**独占**子目录。
 /// 🔴 三条纪律，都是一轮轮实测换来的：
-/// ① 名字要带每次调用都不同的序号——只带 pid 的话同一趟里几个测试拿到同一个目录，
+/// ① 名字要带每次调用都不同的序号：只带 pid 的话同一趟里几个测试会拿到同一个目录，
 ///    谁先收尾就把对方的文件删了（实测红过一条"源不见了"，而代码没错）；
-/// ② **不许在建之前先 `remove_dir_all`**——Windows 上"已标记删除"的目录还会在原地挂一会儿，
-///    紧接着的 `create_dir_all` 就可能拿到 `ERROR_PATH_NOT_FOUND(3)`（CI 的 windows job
-///    实测判红过两条，本地 TMPDIR 下不复现）；序号本来就唯一，压根没有同名旧目录要清；
-/// ③ 建失败要把**路径**打进 panic 消息——判据红在文件系统上时，没有路径就只能靠猜。
+/// ② **只在自己的子目录里活动**：所有测试共用 `<temp>/fmnr-xdiv-<pid>` 这一层，
+///    所以任何"往上一层去删"（`remove_dir_all(x.parent())`）都等于删掉**同批所有测试的夹具**
+///    ——CI 上那两条本机不复现的红就是这么来的（详见下面两处注释）；
+/// ③ 建失败要把**路径**打进 panic 消息：判据红在文件系统上时，没有路径就只能靠猜。
 fn tmpdir(tag: &str) -> PathBuf {
     let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let d = root().join(format!("{tag}-{seq}"));
@@ -210,9 +210,15 @@ async fn a_bare_absolute_dest_is_recognised_without_a_volume_prefix() {
 
     assert_eq!(read_landed(&b.join("bare.txt")), b"bare-dest");
     assert!(a.join("bare.txt").exists(), "copy 不动源");
+    // 🔴 只许删**自己这两个目录**。这里原先写的是 `remove_dir_all(b.parent())`：
+    // 那时 `b` 直接挂在 TEMP 下面，`parent()` 是 TEMP（已经是越权删除）；把临时根收成
+    // `<temp>/fmnr-xdiv-<pid>` 一层之后，`parent()` 正好**等于所有测试共用的那层根**，
+    // 于是这个测试收尾时把同批其他测试的夹具整个删了——CI 上 ubuntu 那条
+    // "回执 done:1 / bytes:6，可目标目录里没有那个文件"、windows 那条
+    // `create_dir_all` 刚成功紧接着 `write` 报 `ERROR_PATH_NOT_FOUND(3)`，全是这一个成因。
+    // 本机不复现只是因为本地这一趟跑得太快、删除恰好落在别人读完之后。
     std::fs::remove_dir_all(&a).ok();
-    let parent = b.parent().unwrap().to_path_buf();
-    std::fs::remove_dir_all(&parent).ok();
+    std::fs::remove_dir_all(&b).ok();
 }
 
 /// 🔴 真用户那条：**源是只读卷、目标是裸绝对路径**（不带 `local:` 前缀）。
@@ -269,7 +275,9 @@ async fn a_dest_inside_the_source_volume_stays_same_volume() {
 
     assert_eq!(read_landed(&sub.join("same.txt")), b"stays");
     std::fs::remove_dir_all(&b).ok();
-    std::fs::remove_dir_all(a.parent().unwrap()).ok();
+    // 同上：只删自己那一格（`a.parent()` 恰好是 `tmpdir("a")` 那一层，属于本测试，
+    // 但这类"往上删一层"的写法刚才已经把整批夹具删过一次，规则定死：不许删父目录）。
+    std::fs::remove_dir_all(&a).ok();
 }
 
 /// 只读目标：错要说在"**目标**卷是只读的"，而不是让人以为是源卷读不了。
