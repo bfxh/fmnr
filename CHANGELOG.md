@@ -118,6 +118,13 @@
   与 `gate.sh` 输出里各 suite 的 `passed` 之和（524）对上一版（484）的差一致，也等于上面那五项之和。
   ⚠ 其中"大小写归一"那条路由门是 `#[cfg(windows)]`：**ubuntu job 会少 1 条**（40 里那 1 条只在
   Windows 判），那是平台分工不是漏跑——与 7z 那轮 windows/ubuntu 的 23 条差同一类。
+- **CI 两侧的独立复算**（run **39219679686 = success，六 job 全绿**，提交 `83f0051`）：
+  windows job 自己数出 **524**（与本地 `gate.sh` 相等），ubuntu job 数出 **499**。
+  两侧差 **25**，其中 **2 条是这一轮新增的只在一侧成立的门**——`dest_routing_normalizes_drive_case`
+  （`#[cfg(windows)]`）与 `streaming_write_refuses_a_file_another_writer_holds`（同）；
+  其余 23 条就是 7z 那轮已经解释过的那批 `#[cfg(windows)]`（句柄泄漏/角标存活那一族）。
+  上一笔 `0a5eef0` 的 run 39207052882、`927d14a` 的 39212381794、`56926b6` 的 39217000234
+  **都是 failure**，逐条读数与撤回写在 `docs/NEXT-BATCH.md` §23 第八、九两节。
 - 新增会判红的门：`.lnk` 手写解析器的畸形件模糊门（截断 × 标志位 × 虚报长度 × 随机字节）
   加一条**反编造**门（LinkInfo 里没有目标时必须判错，不许把隔壁 StringData 那条当答案）、
   一条拿 **Windows 自己写出来的 78 字节 LinkInfo 块**（VolumeID 段抹平）当字面量的门
