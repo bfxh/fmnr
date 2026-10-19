@@ -101,11 +101,13 @@ fn a_nested_member_lands_by_its_own_name() {
 #[test]
 fn search_hits_can_be_read_back() {
     let vol = fmnr_archive::ArchiveVolume::open(plain7z()).unwrap();
-    let hits = rt().block_on(vol.search(&VPath(PathBuf::from("archive:/")), "deep".into(), 50));
-    assert!(hits.is_err() || !hits.as_ref().unwrap().is_empty());
+    let hits = rt()
+        .block_on(vol.search(&VPath(PathBuf::from("archive:/")), "deep".into(), 50))
+        .expect("卷根搜索本身要成功——报 Err 就不算'搜到能读回'");
+    assert!(!hits.is_empty(), "搜 deep 该有命中（没命中这条门就空转了）");
     // 卷根的搜索在归档卷上按 key 走，命中形如 `archive:<件>!/dir/deep.bin`；
     // 这里把它原样喂回去读——认不下 `!` 的老实现会在这里变成 NotFound/语法错。
-    for h in hits.unwrap() {
+    for h in hits {
         let text = rt().block_on(read_all(&vol, &h));
         assert!(
             !text.is_empty(),

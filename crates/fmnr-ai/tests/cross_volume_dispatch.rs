@@ -9,7 +9,7 @@
 use fmnr_core::{volreg::VolumeRegistry, VPath, Volume};
 use fmnr_fs::LocalVolume;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -40,6 +40,43 @@ fn tmpdir(tag: &str) -> PathBuf {
     let d = root().join(format!("{tag}-{seq}"));
     std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("建临时目录 {} 失败：{e}", d.display()));
     d
+}
+
+/// 读落地文件；**读不到就把整棵临时根的文件清单打出来**。
+/// 加这条的理由：`copy_lands_on_the_other_volume` 在 ubuntu job 判红过
+/// （回执 `done:1`、`bytes:6`，但目标目录里没有那个文件），本机三遍不复现。
+/// 只报 `ENOENT` 定位不了那 6 个字节落在哪儿，所以把"落在哪儿"变成失败消息的一部分。
+fn read_landed(p: &Path) -> Vec<u8> {
+    match std::fs::read(p) {
+        Ok(b) => b,
+        Err(e) => panic!(
+            "读 {} 失败：{e}\n临时根 {} 里的全部文件：{:?}",
+            p.display(),
+            root().display(),
+            tree_files(&root())
+        ),
+    }
+}
+
+/// 目录树里所有**文件**的相对路径（排序，好比对）。
+fn tree_files(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(rel) = p.strip_prefix(dir) {
+                out.push(rel.to_string_lossy().to_string());
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 /// 一对本地卷。**A 的根刻意比 B 深一层**：`route_for` 是"最长 id 前缀赢"，
@@ -86,7 +123,7 @@ async fn copy_lands_on_the_other_volume() {
     .expect("跨卷 copy 该成功");
     assert_eq!(out["done"], 1, "回执要说搬了几条：{out}");
     assert_eq!(out["bytes"], 6);
-    assert_eq!(std::fs::read(b.join("note.txt")).unwrap(), b"from-A");
+    assert_eq!(read_landed(&b.join("note.txt")), b"from-A");
     assert!(
         !a.join("note.txt").with_file_name("note (2).txt").exists(),
         "目标在 B，就不该在 A 里长出重名副本"
@@ -125,7 +162,7 @@ async fn nested_roots_copy_from_the_shallower_source_volume() {
     .unwrap_or_else(|e| panic!("浅根→深根该跨卷成功，拿到 {e:?}"));
 
     assert_eq!(out["done"], 1, "回执要说搬了几条：{out}");
-    assert_eq!(std::fs::read(deep.join("x.txt")).unwrap(), b"SHALLOW");
+    assert_eq!(read_landed(&deep.join("x.txt")), b"SHALLOW");
     std::fs::remove_dir_all(&shallow).ok();
 }
 
@@ -171,7 +208,7 @@ async fn a_bare_absolute_dest_is_recognised_without_a_volume_prefix() {
     .await
     .expect("裸绝对路径的目标该被认成另一个本地卷");
 
-    assert_eq!(std::fs::read(b.join("bare.txt")).unwrap(), b"bare-dest");
+    assert_eq!(read_landed(&b.join("bare.txt")), b"bare-dest");
     assert!(a.join("bare.txt").exists(), "copy 不动源");
     std::fs::remove_dir_all(&a).ok();
     let parent = b.parent().unwrap().to_path_buf();
@@ -203,10 +240,7 @@ async fn extracting_from_a_readonly_source_to_a_bare_absolute_dest() {
     .expect("从只读卷取到本地裸路径该成功（这正是本轮修的那条死路）");
 
     assert_eq!(out["done"], 1, "{out}");
-    assert_eq!(
-        std::fs::read(dst_root.join("member.bin")).unwrap(),
-        b"from-readonly"
-    );
+    assert_eq!(read_landed(&dst_root.join("member.bin")), b"from-readonly");
     std::fs::remove_dir_all(&ro_root).ok();
     std::fs::remove_dir_all(&dst_root).ok();
 }
@@ -233,7 +267,7 @@ async fn a_dest_inside_the_source_volume_stays_same_volume() {
     .await
     .unwrap_or_else(|e| panic!("同卷目标不该被当成跨卷：{}", e.message));
 
-    assert_eq!(std::fs::read(sub.join("same.txt")).unwrap(), b"stays");
+    assert_eq!(read_landed(&sub.join("same.txt")), b"stays");
     std::fs::remove_dir_all(&b).ok();
     std::fs::remove_dir_all(a.parent().unwrap()).ok();
 }
