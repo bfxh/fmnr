@@ -360,6 +360,22 @@ impl MountDialog {
     }
 }
 
+/// 加一个文本输入框，并**当场登记「键盘归这个框」**。
+///
+/// 🔴 全仓每一个 `TextEdit` 都必须走这一格，不许直接 `ui.add(egui::TextEdit…)`。
+/// 原先是各框自己写 `self.text_focus = true`，十个框只写了四个 —— 漏掉的那六个
+/// （栏头地址框、挂载对话框的四个输入框、包管理过滤框）里按键会**穿过输入框**
+/// 落到全局快捷键上：按退格 = 栏跳上级，按 Ctrl+V = 把文件贴进当前栏，
+/// 按 Delete = 把选中那一行送进回收站。用户只是在改一个打错的路径。
+/// 漏一个框会不会被发现，由 `keyboard_gate_tests` 里那把静态尺管着。
+fn text_edit(ui: &mut egui::Ui, te: egui::TextEdit<'_>, typing: &mut bool) -> egui::Response {
+    let r = ui.add(te);
+    if r.has_focus() {
+        *typing = true;
+    }
+    r
+}
+
 impl App {
     pub fn new(cjk_font_ok: bool) -> Self {
         // M8 卷接线：启动时用 fmnr_mount 的默认计划挂载（本地 home 起步，
@@ -753,15 +769,14 @@ impl App {
             DropPlan::Copy(sources) => {
                 let n = sources.len();
                 let sources = sources.into_iter().map(VPath).collect();
+                let receipt = format!("拖入拷贝（{n} 项）…");
                 self.start_op(
                     crate::ops::OpKind::Copy,
                     sources,
                     Some(VPath(dest)),
                     fmnr_core::ConflictPolicy::Skip,
+                    Some(&receipt),
                 );
-                if self.running.is_some() {
-                    self.status = format!("拖入拷贝（{n} 项）…");
-                }
             }
         }
     }
@@ -983,17 +998,18 @@ impl App {
             });
             return;
         }
+        // 说清贴到哪了：状态栏原本只写"复制…"，粘完之后用户不知道文件去了哪。
+        // 🔴 这句回执必须走 start_op 的 receipt：原先是 `if self.running.is_some()`，
+        // 而"上一个操作还在跑"时它同样为真 —— 于是那次被拒的粘贴也宣布"复制到 X"。
+        let verb = if cut { "移动到" } else { "复制到" };
+        let receipt = format!("{verb} {}", dest.display());
         self.start_op(
             kind,
             sources,
             Some(VPath(dest.clone())),
             fmnr_core::ConflictPolicy::Skip,
+            Some(&receipt),
         );
-        // 说清贴到哪了：状态栏原本只写"复制…"，粘完之后用户不知道文件去了哪。
-        if self.running.is_some() {
-            let verb = if cut { "移动到" } else { "复制到" };
-            self.status = format!("{verb} {}", dest.display());
-        }
     }
 
     /// 列出「源名在目标目录已存在」的条目名。
@@ -1011,16 +1027,25 @@ impl App {
             .collect()
     }
 
+    /// 派发一个长操作。
+    ///
+    /// 🔴 状态栏那句"送入回收站（N 项，可恢复）… / 复制到 X / 拖放移动 N 项 → X"
+    /// **只能由这一格写**（`receipt`），因为原先是调用方在 `start_op` 之后各自
+    /// `self.status = …`，于是被拒（已有操作在跑、没挂卷、spawn 失败）的时候
+    /// 回执照样宣布成功——用户以为文件进了回收站，其实一根没动。
+    /// 返回值 = 是否真的派出去了，给"只有派出去了才允许改清单/记账"的调用方用
+    /// （重复清单那格就是：先派出去、再把这些行标成已删）。
     fn start_op(
         &mut self,
         kind: crate::ops::OpKind,
         sources: Vec<VPath>,
         dest_dir: Option<VPath>,
         policy: fmnr_core::ConflictPolicy,
-    ) {
+        receipt: Option<&str>,
+    ) -> bool {
         if self.running.is_some() {
             self.status = "已有操作在进行中".into();
-            return;
+            return false;
         }
         let req = crate::ops::OpRequest {
             kind,
@@ -1030,14 +1055,20 @@ impl App {
         };
         let Some(volume) = self.current_volume() else {
             self.status = "无法启动操作：没有已挂载的卷".into();
-            return;
+            return false;
         };
         match crate::ops::spawn_op(volume.clone(), req) {
             Ok(running) => {
-                self.status = running.label.clone();
+                self.status = receipt
+                    .map(str::to_string)
+                    .unwrap_or_else(|| running.label.clone());
                 self.running = Some(running);
+                true
             }
-            Err(e) => self.status = format!("无法启动操作：{e}"),
+            Err(e) => {
+                self.status = format!("无法启动操作：{e}");
+                false
+            }
         }
     }
 
@@ -1084,13 +1115,14 @@ impl App {
             return;
         }
         let n = paths.len();
+        let receipt = format!("送入回收站（{n} 项，可恢复）…");
         self.start_op(
             crate::ops::OpKind::Delete,
             paths.into_iter().map(VPath).collect(),
             None,
             fmnr_core::ConflictPolicy::Skip,
+            Some(&receipt),
         );
-        self.status = format!("送入回收站（{n} 项，可恢复）…");
     }
 
     fn begin_rename(&mut self) {
@@ -1486,13 +1518,14 @@ impl App {
                     }
                     ui.horizontal(|ui| {
                         ui.label("过滤");
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut self.pkg.filter)
-                                    .desired_width(200.0)
-                                    .hint_text("名称 / 发布者"),
-                            )
-                            .changed()
+                        if text_edit(
+                            ui,
+                            egui::TextEdit::singleline(&mut self.pkg.filter)
+                                .desired_width(200.0)
+                                .hint_text("名称 / 发布者"),
+                            &mut self.text_focus,
+                        )
+                        .changed()
                         {
                             // 详情按下标记住选中项，列表一变这个下标就指向
                             // 另一个应用了——那不是"选中丢了"，是"显示错数据"。
@@ -2025,16 +2058,20 @@ impl App {
         self.usage_open = keep;
         if let Some(plan) = dupes_plan {
             let n = plan.paths.len();
-            // 先记下"这些已经删了"，再发操作：清单是删之前扫的那一份，
-            // 不记的话删完还挂在上面，下一句"可省多少"就虚报了。
-            self.dupes_dead.extend(plan.paths.iter().cloned());
-            self.start_op(
+            let dead = plan.paths.clone();
+            let receipt = format!("重复清单：送入回收站（{n} 项，可恢复）…");
+            // 🔴 顺序是"先派出去、再记已删"。原先反过来（先 extend 再 start_op），
+            // 而被拒的那次（已有操作在跑 / 没挂卷）没人回滚这份名单 ⇒
+            // 行从清单里消失、"可省多少"跟着变小，而每一个文件都还在盘上。
+            if self.start_op(
                 crate::ops::OpKind::Delete,
                 plan.paths.into_iter().map(VPath).collect(),
                 None,
                 fmnr_core::ConflictPolicy::Skip,
-            );
-            self.status = format!("重复清单：送入回收站（{n} 项，可恢复）…");
+                Some(&receipt),
+            ) {
+                self.dupes_dead.extend(dead);
+            }
         }
         if want_dupes {
             // 新一轮扫描：勾选状态和"已删"名单都属于上一轮，留着会把
@@ -2652,7 +2689,13 @@ impl App {
             } else if prompt.sources.is_empty() {
                 self.status = "已取消操作".into();
             } else {
-                self.start_op(prompt.kind, prompt.sources, prompt.dest_dir, prompt.choice);
+                self.start_op(
+                    prompt.kind,
+                    prompt.sources,
+                    prompt.dest_dir,
+                    prompt.choice,
+                    None,
+                );
             }
         }
 
@@ -2668,17 +2711,16 @@ impl App {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    let resp = ui.add(
+                    let resp = text_edit(
+                        ui,
                         egui::TextEdit::singleline(&mut text)
                             .desired_width(260.0)
                             .hint_text("新名称"),
+                        &mut self.text_focus,
                     );
                     // 打开即抢焦点：不抢的话回车条件永不成立，只能拿鼠标点确定。
                     if want_focus {
                         resp.request_focus();
-                    }
-                    if resp.has_focus() {
-                        self.text_focus = true;
                     }
                     // 回车提交。原来判的是 `resp.lost_focus() && Enter`，
                     // 而这个输入框打开时根本没拿到焦点 ⇒ 条件永不成立，
@@ -2722,16 +2764,15 @@ impl App {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    let resp = ui.add(
+                    let resp = text_edit(
+                        ui,
                         egui::TextEdit::singleline(&mut text)
                             .desired_width(260.0)
                             .hint_text("目录名"),
+                        &mut self.text_focus,
                     );
                     if want_focus {
                         resp.request_focus();
-                    }
-                    if resp.has_focus() {
-                        self.text_focus = true;
                     }
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         submit = true;
@@ -2784,10 +2825,12 @@ impl App {
                 });
                 match dlg.kind {
                     MountKind::Local => {
-                        let resp = ui.add(
+                        let resp = text_edit(
+                            ui,
                             egui::TextEdit::singleline(&mut dlg.input)
                                 .desired_width(320.0)
                                 .hint_text(r"D:\some\dir  或  E:\"),
+                            &mut self.text_focus,
                         );
                         if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                             submit = true;
@@ -2814,10 +2857,12 @@ impl App {
                         }
                     }
                     MountKind::Archive => {
-                        let resp = ui.add(
+                        let resp = text_edit(
+                            ui,
                             egui::TextEdit::singleline(&mut dlg.input)
                                 .desired_width(320.0)
                                 .hint_text(r"D:\path\to\a.zip"),
+                            &mut self.text_focus,
                         );
                         if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                             submit = true;
@@ -2844,10 +2889,12 @@ impl App {
                         }
                         Some(Err(e)) => {
                             ui.label(format!("发现失败：{e}；可手动输入 distro 名"));
-                            let resp = ui.add(
+                            let resp = text_edit(
+                                ui,
                                 egui::TextEdit::singleline(&mut dlg.input)
                                     .desired_width(260.0)
                                     .hint_text("distro 名，如 Ubuntu-24.04"),
+                                &mut self.text_focus,
                             );
                             if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                                 submit = true;
@@ -2858,10 +2905,12 @@ impl App {
                         }
                     },
                     MountKind::Ssh => {
-                        let resp = ui.add(
+                        let resp = text_edit(
+                            ui,
                             egui::TextEdit::singleline(&mut dlg.input)
                                 .desired_width(320.0)
                                 .hint_text("ssh://user@host[:port][/path]"),
+                            &mut self.text_focus,
                         );
                         if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                             submit = true;
@@ -2941,16 +2990,15 @@ impl App {
         egui::TopBottomPanel::top("searchbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("🔎");
-                let resp = ui.add(
+                let resp = text_edit(
+                    ui,
                     egui::TextEdit::singleline(&mut self.search_text)
                         .hint_text("在这个子树里搜索…")
                         .desired_width(320.0),
+                    &mut self.text_focus,
                 );
                 if want_focus {
                     resp.request_focus();
-                }
-                if resp.has_focus() {
-                    self.text_focus = true;
                 }
                 // 逐字符触发增量搜索：不等回车
                 if resp.changed() {
@@ -3184,6 +3232,7 @@ impl App {
                         paths.into_iter().map(VPath).collect(),
                         Some(VPath(dest)),
                         fmnr_core::ConflictPolicy::Rename,
+                        None,
                     );
                 } else {
                     self.status = "多选未实现，先用 Ctrl+C → 对栏 Ctrl+V".into();
@@ -3198,6 +3247,7 @@ impl App {
                         paths.into_iter().map(VPath).collect(),
                         Some(VPath(dest)),
                         fmnr_core::ConflictPolicy::Rename,
+                        None,
                     );
                 }
             }
@@ -3327,16 +3377,15 @@ impl App {
             });
             return;
         }
+        let verb = if copy { "拖放复制" } else { "拖放移动" };
+        let receipt = format!("{verb} {n} 项 → {}", target.display());
         self.start_op(
             kind,
             vpaths,
             Some(VPath(target.clone())),
             fmnr_core::ConflictPolicy::Skip,
+            Some(&receipt),
         );
-        if self.running.is_some() {
-            let verb = if copy { "拖放复制" } else { "拖放移动" };
-            self.status = format!("{verb} {n} 项 → {}", target.display());
-        }
     }
 
     fn other_pane_path(&self) -> PathBuf {
@@ -3818,10 +3867,12 @@ impl App {
                 // 那两个按钮原先贴在面包屑末尾，读起来像面包屑的一段。
                 ui.horizontal(|ui| {
                     if let Some(mut buf) = editing {
-                        let resp = ui.add(
+                        let resp = text_edit(
+                            ui,
                             egui::TextEdit::singleline(&mut buf)
                                 .hint_text("贴一个路径，回车过去")
                                 .desired_width((width - 132.0).max(80.0)),
+                            &mut self.text_focus,
                         );
                         if !resp.has_focus() {
                             resp.request_focus();
@@ -3910,24 +3961,23 @@ impl App {
                     }
                 });
 
-                let mut filter_focused = false;
                 ui.horizontal(|ui| {
                     let filter = match which {
                         Pane::Left => &mut self.left_filter,
                         Pane::Right => &mut self.right_filter,
                     };
                     ui.label("🔍");
-                    let resp = ui.add(
+                    text_edit(
+                        ui,
                         egui::TextEdit::singleline(filter)
                             .hint_text("按名称过滤")
                             .desired_width((width - 116.0).max(80.0)),
+                        &mut self.text_focus,
                     );
-                    filter_focused = resp.has_focus();
                     if !filter.is_empty() && ui.button("✕").clicked() {
                         filter.clear();
                     }
                 });
-                self.text_focus |= filter_focused;
                 // 「这里是某个**有新版可升**的程序的目录」——弱提示，两个条件都凑齐才说话：
                 // 目录确证对得上底账里的 InstallLocation（宁漏勿错，歧义也不说），
                 // 且用户查过的那轮 winget 盘点里有它。
@@ -5866,5 +5916,115 @@ mod board_notice_tests {
             assert!(n.contains("覆盖"), "得提醒会被盖掉：{n}");
             assert!(n.contains("board.json"), "得说清是哪份文件：{n}");
         }
+    }
+}
+
+/// 「被拒的操作不许宣布成功」这一族的门。
+///
+/// 修前：`start_op` 被拒（已有操作在跑 / 没挂卷 / spawn 失败）时自己也写了拒绝文案，
+/// 但调用方紧接着又无条件 `self.status = "送入回收站（N 项，可恢复）…"` 把它盖掉
+/// ——用户以为 N 个文件进了回收站，其实一个都没动。
+#[cfg(test)]
+mod refused_op_tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_operation_must_not_announce_itself_as_done() {
+        let mut app = App::new(true);
+        let volume = app
+            .current_volume()
+            .expect("测试前提：App::new 至少挂上了起步卷");
+        let dir = std::env::temp_dir().join(format!("fmnr-refused-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.left_path = dir.clone();
+        app.left_selected = Some("根本不存在.bin".into());
+
+        // 先占住「已经有一个操作在跑」这个位置：句柄立刻存在，失败要等 worker 才回报，
+        // 而这一格要量的正是"被拒的那一刻状态栏写了什么"。
+        let req = crate::ops::OpRequest {
+            kind: crate::ops::OpKind::Delete,
+            sources: vec![VPath(dir.join("也根本不存在.bin"))],
+            dest_dir: None,
+            policy: fmnr_core::ConflictPolicy::Skip,
+        };
+        app.running = Some(crate::ops::spawn_op(volume, req).expect("测试前提：能派发一个操作"));
+        app.status.clear();
+
+        app.delete_selected();
+
+        assert!(
+            app.status.contains("已有操作在进行中"),
+            "被拒时要把拒绝说出来，拿到：{}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("回收站"),
+            "被拒的那次不许宣布「送入回收站」——文件一根都没动：{}",
+            app.status
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// 输入框必须登记「键盘归我」的静态尺：漏一个框，快捷键就穿过输入框去动文件系统。
+///
+/// 🔴 这把尺自己也要带覆盖面下限（"看到 0 个框"和"一个都没漏"输出长得一样），
+/// 并且不许把解析失败洗成通过。
+#[cfg(test)]
+mod text_edit_gate_tests {
+    /// 每个 `TextEdit` 都必须被 `text_edit(` 包着（首参 ui、末参 &mut self.text_focus）。
+    #[test]
+    fn every_text_edit_registers_keyboard_ownership() {
+        let src = include_str!("app.rs");
+        // 🔴 先把**整行注释**抹成空白再数：这把尺要数的是"被写的输入框"，不是"被提到的输入框"。
+        // 不抹的话它第一个红就红在自己那句说明上（本仓已经为此返工过一次）。
+        // 抹整行而不是删行：删行会让报出来的行号指到别处去。
+        let code: String = src
+            .split('\n')
+            .map(|l| {
+                let t = l.trim_start();
+                if t.starts_with("//") {
+                    format!("{}\n", " ".repeat(l.len()))
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        let mut seen = 0usize;
+        let mut missing: Vec<String> = Vec::new();
+        // 尺子不许数到自己头上：把这串**拼出来**，否则下面那句 `match_indices` 自己
+        // 就是源码里的一处 "TextEdit::singleline"，第一个红必然红在尺子身上。
+        let needle = String::from("TextEdit::") + "singleline";
+        for m in code.match_indices(&needle) {
+            seen += 1;
+            // 🔴 窗口要按**字符边界**收：这是把中文源码尺，直接 `&code[i..i+400]`
+            // 会切进一个三字节汉字里当场 panic（本尺第一次跑就是这么红的——
+            // 红在尺子上，不是有人漏登记）。
+            let mut from = m.0.saturating_sub(220);
+            while from > 0 && !code.is_char_boundary(from) {
+                from += 1;
+            }
+            let mut to = (m.0 + 400).min(code.len());
+            while to < code.len() && !code.is_char_boundary(to) {
+                to -= 1;
+            }
+            let back = &code[from..m.0];
+            let fwd = &code[m.0..to];
+            if !back.contains("text_edit(") || !fwd.contains("&mut self.text_focus") {
+                missing.push(format!(
+                    "第 {} 行附近",
+                    code[..m.0].matches('\n').count() + 1
+                ));
+            }
+        }
+        assert!(
+            seen >= 10,
+            "只看到 {seen} 个输入框，低于下限 10 ⇒ 是这把尺瞎了，不是没人漏登记"
+        );
+        assert!(
+            missing.is_empty(),
+            "这些输入框没走 text_edit 那一格：{missing:?}\n\
+             后果：在框里按退格 = 栏跳上级，Ctrl+V = 把文件贴进当前栏，Delete = 把选中行送进回收站。"
+        );
     }
 }
