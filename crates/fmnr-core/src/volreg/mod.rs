@@ -464,38 +464,64 @@ mod tests {
         })
     }
 
+    /// 本平台**真正的**绝对路径（一定要过得了 `Path::is_absolute()`）：
+    /// Windows 给 `C:\…`，其它平台给 `/…`。
+    /// 用在目标路由那几条门上——写死 `C:\Foo` 的话，Linux 上它在"绝对性"那一档就被拦掉，
+    /// `is_none()` 的断言会因为**错误的原因**变绿、`.expect()` 的断言直接判红。
+    fn n(rel: &str) -> String {
+        if cfg!(windows) {
+            format!("C:\\{}", rel.replace('/', "\\"))
+        } else {
+            format!("/{}", rel)
+        }
+    }
+
     /// 🔴 目标路由的第二条易错点：**按目录成分比，不按字符串**。
-    /// 用 `starts_with` 的话 `local:C:\Foo` 会把 `C:\Football\a.txt` 也认成自己的，
-    /// 于是文件被搬进隔壁那个盘目录——同一个形状在 `fmnr-pkg::owner` 里已经栽过一次，
-    /// 那里有专门的 `C:\Foo` vs `C:\Football` 测试。
+    /// 用 `starts_with` 的话 `local:<根>/Foo` 会把 `<根>/Football/a.txt` 也认成自己的，
+    /// 于是文件被搬进隔壁那个目录——同一个形状在 `fmnr-pkg::owner` 里已经栽过一次。
+    ///
+    /// ⚠ 早先这里把 `C:\Foo` 写死：在 Linux 上 `Path::new("C:\\Foo").is_absolute()` 是 **false**，
+    /// `route_for_dest` 在"绝对性"那一档就返回 None ⇒ "更深的根要赢"那两条 `.expect()` 必判红，
+    /// 而 `is_none()` 那两条会**因为错误的原因**变绿。⇒ **测试数据也可能只在一个平台上成立**
+    /// （这是"cfg 另一边不参与编译"那条纪律的镜像），一律走 `n()` 拿本平台真正的绝对路径。
     #[test]
     fn dest_routing_matches_directory_not_string_prefix() {
         let reg = VolumeRegistry::new();
-        reg.add(dummy("local:C:\\Foo"));
-        reg.add(dummy("local:C:\\Other"));
+        reg.add(dummy(&format!("local:{}", n("Foo"))));
+        reg.add(dummy(&format!("local:{}", n("Other"))));
         assert!(
-            reg.route_for_dest("C:\\Football\\a.txt").is_none(),
-            "字符串前缀会把 Football 认进 C:\\Foo 的根里——两个都不含它就谁也不是，不许猜"
+            reg.route_for_dest(&n("Football/a.txt")).is_none(),
+            "字符串前缀会把 Football 认进 {}\\Foo 的根里——两个都不含它就谁也不是，不许猜",
+            n("")
         );
 
         // 真在根下的要认对，并且更深的那个根要赢（最长匹配）。
         let deep = VolumeRegistry::new();
-        deep.add(dummy("local:C:\\Users"));
-        deep.add(dummy("local:C:\\Users\\lbx13"));
+        deep.add(dummy(&format!("local:{}", n("Users"))));
+        deep.add(dummy(&format!("local:{}", n("Users/lbx13"))));
         assert_eq!(
-            deep.route_for_dest("C:\\Users\\lbx13\\out")
+            deep.route_for_dest(&n("Users/lbx13/out"))
                 .expect("更深的根要赢")
                 .id()
                 .0,
-            "local:C:\\Users\\lbx13"
+            format!("local:{}", n("Users/lbx13"))
         );
-        // 盘符大小写不同是同一个地方
+    }
+
+    /// 大小写归一只在**大小写不敏感的平台**上有意义：unix 上 `/USERS` 与 `/users` 是两个目录，
+    /// 所以这条只在 Windows 跑（不写成跨平台断言，免得把"这里归一大小写"洗成平台事实）。
+    #[cfg(windows)]
+    #[test]
+    fn dest_routing_normalizes_drive_case() {
+        let deep = VolumeRegistry::new();
+        deep.add(dummy(&format!("local:{}", n("Users"))));
+        deep.add(dummy(&format!("local:{}", n("Users/lbx13"))));
         assert_eq!(
             deep.route_for_dest("c:\\users\\lbx13\\out")
                 .expect("盘符与根的大小写要归一")
                 .id()
                 .0,
-            "local:C:\\Users\\lbx13"
+            format!("local:{}", n("Users/lbx13"))
         );
     }
 
@@ -503,21 +529,22 @@ mod tests {
     #[test]
     fn dest_routing_falls_back_only_when_a_single_local_volume_exists() {
         let one = VolumeRegistry::new();
-        one.add(dummy("local:C:\\Users\\lbx13"));
+        one.add(dummy(&format!("local:{}", n("Users/lbx13"))));
         assert_eq!(
-            one.route_for_dest("D:\\somewhere\\out")
+            one.route_for_dest(&n("somewhere/out"))
                 .expect("唯一一个本地卷时兜底到它")
                 .id()
                 .0,
-            "local:C:\\Users\\lbx13"
+            format!("local:{}", n("Users/lbx13"))
         );
 
         let two = VolumeRegistry::new();
-        two.add(dummy("local:C:\\Users\\lbx13"));
-        two.add(dummy("local:D:\\Data"));
+        two.add(dummy(&format!("local:{}", n("Users/lbx13"))));
+        two.add(dummy(&format!("local:{}", n("Data"))));
         assert!(
-            two.route_for_dest("E:\\out").is_none(),
-            "两个本地盘都装不下 E:\\out 时不许猜一个——那时目标必须显式带卷名前缀"
+            two.route_for_dest(&n("Elsewhere/out")).is_none(),
+            "两个本地根都装不下 {} 时不许猜一个——那时目标必须显式带卷名前缀",
+            n("Elsewhere/out")
         );
     }
 
@@ -530,7 +557,7 @@ mod tests {
     #[test]
     fn a_relative_dest_is_never_routed() {
         let one = VolumeRegistry::new();
-        one.add(dummy("local:C:\\Users\\lbx13"));
+        one.add(dummy(&format!("local:{}", n("Users/lbx13"))));
         assert!(
             one.route_for_dest("out").is_none(),
             "相对路径不许走『唯一一个本地卷』的兜底"

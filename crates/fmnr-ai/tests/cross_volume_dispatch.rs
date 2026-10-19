@@ -14,21 +14,31 @@ use std::sync::Arc;
 
 static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// 本测试二进制的公共临时根：`<temp>/fmnr-xdiv-<pid>`，一次建好。
+/// 各测试只在自己的子目录里活动 ⇒ 路径短、且**永远不可能撞到别人的目录**。
+fn root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("fmnr-xdiv-{}", std::process::id()));
+        std::fs::create_dir_all(&d)
+            .unwrap_or_else(|e| panic!("建公共临时根 {} 失败：{e}", d.display()));
+        d
+    })
+    .clone()
+}
+
+/// 每个测试一个**独占**子目录。
+/// 🔴 三条纪律，都是一轮轮实测换来的：
+/// ① 名字要带每次调用都不同的序号——只带 pid 的话同一趟里几个测试拿到同一个目录，
+///    谁先收尾就把对方的文件删了（实测红过一条"源不见了"，而代码没错）；
+/// ② **不许在建之前先 `remove_dir_all`**——Windows 上"已标记删除"的目录还会在原地挂一会儿，
+///    紧接着的 `create_dir_all` 就可能拿到 `ERROR_PATH_NOT_FOUND(3)`（CI 的 windows job
+///    实测判红过两条，本地 TMPDIR 下不复现）；序号本来就唯一，压根没有同名旧目录要清；
+/// ③ 建失败要把**路径**打进 panic 消息——判据红在文件系统上时，没有路径就只能靠猜。
 fn tmpdir(tag: &str) -> PathBuf {
-    // 🔴 名字里要带**每次调用都不同**的序号：只带 pid 的话，同一趟里的几个测试会拿到
-    // 同一个目录，谁先收尾就把对方的文件删了——实测就是这样红了一条"源不见了"，
-    // 而代码没错。判据的输入被另一个测试清掉，比代码 bug 更难查。
     let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let d = std::env::temp_dir().join(format!(
-        "fmnr-xdiv-{tag}-{}-{seq}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
+    let d = root().join(format!("{tag}-{seq}"));
+    std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("建临时目录 {} 失败：{e}", d.display()));
     d
 }
 
@@ -67,7 +77,7 @@ async fn copy_lands_on_the_other_volume() {
         &reg,
         "copy",
         json!({
-            "sources": [format!("local:{}\\note.txt", a.display())],
+            "sources": [format!("local:{}", a.join("note.txt").display())],
             "dest_dir": format!("local:{}", b.display()),
             "conflict": "rename"
         }),
@@ -106,7 +116,7 @@ async fn nested_roots_copy_from_the_shallower_source_volume() {
         &reg,
         "copy",
         json!({
-            "sources": [format!("local:{}\\x.txt", shallow.display())],
+            "sources": [format!("local:{}", shallow.join("x.txt").display())],
             "dest_dir": format!("local:{}", deep.display()),
             "conflict": "rename"
         }),
@@ -152,7 +162,7 @@ async fn a_bare_absolute_dest_is_recognised_without_a_volume_prefix() {
         &reg,
         "copy",
         json!({
-            "sources": [format!("local:{}\\bare.txt", a.display())],
+            "sources": [format!("local:{}", a.join("bare.txt").display())],
             // 刻意不带 `local:` —— 全靠"按目录成分比谁含它 + 最长匹配"
             "dest_dir": b.display().to_string(),
             "conflict": "rename"
@@ -184,7 +194,7 @@ async fn extracting_from_a_readonly_source_to_a_bare_absolute_dest() {
         &reg,
         "copy",
         json!({
-            "sources": [format!("ro:{}\\member.bin", ro_root.display())],
+            "sources": [format!("ro:{}", ro_root.join("member.bin").display())],
             "dest_dir": dst_root.display().to_string(),
             "conflict": "rename"
         }),
@@ -214,7 +224,7 @@ async fn a_dest_inside_the_source_volume_stays_same_volume() {
         &reg,
         "copy",
         json!({
-            "sources": [format!("local:{}\\same.txt", a.display())],
+            "sources": [format!("local:{}", a.join("same.txt").display())],
             // 裸绝对路径，但它就在**源卷自己**的根下面
             "dest_dir": sub.display().to_string(),
             "conflict": "skip"
@@ -242,7 +252,7 @@ async fn a_readonly_target_says_so_about_the_target() {
         &reg,
         "copy",
         json!({
-            "sources": [format!("local:{}\\f.bin", src_root.display())],
+            "sources": [format!("local:{}", src_root.join("f.bin").display())],
             "dest_dir": format!("ro:{}", src_root.display()),
             "conflict": "skip"
         }),
@@ -274,7 +284,7 @@ async fn move_is_not_special_cased_across_two_local_volumes() {
         &reg,
         "move",
         json!({
-            "sources": [format!("local:{}\\m.txt", a.display())],
+            "sources": [format!("local:{}", a.join("m.txt").display())],
             "dest_dir": format!("local:{}", b.display()),
             "conflict": "rename"
         }),
@@ -304,15 +314,15 @@ impl ReadOnlyVolume {
     }
 
     /// 剥掉自己卷 id 的 `ro:` 前缀。探针卷也得认自己的寻址写法，
-    /// 否则"列父目录"会拿整串 `ro:C:\…` 去 `read_dir`，报 `os error 123`
-    /// ——那正是归档卷 `key_of` 存在的理由，抄同一形状。
+    /// 否则"列父目录"会拿整串 `ro:<那个根>/…` 去 `read_dir`。
+    /// 🔴 剥完**原样当路径**用，不许再 `replace('\\',"/")` + `trim_start_matches('/')`：
+    /// 那样在 unix 上会把前导 `/` 削掉 ⇒ 得到一个相对路径，`root.join(...)` 拼出一个
+    /// 根本不存在的目录（ubuntu job 实测 `io: No such file or directory`；本地 Windows
+    /// 因为路径以盘符 `C:` 开头、没有前导斜杠可削，所以看不出来）。
     /// 卷根（空串或只剩前缀）回落到自己的 root。
     fn inner(&self, path: &VPath) -> PathBuf {
-        let raw = path.0.to_string_lossy().replace('\\', "/");
-        match raw.strip_prefix("ro:") {
-            Some(rest) if !rest.trim_start_matches('/').is_empty() => {
-                PathBuf::from(rest.trim_start_matches('/'))
-            }
+        match path.0.to_string_lossy().strip_prefix("ro:") {
+            Some(rest) if !rest.is_empty() => PathBuf::from(rest),
             _ => self.root.clone(),
         }
     }
