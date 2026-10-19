@@ -5981,6 +5981,10 @@ mod text_edit_gate_tests {
         // 抹整行而不是删行：删行会让报出来的行号指到别处去。
         let code: String = src
             .split('\n')
+            // 🔴 用 `trim()` 不是 `trim_start()`：本文件是 CRLF，`split('\n')` 之后
+            // 每行尾巴还挂着一个 `\r`，只 trim 头的话这行永远不等于 `#[cfg(test)]`，
+            // 门就一路数到测试模块里自己的探针框（第一红红在门上）。
+            .take_while(|l| l.trim() != "#[cfg(test)]")
             .map(|l| {
                 let t = l.trim_start();
                 if t.starts_with("//") {
@@ -6025,6 +6029,60 @@ mod text_edit_gate_tests {
             missing.is_empty(),
             "这些输入框没走 text_edit 那一格：{missing:?}\n\
              后果：在框里按退格 = 栏跳上级，Ctrl+V = 把文件贴进当前栏，Delete = 把选中行送进回收站。"
+        );
+    }
+}
+
+/// `text_edit` 这**一格**本身得有人验证。上一批把 10 个框收敛成它，
+/// 静态门只保证"每个框都调了它"——它自己坏了（焦点判断失效）静态门照样绿。
+///
+/// 用无头 egui 帧驱动，不开窗口。
+#[cfg(test)]
+mod text_edit_helper_tests {
+    use super::text_edit;
+    use egui::{Context, TextEdit};
+
+    /// 跑一帧，返回这一帧里 `text_edit` 有没有把 `typing` 置真、以及框的真实 id。
+    fn frame(ctx: &mut Context) -> (bool, egui::Id) {
+        let mut typing = false;
+        let mut box_id = None;
+        let _out = ctx.run(Default::default(), |ctx| {
+            egui::Window::new("probe").show(ctx, |ui| {
+                let mut scratch = String::from("x");
+                let te = TextEdit::singleline(&mut scratch);
+                box_id = Some(text_edit(ui, te, &mut typing).id);
+            });
+        });
+        (typing, box_id.expect("probe 窗里那个框要有 id"))
+    }
+
+    /// 两帧：第一帧拿到框的 id，第二帧之前把焦点要给它（或明确让出去）。
+    /// 🔴 `request_focus` 是**下一帧**才生效：只跑一帧永远验不到"有焦点"那一支。
+    fn drive(grant_focus: bool) -> [bool; 2] {
+        let mut ctx = Context::default();
+        let (first, id) = frame(&mut ctx);
+        ctx.memory_mut(|m| {
+            if grant_focus {
+                m.request_focus(id)
+            } else {
+                m.surrender_focus(id)
+            }
+        });
+        let (second, _) = frame(&mut ctx);
+        [first, second]
+    }
+
+    #[test]
+    fn the_helper_registers_only_the_frames_a_text_edit_has_focus() {
+        let focused = drive(true);
+        assert!(
+            focused[1],
+            "第二帧输入框已拿到焦点，`text_edit` 却没登记键盘所有权 ⇒ 快捷键还会穿过它"
+        );
+        let unfocused = drive(false);
+        assert!(
+            !unfocused[0] && !unfocused[1],
+            "没有焦点却登记了键盘所有权：{unfocused:?} ⇒ 快捷键会被一个没人用的框吃掉"
         );
     }
 }
