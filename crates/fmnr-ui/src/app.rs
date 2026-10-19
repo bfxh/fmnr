@@ -814,6 +814,11 @@ impl App {
             .unwrap_or_default();
         self.navigate(other, dir.to_path_buf());
         self.set_selection_for(other, &name);
+        // 🔴 落点那一栏要**成为当前栏**：原先只把目录和选中放过去，`active_pane`
+        // 还留在搜索前那一栏 ⇒ 面板收掉后按 Delete / F2 / Ctrl+C 全打在
+        // 没落地的旧栏上，报「没有选中任何项」——用户刚点中的那一行明明亮着。
+        // 与 #32 同形状（栏头与列出的内容必须是同一目录）：谁显示这条，谁就是活动栏。
+        self.active_pane = other;
     }
 
     /// 按名字设某一栏的选中态。名字不在该栏列表里就不选——
@@ -987,7 +992,7 @@ impl App {
             return;
         }
 
-        let conflicts = self.find_conflicts(&sources, &dest);
+        let conflicts = self.find_conflicts(&sources, &VPath(dest.clone()));
         if !conflicts.is_empty() {
             self.conflict = Some(ConflictPrompt {
                 kind,
@@ -1013,16 +1018,46 @@ impl App {
     }
 
     /// 列出「源名在目标目录已存在」的条目名。
-    fn find_conflicts(&self, sources: &[VPath], dest: &Path) -> Vec<String> {
+    ///
+    /// 🔴 判据问**卷**，不用 `Path::exists()`：目标可以是归档卷 / 远程卷，那里的
+    /// `dest` 不是一个本地路径，`exists()` 恒假 ⇒ 同名**永远进不了冲突弹窗**，
+    /// 操作直接按默认政策跑掉（`Skip` = 悄悄不贴、一个也不说）。
+    /// 口径与内核预遍历同一格（`transfer::entry_of`：列父目录、按名字找），
+    /// 所以"界面以为没冲突、内核说有"这种分叉不可能出现。
+    ///
+    /// 只列**一次**父目录：`entry_of` 每问一条就 `list` 一遍，在归档卷上是
+    /// 每源一次 O(N)；批量粘贴 100 项就是 100 次全目录扫描。
+    /// 父目录列不出来时**全部当冲突**（宁可弹窗问，不许静默替用户选政策）——
+    /// 这不是把错洗成"不存在"，`entry_of` 那条也是照错往上抛的。
+    fn find_conflicts(&self, sources: &[VPath], dest: &VPath) -> Vec<String> {
+        let Some(volume) = self.current_volume() else {
+            return Vec::new();
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let listing = rt.block_on(volume.list(
+            dest,
+            &fmnr_core::ListOpts {
+                show_hidden: true,
+                ..Default::default()
+            },
+        ));
+        let existing: std::collections::HashSet<String> = match listing {
+            Ok(entries) => entries.into_iter().map(|e| e.name).collect(),
+            Err(_) => sources
+                .iter()
+                .filter_map(|s| {
+                    s.as_path()
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                })
+                .collect(),
+        };
         sources
             .iter()
             .filter_map(|s| {
                 let name = s.as_path().file_name()?;
-                if dest.join(name).exists() {
-                    Some(name.to_string_lossy().to_string())
-                } else {
-                    None
-                }
+                let name = name.to_string_lossy().to_string();
+                existing.contains(&name).then_some(name)
             })
             .collect()
     }
@@ -3365,7 +3400,7 @@ impl App {
         }
         let n = sources.len();
         let vpaths: Vec<VPath> = sources.into_iter().map(VPath).collect();
-        let conflicts = self.find_conflicts(&vpaths, &target);
+        let conflicts = self.find_conflicts(&vpaths, &VPath(target.clone()));
         if !conflicts.is_empty() {
             // 冲突交给既有的策略弹窗，和粘贴同一条路：不静默覆盖也不静默跳过。
             self.conflict = Some(ConflictPrompt {
@@ -5698,11 +5733,15 @@ fn render_dupes_section(
 ) -> Option<crate::dupes_run::DeletePlan> {
     let Some(f) = found else {
         sel.clear();
-        ui.label(
-            egui::RichText::new("还没扫。点上面「♻ 找重复」。")
-                .size(12.0)
-                .weak(),
-        );
+        // 🔴 「还没扫」这句只在**真没扫**的时候成立。扫描跑起来后第一份快照之前
+        // `found` 也是 `None`——界面上「取消」按钮已经在了，下面却写着"还没扫"，
+        // 两句互相打脸（真窗口实测：Desktop 扫完前一直这样）。
+        let msg = if busy {
+            "扫描中… 第一批结果还没出来（大目录会等一会儿）。"
+        } else {
+            "还没扫。点上面「♻ 找重复」。"
+        };
+        ui.label(egui::RichText::new(msg).size(12.0).weak());
         return None;
     };
     let warn = egui::Color32::from_rgb(230, 89, 38);
@@ -5728,6 +5767,14 @@ fn render_dupes_section(
         };
         &filtered
     };
+    // 🔴 先说这份清单是**在哪个根上**扫出来的：这块面板上半是磁盘占用（跟着 `usage_root`），
+    // 下半的重复清单跟着的是**点「找重复」那一刻**的根。换过根之后两半不同源，
+    // 而原先一个字的出处都没有 ⇒ 用户会把"新盘上的占用"和"旧目录里的重复"读成一件事。
+    ui.label(
+        egui::RichText::new(format!("重复扫描的根：{}", f.root.display()))
+            .size(12.0)
+            .weak(),
+    );
     if busy {
         ui.label(format!(
             "扫描中… 已处理 {} 个文件，目前 {} 组",
@@ -6083,6 +6130,196 @@ mod text_edit_helper_tests {
         assert!(
             !unfocused[0] && !unfocused[1],
             "没有焦点却登记了键盘所有权：{unfocused:?} ⇒ 快捷键会被一个没人用的框吃掉"
+        );
+    }
+}
+
+/// 冲突预筛问的是**卷**，不是本地文件系统。
+///
+/// 修前：`find_conflicts` 用 `dest.join(name).exists()`。归档卷 / 远程卷上的
+/// `dest` 不是一个能 `exists()` 的本地路径 ⇒ 恒假 ⇒ 同名**永远进不了冲突弹窗**，
+/// 操作带着默认政策直接跑（`Skip` = 悄悄一个也不贴、界面也不说）。
+#[cfg(test)]
+mod volume_conflict_gate_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Runtime::new().unwrap()
+    }
+
+    /// 把 App 指到给定卷上（不靠 App 自己的起步卷，那台机器上有什么盘不知道）。
+    fn app_on(vol: Arc<dyn Volume>) -> App {
+        let mut app = App::new(true);
+        let id = app.volume_registry.add(vol);
+        app.current_volume_id = Some(id);
+        app
+    }
+
+    /// 归档卷里已有的成员，目标目录却是本地路径上不存在的一串 ⇒
+    /// 只有问卷才判得出冲突。这条同时把"退回文件系统探针"钉死：
+    /// 断言②就是旧判据（`exists()`）会说"没冲突"的那个事实。
+    #[test]
+    fn a_conflict_on_an_archive_volume_is_detected_without_the_filesystem() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../fmnr-archive/tests/fixtures/plain.7z");
+        let arc = Arc::new(
+            fmnr_mount::ArchiveVolume::open(fixture.clone())
+                .unwrap_or_else(|e| panic!("测试前提：开不了夹具 {fixture:?}：{e}")),
+        );
+        let dest = VPath(PathBuf::from("archive:/"));
+        let entries = rt()
+            .block_on(arc.list(&dest, &ListOpts::default()))
+            .expect("测试前提：归档卷根要列得出来");
+        assert!(!entries.is_empty(), "夹具是空的，这把门什么都没测");
+
+        // 源是"别处同名"的一件：文件名撞上卷根里每一条。
+        let sources: Vec<VPath> = entries
+            .iter()
+            .map(|e| VPath(PathBuf::from(format!("archive:/elsewhere/{}", e.name))))
+            .collect();
+        let app = app_on(arc);
+        let got = app.find_conflicts(&sources, &dest);
+        assert_eq!(
+            got.len(),
+            sources.len(),
+            "归档卷根上每一条都已存在，却只报出 {got:?}（应有 {} 条）\n\
+             后果：这些同名件不带冲突弹窗直接按默认政策跑掉，用户看不见",
+            sources.len()
+        );
+        // ②旧判据在这里是"没冲突"：这条路径当本地文件看不存在。
+        //    哪天有人把 `exists()` 加回来，这一句先红。
+        for e in &entries {
+            assert!(
+                !dest.as_path().join(&e.name).exists(),
+                "夹具路径 {} 在本地也能 exists()，这把门就测不出机制了",
+                dest.as_path().join(&e.name).display()
+            );
+        }
+    }
+
+    /// 目标目录**列不出来**时要全部当冲突（宁可弹窗问），不许静默按默认政策跑。
+    /// 这里拿一个"指向普通文件"的目录当列不出来的例子：本地卷会报错，
+    /// 而不是回一个空列表——空列表会被洗成"这里什么都没有，不冲突"。
+    #[test]
+    fn an_unlistable_destination_asks_instead_of_assuming_no_conflict() {
+        let dir = std::env::temp_dir().join(format!("fmnr-confprobe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("afile.txt"), b"x").unwrap();
+        let vol = Arc::new(fmnr_fs::LocalVolume::new(dir.clone()));
+        let listing = rt().block_on(vol.list(&VPath(dir.join("afile.txt")), &ListOpts::default()));
+        assert!(
+            listing.is_err(),
+            "测试前提：把文件当目录列要真的报错，实得 {:?}",
+            listing.map(|v| v.len())
+        );
+        let app = app_on(vol);
+        let got = app.find_conflicts(
+            &[VPath(dir.join("afile.txt"))],
+            &VPath(dir.join("afile.txt")),
+        );
+        assert_eq!(
+            got,
+            vec!["afile.txt".to_string()],
+            "列不出目标却报「没冲突」⇒ 直接按默认政策跑，这正是要挡的静默"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// 「定位」之后，显示并选中那一行的那一栏必须**成为当前栏**。
+///
+/// 修前：`reveal_in_panes` 只把目录和选中放到对栏，`active_pane` 还停在
+/// 搜索前那一栏 ⇒ 面板收掉后按 Delete / F2 / Ctrl+C 全打在旧栏上，
+/// 报「没有选中任何项」——用户刚点中的那一行明明亮着。
+#[cfg(test)]
+mod reveal_pane_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn revealing_in_the_other_pane_makes_that_pane_active() {
+        let root = std::env::temp_dir().join(format!("fmnr-reveal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/target.bin"), b"payload").unwrap();
+
+        let mut app = App::new(true);
+        let id = app
+            .volume_registry
+            .add(Arc::new(fmnr_fs::LocalVolume::new(root.clone())));
+        app.current_volume_id = Some(id);
+        app.active_pane = Pane::Left;
+        app.left_path = root.clone();
+        app.right_path = root.clone();
+        app.right_selected = None;
+
+        app.reveal_in_panes(&root.join("sub").join("target.bin"));
+
+        assert!(
+            matches!(app.active_pane, Pane::Right),
+            "落点在对栏，活动栏却还在 {}——随后 Delete / F2 / Ctrl+C 打在错的那栏上",
+            match app.active_pane {
+                Pane::Left => "左栏",
+                Pane::Right => "右栏",
+            }
+        );
+        assert_eq!(
+            app.right_selected.as_deref(),
+            Some("target.bin"),
+            "对栏没选中那一行：定位等于没定位"
+        );
+        assert_eq!(app.right_path, root.join("sub"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// 重复清单必须报出**它扫的那个根**：这块面板上半（磁盘占用）跟着 `usage_root`，
+/// 下半的清单跟着点「找重复」那一刻的根——换过根之后两半不同源，
+/// 重复清单必须报出**它扫的那个根**：这块面板上半（磁盘占用）跟着 `usage_root`，
+/// 下半的清单跟着点「找重复」那一刻的根——换过根之后两半不同源，
+/// 不写出处就会被读成"新盘上的占用 + 新盘里的重复"。
+///
+/// 🔴 这是一把**静态尺**，不是行为门：它钉的是"这一格里确实写了出处"，
+/// 钉不出"像素上看得见"。后者靠真窗口截图（口径见 `docs/NEXT-BATCH.md` §25）。
+/// 试过用无头 egui 取回渲染文字来钉：本版本 `Context::run` 回来的 8 个 shape
+/// Debug 全是 `Noop`，`FullOutput` 也没有 `viewports()`，那条路在 egui 0.31 走不通。
+#[cfg(test)]
+mod dupes_root_notice_tests {
+    /// `render_dupes_section` 的函数体里必须有一句 label 同时带出处字样和 `f.root`。
+    #[test]
+    fn the_dupes_list_names_the_root_it_scanned() {
+        let src = include_str!("app.rs");
+        // 🔴 整份文件都要看：`render_dupes_section` 在文件末尾，而它**前面**已经排着
+        // 好几个 `#[cfg(test)]` 模块——用"扫到第一个 `#[cfg(test)]` 就停"那把尺的口径
+        // 会直接找不到这格函数（第一红红在尺子上）。
+        // 自我保护靠两件事：整行注释抹白 + 判据串拼出来。
+        let code: String = src
+            .split('\n')
+            .map(|l| {
+                let t = l.trim_start();
+                if t.starts_with("//") {
+                    format!("{}\n", " ".repeat(l.len()))
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        let head = code
+            .find("fn render_dupes_section(")
+            .expect("这格函数不见了，尺子无从下手");
+        let mut to = (head + 2600).min(code.len());
+        while to < code.len() && !code.is_char_boundary(to) {
+            to -= 1;
+        }
+        let body = &code[head..to];
+        // 拼出来，免得尺子数到自己头上（那句说明本身含有这串字）。
+        let eyebrow = String::from("重复扫描的") + "根";
+        assert!(
+            body.contains(&eyebrow) && body.contains("f.root") && body.contains("ui.label"),
+            "重复清单没写它是从哪个根扫出来的。后果：换过根之后上半（占用）与\
+             下半（重复）不同源，界面上却一个字都没说，两份数被读成一件事。"
         );
     }
 }

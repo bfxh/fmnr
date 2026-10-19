@@ -948,3 +948,83 @@ git show HEAD:crates/fmnr-ui/src/app.rs 里  TextEdit::singleline 出现 10 次
 
 **仍未验的**：`dupes` 那处把 `dupes_dead` 的合并挪进 `start_op` 返回 true 之后——顺序改了，
 但**没有专门门**钉"操作被拒时不许更新死项集"。这条留在未证栏。
+
+---
+
+## 二十五、UI 第二批：三条"判据问错了对象"的缺陷（提交待填）
+
+上一批修的是"谁拿到键盘"。这一批三条同形状：**判据问的是本地文件系统，
+而这件事的真答案在卷里 / 在另一栏里 / 在扫描那一刻的根上。**
+
+### 修掉的三条（各带判据）
+
+**① 冲突预筛问卷，不用 `Path::exists()`**（`app.rs:find_conflicts`）
+
+旧格：`dest.join(name).exists()`。归档卷 / 远程卷上的 `dest` 不是一个能 `exists()` 的本地路径
+⇒ 恒假 ⇒ 同名**永远进不了冲突弹窗**，操作带着默认政策直接跑完（`Skip` = 一个也不贴、界面也不说）。
+新格：列**一次**目标父目录（`volume.list(dest, show_hidden:true)`）再按名字比，
+口径与内核预遍历同一格（`transfer::entry_of`），所以"界面说没冲突、内核说有"不可能出现。
+只列一次是刻意的：`entry_of` 每问一条 `list` 一遍，批量粘贴 N 项 = N 次全目录扫描，
+在归档卷上每次都是 O(N)。
+列不出来时**全部当冲突**（宁可弹窗问，不许静默替用户选政策）。
+
+两条门（`volume_conflict_gate_tests`）：
+- `a_conflict_on_an_archive_volume_is_detected_without_the_filesystem`：拿真夹具
+  （`fmnr-archive/tests/fixtures/plain.7z`）挂进卷表，源写成"别处同名"，断言每一条都报冲突；
+  外加一句**机制断言**——`dest.join(name).exists()` 必须为假，
+  否则这扇门测不出"问卷 vs 探针"的差别（哪天有人把 `exists()` 加回来，这一句先红）。
+- `an_unlistable_destination_asks_instead_of_assuming_no_conflict`：把普通文件当目录列，
+  本地卷真的报错（这条前提也在门里），于是必须全部当冲突。
+
+**② 「定位」之后活动栏跟着落点走**（`app.rs:reveal_in_panes`）
+
+旧格只把目录 + 选中放到对栏，`active_pane` 还停在搜索前那一栏 ⇒ 面板收掉后按
+Delete / F2 / Ctrl+C 全打在没落地的旧栏上，报「没有选中任何项」——用户刚点中的那一行明明亮着。
+与 #32 同形状：谁显示这条，谁就是活动栏。
+门 `revealing_in_the_other_pane_makes_that_pane_active` 三个断言：活动栏、选中项、栏路径。
+
+**③ 重复清单报出它扫的那个根**（`app.rs:render_dupes_section`）
+
+这块面板上半（磁盘占用）跟着 `usage_root`，下半（重复）跟着**点「找重复」那一刻**的根。
+换过根之后两半不同源，而界面上原先一个字的出处都没有。
+门 `the_dupes_list_names_the_root_it_scanned` 是**静态尺**（钉"这格里写了出处"，不钉"像素看得见"）。
+
+### 三条门的变异复打（本机，逐字改 + `cmp` 验还原）
+
+| 刀 | 打在哪 | 结果 |
+|---|---|---|
+| K3 | 判据退回 `dest.join(&name).exists()` | 🔴 两条冲突门**都**红，红的都是断言消息（"却只报出 []（应有 2 条）" / "列不出目标却报「没冲突」"） |
+| K4 | 删掉 `self.active_pane = other;` | 🔴 红（"落点在对栏，活动栏却还在左栏…"） |
+| K5 | 删掉那句出处 label | 🔴 红（"重复清单没写它是从哪个根扫出来的…"） |
+
+第一版 K3 打成了 `...exists()`（少了 `.then_some`）——那是**编译红不是断言红**，
+按本仓口径不算锁；补成合法变异后才是上面那行。
+
+### 真窗口实测（PID 46136，`target/debug/fmnr-ui.exe`）
+
+- 起来正常：双栏 + 左树 + 工具条，`空间` 面板开合、面包屑、treemap 都照旧（没看出回归）。
+- **看到一条新的、这一批没修的**：`♻ 找重复` 跑起来之后，清单区一直写着
+  「还没扫。点上面「♻ 找重复」。」，而同一行右边的「取消」已经在了——两句互相打脸。
+  机制：`Running::view()` 在第一份快照之前是 `None`，而 `render_dupes_section` 的
+  `let Some(f) = found else { … }` 那一支**不看 `busy`**（`busy` 就是它的入参）。
+  已改：那一支按 `busy` 分岔，跑着就说"扫描中… 第一批结果还没出来"。
+  🔴 这条**没有门**：它是文案分岔，静态尺钉不住语义。
+- **没验到的**：出处 label（③）在像素上是否可见——Desktop 那棵树扫完了、
+  `C:\Users\lbx13` 那棵太大（344,485 个文件时被我停掉），label 要等第一份 `Found` 才画得出来。
+  ⇒ ③ 只有静态尺 + 变异复打，截图这一路记在未证栏。
+
+### 门与尺
+
+- 计数：本地 `gate.sh` 全绿，`passed` 之和 **527 → 531**（+4 = 冲突门 2 + 定位门 1 + 出处尺 1），
+  与 `git diff` 里新增的 `#[test]` 属性数一致。
+- 尺子自己的两处坑（都写进注释了）：
+  ① `render_dupes_section` 在文件**末尾**，前面已经排着好几个 `#[cfg(test)]` 模块 ⇒
+  沿用"扫到第一个 `#[cfg(test)]` 就停"的口径会直接找不到这格函数（第一红红在尺子上）。
+  这把尺改成"整份文件 + 抹注释 + 判据串拼出来"。
+  ② 用无头 egui 取回渲染文字这条路在 egui 0.31 走不通：`Context::run` 回来的
+  8 个 shape 的 `Debug` 全是 `Noop`，`FullOutput` 也没有 `viewports()` / `viewport_ids()`。
+  ⇒ 想钉"看得见的文案"得另找口径（真窗口截图），别在这条路上继续烧。
+- 工具面：`cat >>` 与 `python - <<'PY'` 写含反斜杠转义的 Rust 源码会把 `\\n` 吃成真换行
+  （本批踩了两次：`PathBuf::from("D:\\…")` 和 `.split('\n')`）⇒ 这类改动一律走编辑工具，
+  别走 heredoc。
+
