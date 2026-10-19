@@ -69,18 +69,8 @@ async fn call_tool(
     body: Option<Json<Value>>,
 ) -> Response {
     let args = body.map(|Json(v)| v).unwrap_or(json!({}));
-    // 与 MCP 同一条选卷规则：按参数前缀路由，选不上回退注册表第一个。
-    let Some(volume) = state.registry.route_or_default(&args) else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": "没有已挂载的卷：注册表是空的",
-                "code": INTERNAL_ERROR
-            })),
-        )
-            .into_response();
-    };
-    match tools::dispatch_payload(volume, &name, args).await {
+    // 与 MCP 同一条规则，而且同一格代码：选源卷 + 判断目标目录是不是另一个卷。
+    match tools::dispatch_on_registry(&state.registry, &name, args).await {
         Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
         Err(e) => {
             // JSON-RPC 错误码 → HTTP 状态码。别一律 500：

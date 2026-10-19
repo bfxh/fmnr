@@ -98,7 +98,7 @@ MCP：`cargo run -p fmnr-ai` 走 stdio；加 `--serve 127.0.0.1:PORT` 走 HTTP�
 ## 工作区结构
 
 ```
-crates/fmnr-core     核心模型：Volume trait / Entry / 打开决策 / 进度 / Board / WSL 路径
+crates/fmnr-core     核心模型：Volume trait / Entry / 打开决策 / 进度 / Board / WSL 路径 / 跨卷搬运
 crates/fmnr-fs       本地卷实现：ops（复制移动删除）、assoc（默认程序注册与回滚）
 crates/fmnr-archive  归档只读卷：zip / tar / tar.gz / 7z，进卷时建条目索引、内容按需读
 crates/fmnr-remote   SSH/SFTP 卷（接口层，未真机验证）
@@ -148,6 +148,7 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
 | 重复文件 | 阶梯筛选 + **字节比对才算判定**；「磁盘占用」面板里扫、勾、**只删副本（进回收站）** | ✅ 真跑：`a/b/c.bin` 同内容扫成一组、默认留第一个、取消某项后按钮计数跟着变、删完清单重算且**保住用户其余的勾**；`b.bin` 在回收站里查到（删前 0 项）；9 条测试含"喂恒等碰撞哈希也不许把不等内容成组"；四元组指纹缓存，"不记住"是真开关（ephemeral 连落盘都拒绝） |
 | 多卷寻址 | MCP/HTTP 每次调用按参数选卷（与 CLI 共用 `fmnr-core` 那一份规则），空表明确报错而不是列空 | ✅ 探针卷测试钉住"选错卷立刻显形"（第一版用两个本地卷的测试把路由摘掉照样过，已作废重写）；**独立 MCP 进程仍挂不了 zip**，那是依赖决定 |
 | 子树搜索 | 归档/远程卷走 `Volume::list` 逐层遍历（本地仍走 jwalk），根读不了说成"搜不动"而不是 0 命中 | ✅ 归档卷真跑：包内 `inner/deep-readme-4471.md` 搜 `deep` 命中（1 结果 · 1 ms）；**远程卷未实测**（本机无 SSH 目标） |
+| 跨卷互传 | 源卷 `read_stream` → 目标卷 `write_stream`，一块一次写、两边都不整份进内存；目标是**另一个卷**时（带 `local:` 前缀或一条裸绝对路径）走这条 | ✅ 真 CLI 进程：`fmnr cp archive:D:\tmp\e2e\pack.7z/hello.txt --to D:\tmp\e2e\out` → `done:1 · bytes:9`、盘上文件逐字节相等（修前这条报「归档卷是只读的」，四条入口都取不出包内文件）。🔴 **只搬文件**（整目录有 §21-2 那条 O(N×D) 禁区，加上本地卷的 `search` 只按"名字以 `.` 开头"跳隐藏项这一条前置），**界面里的跨栏拖放仍走单卷** |
 | 特殊文件夹 | 目录树起点下挂 下载/文档/图片/桌面（走系统已知文件夹，不拼 `home\Downloads`） | ✅ 真跑点过：点「下载」→ 栏头/面包屑/状态栏三处都是 `C:\Users\lbx13\Downloads`；被重定向的文件夹也拿得到真实位置 |
 | 路径串 | 面包屑/栏头与列出的内容必须指向同一个目录 | ✅ 已确诊并修：旧面包屑按 `components()` 取前 N 个重拼，Windows 上第一跳给的是 `E:`（盘相对，按该盘 CWD 解析）。现在标签与目标同源走 `ancestors()`，枚举层 `LocalVolume::resolve` 把 `E:` 补成 `E:\`（MCP/HTTP/CLI 那条腿客户端可以直接传 `"path":"E:"`）。真跑验过：`E:\tmp\adv-mut` 点「tmp」→ 栏头 `E:\tmp`、列的是 tmp 的内容。机制与实测见 `docs/UI-NEXT.md` §10 |
 | CI | 五道门禁（lint / 双平台测试 / 插件行为 / 插件字节可复现 / 客户端契约） | ✅ `85f8ba9`（run 38979552946）全绿 |
@@ -178,6 +179,16 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
   两栏与目录树都列出该发行版的根。它和"在本地卷里直接进
   `\\wsl.localhost\<distro>\…`"是同一条底层路径（UNC 本来就可 `read_dir`），
   差别是入口现在看得见。
+- **跨卷互传到"真进程"为止，界面没接。** 在 `D:\tmp\e2e` 里起真 CLI 进程实测到的：
+  `fmnr cp archive:D:\tmp\e2e\pack.7z/hello.txt --to D:\tmp\e2e\final` → `{done:1, bytes:9}`，
+  盘上 9 字节逐字节等于 `hello 7z\n`；嵌套成员 `dir/deep.bin` → 落 10 字节 `ABCDEFGHIJ`；
+  `fmnr search <那个件> deep` 吐出的那条 `archive:…!/dir/deep.bin` 原样喂给 `fmnr cat`
+  读回同样 10 字节（这就是 `!/` 那一格的验收）。
+  🔴 一句别读错的证据：往只读卷拷（`cp <本地文件> --to archive:…`）时 CLI 打的
+  「归档卷是只读的：1 → archive:…」是**源卷自己的 `copy`** 报的（那次选卷把归档卷选成了源卷），
+  不是 `copy_across` 那句「目标卷 X 是只读的」——两条消息都说清了只读，但别拿这条 CLI 输出
+  当 `copy_across` 的实测证据（那一格在 `fmnr-ai/tests/cross_volume_dispatch.rs` 里测）。
+  **没实测的**：WSL / SSH 卷之间的搬运（没有可连主机）、界面里的跨栏拖放（仍走单卷那条 `ops::spawn_op`）。
 - **两栏只能看已挂载的那个卷。** 面包屑最远到盘根，但目录树只挂当前 home 的子树，
   「📦 挂载」只给 归档 / WSL / SSH 三项——**没有"挂另一块本地盘"**。
   所以从 `local:C:\Users\…` 出发，走到 `C:\Program Files (x86)\…` 这种同机绝对路径

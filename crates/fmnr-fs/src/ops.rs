@@ -128,6 +128,31 @@ pub fn dir_stats(root: &Path) -> (u64, u64) {
 /// 整份写入的**唯一**入口：走 `create_exclusive` 的开法，所以"别人正开着写"
 /// 在这里会变成一条说得清的失败，而不是静默把对方的数据截掉。
 ///
+/// 逐块把流写进任意 `AsyncWrite`，返回写出的字节数。**一块一次写，不先收齐。**
+///
+/// 为什么单独抽出来：这是"跨卷搬运不把整个文件读进内存"这句话里**唯一能被确定地测**
+/// 的那一半。另一半（"边收边写在盘上立刻看得见"）在本机量不出来——实测：
+/// `write_all(...).await` 已经返回成功，另开一个句柄问大小仍报 **0 字节**，
+/// 要先在写句柄上 `stream_position()`（一次 seek）才变得可见。
+/// 所以拿"另一个句柄看到的文件大小"当判据的门会**红在尺子上**，不 Ship（细节见 CHANGELOG）。
+/// 这一格的判据改成**写入次数**：三块流必须让 sink 看到 ≥2 次写；
+/// 谁把它改成"收齐再一次写"，这条当场判红。
+pub async fn stream_to_writer<W, S>(writer: &mut W, stream: &mut S) -> std::io::Result<u64>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    S: futures::Stream<Item = std::io::Result<Vec<u8>>> + Unpin,
+{
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    let mut written = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk?;
+        writer.write_all(&bytes).await?;
+        written += bytes.len() as u64;
+    }
+    Ok(written)
+}
+
 /// `LocalVolume::write` 与拷贝落盘都汇到这一层——同一件政策只写一处
 /// （本轮 `.lnk` 那条的教训就是：同一句事实写两份，其中一份一定会先过期）。
 pub fn write_file(path: &Path, data: &[u8]) -> Result<()> {
@@ -140,41 +165,22 @@ pub fn write_file(path: &Path, data: &[u8]) -> Result<()> {
 
 /// 目标已存在时求一个不冲突的名字：`a.txt` → `a (2).txt` → `a (3).txt`。
 /// 无冲突时原样返回。
+///
+/// 名字怎么拼（`{基名} ({n}).{扩展}`、已带序号则续号）在 `fmnr_core::rename` 里，
+/// **这里只剩"问本地盘存不存在"那三行**：跨卷搬运（`fmnr_core::transfer`）问的是目标卷，
+/// 两边必须共用同一条拼名规则，否则同一个文件从两条入口拖进同一个目录会拿到两个名字。
 pub fn unique_name(dest: &Path) -> PathBuf {
     if !dest.exists() {
         return dest.to_path_buf();
     }
-    let parent = dest.parent().unwrap_or(Path::new("."));
     let stem = dest
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    let ext = dest
-        .extension()
-        .map(|e| e.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    // 若原名已是 "x (2)" 形式，从它的序号继续往上加。
-    let (base, start) = match stem.rfind(" (") {
-        Some(i) if stem.ends_with(')') => {
-            let inner = &stem[i + 2..stem.len() - 1];
-            match inner.parse::<u32>() {
-                Ok(n) if n >= 2 => (stem[..i].to_string(), n + 1),
-                _ => (stem.clone(), 2),
-            }
-        }
-        _ => (stem.clone(), 2),
-    };
-
-    for n in start..u32::MAX {
-        let candidate = if ext.is_empty() {
-            format!("{base} ({n})")
-        } else {
-            format!("{base} ({n}).{ext}")
-        };
-        let path = parent.join(candidate);
-        if !path.exists() {
-            return path;
+    for n in fmnr_core::rename::first_rename_index(&stem)..u32::MAX {
+        let candidate = fmnr_core::rename::candidate_name(dest, n);
+        if !candidate.exists() {
+            return candidate;
         }
     }
     dest.to_path_buf()
@@ -522,6 +528,103 @@ mod tests {
         ));
         std::fs::create_dir_all(&base).unwrap();
         base
+    }
+
+    /// 只数"被写了几次"的 sink——**写入次数**是这里唯一能被确定量到的信号。
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tokio::io::AsyncWrite for CountingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(std::io::Write::write(self.get_mut(), buf))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// 🔴 门：**一块一次写**，不许先收齐。三块的流必须让 sink 看到 ≥2 次写。
+    ///
+    /// 为什么用写入次数而不是"盘上大小"：跨句柄看长度在本机不可靠
+    /// （`write_all` 已返回成功后，另一个句柄仍报 0 字节，要先在写句柄上 seek 一次），
+    /// 那条判据会红在尺子上。而"收齐再一次写"这个退化写法在**内容上完全等价**，
+    /// 只有写入次数分得开——它也正是"不把整个文件读进内存"这句话的可测部分。
+    #[tokio::test]
+    async fn stream_to_writer_writes_each_chunk_separately() {
+        let chunks: Vec<std::io::Result<Vec<u8>>> =
+            vec![Ok(vec![b'a'; 3]), Ok(vec![b'b'; 4]), Ok(vec![b'c'; 5])];
+        let mut stream = futures::stream::iter(chunks);
+        let mut w = CountingWriter {
+            writes: 0,
+            bytes: Vec::new(),
+        };
+
+        let n = stream_to_writer(&mut w, &mut stream).await.unwrap();
+
+        assert_eq!(n, 12, "返回值要等于全部字节数");
+        assert_eq!(w.bytes, b"aaabbbbccccc", "内容要按顺序逐字节对上");
+        assert!(
+            w.writes >= 3,
+            "三块流必须至少三次写；实际 {} 次 ⇒ 退化成收齐再写了",
+            w.writes
+        );
+    }
+
+    /// 空流：一次都不写、返回 0。**0 字节与"没发生"要区分开**——那是上层建不建文件的依据。
+    #[tokio::test]
+    async fn empty_stream_writes_nothing_and_reports_zero() {
+        let mut stream = futures::stream::iter(Vec::<std::io::Result<Vec<u8>>>::new());
+        let mut w = CountingWriter {
+            writes: 0,
+            bytes: Vec::new(),
+        };
+        assert_eq!(stream_to_writer(&mut w, &mut stream).await.unwrap(), 0);
+        assert_eq!(w.writes, 0);
+    }
+
+    /// 源侧报错要**原样带出去**，不能变成"成功但内容短了"。
+    #[tokio::test]
+    async fn a_failing_chunk_is_propagated_not_truncated() {
+        let chunks = vec![
+            Ok(vec![b'x'; 4]),
+            Err(std::io::Error::other("解压到一半坏了")),
+        ];
+        let mut stream = futures::stream::iter(chunks);
+        let mut w = CountingWriter {
+            writes: 0,
+            bytes: Vec::new(),
+        };
+        let e = stream_to_writer(&mut w, &mut stream).await.unwrap_err();
+        assert!(
+            e.to_string().contains("解压到一半坏了"),
+            "错要原样带出：{e}"
+        );
     }
 
     /// 🔴 门：往一个**别的程序正开着写**的文件上覆盖，必须失败并把原因说清楚，

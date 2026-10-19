@@ -247,6 +247,36 @@ impl Volume for LocalVolume {
             .map_err(|e| Error::Other(e.to_string()))?
     }
 
+    /// 边收边写：跨卷搬运走这条路，所以**不把整个文件读进内存**。
+    ///
+    /// 句柄仍由 `ops::create_exclusive` 建（拒写共享掩码，见 #61）：这条新通路
+    /// 要是绕过它，就等于在刚修好的闸旁边再开一个洞——实测形状是
+    /// "对方正开着写的文件被 truncate 成 0 字节而调用方看到成功"。
+    /// 建句柄这种一次性阻塞动作进 `spawn_blocking`，逐块写用 `tokio::fs::File`，
+    /// 免得在异步任务里拿着 std 的 File 一块一块地堵运行时线程。
+    async fn write_stream(
+        &self,
+        dest: &VPath,
+        mut src: Box<dyn futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + Unpin>,
+    ) -> Result<u64> {
+        use tokio::io::AsyncWriteExt;
+        let full = self.resolve(dest);
+        let std_file = {
+            let for_open = full.clone();
+            tokio::task::spawn_blocking(move || {
+                ops::create_exclusive(&for_open).map_err(|e| ops::in_use_error(&for_open, e))
+            })
+            .await
+            .map_err(|e| Error::Other(format!("写盘任务被中断：{e}")))??
+        };
+        let mut f = tokio::fs::File::from_std(std_file);
+        let written = ops::stream_to_writer(&mut f, &mut src)
+            .await
+            .map_err(|e| ops::in_use_error(&full, e))?;
+        f.flush().await.map_err(Error::Io)?;
+        Ok(written)
+    }
+
     fn writable(&self) -> bool {
         true
     }

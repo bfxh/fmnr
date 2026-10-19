@@ -117,12 +117,9 @@ impl Server {
                     .ok_or_else(|| RpcError::new(INVALID_PARAMS, "缺少 tools/call 的 name"))?
                     .to_string();
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                // 按参数选卷，选不上回退注册表里的第一个（规则与 CLI 同一份）。
-                let volume = self
-                    .registry
-                    .route_or_default(&args)
-                    .ok_or_else(|| RpcError::new(INTERNAL_ERROR, "没有已挂载的卷：注册表是空的"))?;
-                tools::dispatch(volume, &name, args).await
+                // 选卷 + 「目标目录是不是另一个卷」都在 tools 那一格里，与 CLI / HTTP
+                // 共用同一份规则——三个入口各写一遍就会分叉成「CLI 能取包内文件、MCP 说不行」。
+                tools::dispatch_on_registry_envelope(&self.registry, &name, args).await
             }
 
             other => Err(RpcError::new(

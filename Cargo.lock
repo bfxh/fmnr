@@ -1685,9 +1685,11 @@ dependencies = [
  "fmnr-core",
  "fmnr-fs",
  "fmnr-remote",
+ "futures",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

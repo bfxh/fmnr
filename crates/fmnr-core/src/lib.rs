@@ -1,6 +1,8 @@
 pub mod board;
 pub mod open;
+pub mod rename;
 pub mod search;
+pub mod transfer;
 pub mod volreg;
 pub mod wsl;
 
@@ -299,6 +301,30 @@ pub trait Volume: Send + Sync {
 
     /// 写入（只读卷返回 Unsupported）。
     async fn write(&self, path: &VPath, data: &[u8]) -> Result<()>;
+
+    /// 以**流**的方式写一个文件：逐块接收、落盘，返回写出的字节数。
+    ///
+    /// 有了它才谈得上跨卷搬运：源侧只给 `read_stream`（本来就是分块的），
+    /// 目标侧若只有 `write(&[u8])`，搬运就得先把整个文件读进内存——
+    /// 那等于把「拷贝按块走、不把 4 GB 读进内存」这条自己立的规矩从另一头破掉。
+    ///
+    /// 默认实现收齐后转调 `write`：**不静默丢字节**，但整份在内存里
+    /// （远程卷今天只有这一条路，已在「已知边界」登记）；本地卷覆写成边收边写。
+    /// 只读卷沿用 `write` 的 `Unsupported`。
+    async fn write_stream(
+        &self,
+        dest: &VPath,
+        mut src: Box<dyn futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + Unpin>,
+    ) -> Result<u64> {
+        use futures::StreamExt;
+        let mut buf = Vec::new();
+        while let Some(chunk) = src.next().await {
+            buf.extend_from_slice(&chunk.map_err(Error::Io)?);
+        }
+        let n = buf.len() as u64;
+        self.write(dest, &buf).await?;
+        Ok(n)
+    }
 
     fn writable(&self) -> bool;
 

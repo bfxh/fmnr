@@ -7,6 +7,7 @@
 //! 先注册进本仓，才能被 UI 拉出来选择。
 
 use crate::{Volume, VolumeId, VolumeKind};
+use std::path::Path;
 use std::sync::Arc;
 
 pub struct VolumeInfo {
@@ -102,6 +103,59 @@ impl VolumeRegistry {
         self.route_for(&path_samples(args))
     }
 
+    /// 只拿**一条**路径去路由——跨卷搬运用它判断"目标目录是不是另一个卷"。
+    ///
+    /// 刻意只是 [`route_for`] 的一层薄壳：匹配规则必须只有那一份，
+    /// 两处各写就会漂移出"源侧认这个卷、目标侧认那个卷"的怪结果。
+    pub fn route_for_sample(&self, sample: &str) -> Option<Arc<dyn Volume>> {
+        self.route_for(&[sample.to_string()])
+    }
+
+    /// 目标目录属于哪个卷——跨卷搬运的**第二条**路由，比 [`route_for_sample`] 多认一层。
+    ///
+    /// 为什么不能只用前者：前者的规则是"谁的 **id** 是这条字符串的前缀"，而
+    /// `D:\tmp\out` 不是任何 id 的前缀（id 长这样：`local:D:\tmp\e2e`）。于是
+    /// 1. 显式带卷名前缀的写法（`local:D:\out`、`wsl:Ubuntu-24.04/home`）照旧走 id 匹配；
+    /// 2. 裸**绝对路径**再按"哪个本地卷的根是它的目录级前缀"挑最长的；
+    /// 3. 都不中时，**只注册了一个本地卷**就用它（一台机器上的"本地"就是它，
+    ///    且 `LocalVolume` 本来就接受自己根之外的绝对路径）；注册了多个盘则返回 None——
+    ///    这时目标必须由用户显式指名，猜一个盘会把文件搬到没点过的地方去。
+    pub fn route_for_dest(&self, dest: &str) -> Option<Arc<dyn Volume>> {
+        if let Some(v) = self.route_for_sample(dest) {
+            return Some(v);
+        }
+        let dest_path = std::path::Path::new(dest);
+        if !dest_path.is_absolute() {
+            return None;
+        }
+        let mut best: Option<(usize, VolumeId)> = None;
+        let mut locals = Vec::new();
+        for info in self.list() {
+            // 判据只有一条：**id 是不是 `local:` 开头的**。归档/WSL/远程卷的 id
+            // 各自是 `archive:`/`wsl:`/`ssh:`，剥不出 `local:` 就自然被跳过——
+            // 所以这里**不再另加一个 `kind != Local` 的条件**：那条今天没有分辨力
+            // （变异"摘掉 kind 筛选"照样全绿就是证据），留着只会让人以为它在承重。
+            // 也不看 `writable`：那件事交给 `copy_across` 开头那句「目标卷是只读的」，
+            // 它有门，消息也点名到目标卷。
+            let Some(root) = info.id.0.strip_prefix("local:") else {
+                continue;
+            };
+            if let Some(depth) = dir_prefix_depth(Path::new(root), dest_path) {
+                if best.as_ref().is_none_or(|(d, _)| depth > *d) {
+                    best = Some((depth, info.id.clone()));
+                }
+            }
+            locals.push(info.id);
+        }
+        if let Some((_, id)) = best {
+            return self.get(&id);
+        }
+        if locals.len() == 1 {
+            return self.get(&locals[0]);
+        }
+        None
+    }
+
     /// 路由不上时的兜底卷：注册表里的第一个。
     ///
     /// **不硬编码 id**：`LocalVolume::new(cwd)` 自生的 id 是 `local:<绝对路径>`，
@@ -115,6 +169,47 @@ impl VolumeRegistry {
     pub fn route_or_default(&self, args: &serde_json::Value) -> Option<Arc<dyn Volume>> {
         self.route_for_args(args).or_else(|| self.default_volume())
     }
+
+    /// **这次操作的「源卷」**——`copy`/`move` 只看 `sources`，其余工具沿用 [`route_or_default`]。
+    ///
+    /// 为什么不看 `dest_dir`：这两个工具同时带「从哪拿」和「往哪放」两个方向，而
+    /// [`route_for`] 取的是**最长的 id 前缀** ⇒ 目标根比源根更深时，**目标卷会被选成源卷**。
+    /// 实测（两个本地卷 `local:C:\a` 与 `local:C:\a\b`，源 `local:C:\a\x.txt`，
+    /// 目标 `local:C:\a\b\out`）探针打印 `源卷=local:C:\a\b 同卷=true`
+    /// ⇒ 跨卷那一步根本走不到，这条被冒充成同卷搬运。
+    /// 伤害面到此为止：本地↔本地退回单卷 `copy` 之后**盘上照样成功**（`LocalVolume` 收自己根之外的
+    /// 绝对路径）——变异复打时 `fmnr-ai` 那条分派层门照样绿就是这个意思。更糟的「源在错卷里
+    /// 解析成 NotFound」要跨 kinds 的卷对（本地卷 id 比归档卷 id 更长才抢得赢），本机造不出那种形状，**未证**。
+    /// `sources` 缺失或一条都没有时**保持老行为**（按全样本路由）：那是非法调用，
+    /// 由工具层的参数校验去报，不该在这里改选卷规则。
+    pub fn route_source(&self, tool: &str, args: &serde_json::Value) -> Option<Arc<dyn Volume>> {
+        let base = match tool {
+            "copy" | "move" => {
+                let sources = source_samples(args);
+                if sources.is_empty() {
+                    self.route_for_args(args)
+                } else {
+                    self.route_for(&sources)
+                }
+            }
+            _ => self.route_for_args(args),
+        };
+        base.or_else(|| self.default_volume())
+    }
+}
+
+/// 只取 `copy`/`move` 的**源侧**样本（`sources` 数组），不碰目标字段。
+/// 与 [`path_samples`] 的分工：那份清单回答「这条调用涉及哪些卷」，
+/// 这一份回答「要被动的那些条目住在哪个卷」——跨卷搬运里这两个答案可以不同。
+pub fn source_samples(args: &serde_json::Value) -> Vec<String> {
+    args.get("sources")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// 工具参数里"哪些字段是路径"的**唯一**清单。
@@ -132,6 +227,25 @@ pub fn path_samples(args: &serde_json::Value) -> Vec<String> {
         out.extend(arr.iter().filter_map(|v| v.as_str().map(str::to_string)));
     }
     out
+}
+
+/// `root` 是否是 `dest` 的**目录级**前缀；是则返回 `root` 的成分数（用来挑最长的那一个）。
+///
+/// 两处刻意：① **按成分比不按字符串**——`D:\tmp\e2` 不是 `D:\tmp\e20\out` 的前缀，
+/// 用 `starts_with` 会把文件搬进隔壁盘目录；② 盘符大小写归一（Windows 上
+/// `d:\x` 与 `D:\x` 是同一个地方，而注册表里两个写法都会出现）。
+/// 只归一**大小写**，不做别的规范化。
+fn dir_prefix_depth(root: &Path, dest: &Path) -> Option<usize> {
+    let comps = |p: &Path| -> Vec<String> {
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect::<Vec<_>>()
+    };
+    let (r, d) = (comps(root), comps(dest));
+    if r.is_empty() || r.len() > d.len() {
+        return None;
+    }
+    (d[..r.len()] == r[..]).then_some(r.len())
 }
 
 /// 一个「卷来源」的对外描述：挂载尝试的结果。
@@ -348,6 +462,127 @@ mod tests {
             kind: crate::VolumeKind::Local,
             entries: Vec::new(),
         })
+    }
+
+    /// 🔴 目标路由的第二条易错点：**按目录成分比，不按字符串**。
+    /// 用 `starts_with` 的话 `local:C:\Foo` 会把 `C:\Football\a.txt` 也认成自己的，
+    /// 于是文件被搬进隔壁那个盘目录——同一个形状在 `fmnr-pkg::owner` 里已经栽过一次，
+    /// 那里有专门的 `C:\Foo` vs `C:\Football` 测试。
+    #[test]
+    fn dest_routing_matches_directory_not_string_prefix() {
+        let reg = VolumeRegistry::new();
+        reg.add(dummy("local:C:\\Foo"));
+        reg.add(dummy("local:C:\\Other"));
+        assert!(
+            reg.route_for_dest("C:\\Football\\a.txt").is_none(),
+            "字符串前缀会把 Football 认进 C:\\Foo 的根里——两个都不含它就谁也不是，不许猜"
+        );
+
+        // 真在根下的要认对，并且更深的那个根要赢（最长匹配）。
+        let deep = VolumeRegistry::new();
+        deep.add(dummy("local:C:\\Users"));
+        deep.add(dummy("local:C:\\Users\\lbx13"));
+        assert_eq!(
+            deep.route_for_dest("C:\\Users\\lbx13\\out")
+                .expect("更深的根要赢")
+                .id()
+                .0,
+            "local:C:\\Users\\lbx13"
+        );
+        // 盘符大小写不同是同一个地方
+        assert_eq!(
+            deep.route_for_dest("c:\\users\\lbx13\\out")
+                .expect("盘符与根的大小写要归一")
+                .id()
+                .0,
+            "local:C:\\Users\\lbx13"
+        );
+    }
+
+    /// 只注册了**一个**可写本地卷时，裸绝对路径可以退到它；两个就不许猜。
+    #[test]
+    fn dest_routing_falls_back_only_when_a_single_local_volume_exists() {
+        let one = VolumeRegistry::new();
+        one.add(dummy("local:C:\\Users\\lbx13"));
+        assert_eq!(
+            one.route_for_dest("D:\\somewhere\\out")
+                .expect("唯一一个本地卷时兜底到它")
+                .id()
+                .0,
+            "local:C:\\Users\\lbx13"
+        );
+
+        let two = VolumeRegistry::new();
+        two.add(dummy("local:C:\\Users\\lbx13"));
+        two.add(dummy("local:D:\\Data"));
+        assert!(
+            two.route_for_dest("E:\\out").is_none(),
+            "两个本地盘都装不下 E:\\out 时不许猜一个——那时目标必须显式带卷名前缀"
+        );
+    }
+
+    /// 🔴 **相对路径的目标一律不路由**，哪怕本机只注册了一个本地卷。
+    /// 摘掉 `is_absolute` 那道闸的话，兜底那一档会把 `--to out` 也算给那个唯一的本地卷：
+    /// 源在归档卷时看起来"更好用"，但同一个写法在**装了几个本地盘的两台机器上落点不同**
+    /// （一个卷时跨卷写到 CWD，两个卷时报错），而"不带前缀 = 仍在源卷里解析"这条对外
+    /// 规则会被改成跟机器配置有关。宁可让源卷自己报「本卷只读」。
+    /// 这条是变异复打量出来的：刀口"去掉绝对性检查"原本**全绿**。
+    #[test]
+    fn a_relative_dest_is_never_routed() {
+        let one = VolumeRegistry::new();
+        one.add(dummy("local:C:\\Users\\lbx13"));
+        assert!(
+            one.route_for_dest("out").is_none(),
+            "相对路径不许走『唯一一个本地卷』的兜底"
+        );
+        assert!(
+            one.route_for_dest("sub\\out").is_none(),
+            "带分隔符的相对路径也不许"
+        );
+    }
+
+    /// 🔴 **源卷的选择不许看目标**（`copy`/`move`）。这条是先有实测才有门的：
+    /// 两个本地卷 `local:C:\a`（浅）与 `local:C:\a\b`（深），源在浅根、目标在深根时，
+    /// 老规则（全样本 + 最长 id 前缀）会把**深根那个选成源卷**——
+    /// 于是「源卷 == 目标卷」，跨卷那一步根本走不到（会不会进一步解析错，按卷的种类而定，
+    /// 见上面 `route_source` 的注释）。
+    /// 测试里把两条规则都跑一遍：拿到不同答案才说明这条门真的在分辨"看不看目标"。
+    #[test]
+    fn the_source_volume_ignores_the_destination() {
+        let reg = VolumeRegistry::new();
+        reg.add(dummy("local:C:\\a"));
+        reg.add(dummy("local:C:\\a\\b"));
+        let args = serde_json::json!({
+            "sources": ["local:C:\\a\\x.txt"],
+            "dest_dir": "local:C:\\a\\b\\out"
+        });
+        // 老规则（照旧可用，别的工具仍走它）：目标把源卷抢走了——这一条钉的是"它确实会抢"
+        assert_eq!(
+            reg.route_or_default(&args).expect("有卷").id().0,
+            "local:C:\\a\\b",
+            "全样本规则本来就会被更深的目标根带走；这条断言一旦变绿说明规则漂了"
+        );
+        // 新规则：源只看 sources
+        assert_eq!(
+            reg.route_source("copy", &args).expect("有卷").id().0,
+            "local:C:\\a",
+            "源卷必须由 sources 决定，不许被 dest_dir 带走"
+        );
+        assert_eq!(
+            reg.route_source("move", &args).expect("有卷").id().0,
+            "local:C:\\a"
+        );
+        // 其它工具没有"两个方向"，仍按全样本走（规则不许在这儿顺手改掉）
+        assert_eq!(
+            reg.route_source("delete", &args).expect("有卷").id().0,
+            "local:C:\\a\\b"
+        );
+        // sources 缺失时保持老行为：那是非法调用，该由参数校验报，不该在选卷这层猜
+        let no_sources = serde_json::json!({ "dest_dir": "local:C:\\a\\b\\out" });
+        assert_eq!(
+            reg.route_source("copy", &no_sources).expect("有卷").id().0,
+            "local:C:\\a\\b"
+        );
     }
 
     /// 卷路由的两个易错点之一：**最长 id 前缀**优先。

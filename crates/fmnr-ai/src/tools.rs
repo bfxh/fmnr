@@ -62,7 +62,13 @@ pub fn specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "copy",
-            description: "拷贝一组条目到目标目录。conflict 决定同名时怎么办。",
+            description: concat!(
+                "拷贝一组条目到目标目录。conflict 决定同名时怎么办。",
+                "dest_dir 可以指向**另一个卷**：带卷名前缀（如 `local:D:\\out`）或一条裸绝对路径，",
+                "那时走跨卷搬运（源读流 → 目标写流，不把整个文件读进内存）。",
+                "不带前缀时目标仍解析在源卷里（与旧行为一致）。",
+                "只搬文件，不搬目录；只读卷不能当目标。"
+            ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -365,8 +371,66 @@ fn parse<T: for<'de> Deserialize<'de>>(v: Value) -> Result<T, RpcError> {
 ///
 /// MCP 层（`server.rs`）把它包成 `content` 数组，CLI 直接打印 payload——
 /// 两条入口共用这一个 match，才不会出现「CLI 能删、MCP 不能」这类分叉。
+///
+/// 单卷版：`copy`/`move` 的目标目录也解析在**同一个卷**里。
+/// 三条真入口都该用 [`dispatch_on_registry`]（它只多算一次"目标是不是另一个卷"），
+/// 留这一格是给测试与"手里只有一个卷对象"的调用方。
 pub async fn dispatch_payload(
     volume: Arc<dyn Volume>,
+    name: &str,
+    args: Value,
+) -> Result<Value, RpcError> {
+    dispatch_payload_to(volume, None, name, args).await
+}
+
+/// **三条入口都该用的那一格**：按参数选源卷，再看目标目录是不是另一个卷。
+///
+/// 之前每个入口各写一遍「`route_or_default` + `dispatch_payload`」，形状相同但互不相干；
+/// 跨卷搬运要的第二个卷一旦也各写一遍，就会分叉成「CLI 能取包内文件、MCP 说不行」
+/// ——本仓已经为这种分叉付过学费（`.lnk` builder、归档那句"懒加载目录"、共享掩码政策）。
+/// 所以收成一格，入口只负责把 `VolumeRegistry` 递进来。
+pub async fn dispatch_on_registry(
+    registry: &fmnr_core::volreg::VolumeRegistry,
+    name: &str,
+    args: Value,
+) -> Result<Value, RpcError> {
+    let volume = registry
+        .route_source(name, &args)
+        .ok_or_else(|| RpcError::new(INTERNAL_ERROR, "没有已挂载的卷：注册表是空的"))?;
+    let target = cross_target(registry, name, &args, &volume);
+    dispatch_payload_to(volume, target, name, args).await
+}
+
+/// 只有 `copy`/`move` 需要第二个卷，而且**只有目标目录显式带别卷前缀时**才算跨卷。
+///
+/// 不带前缀一律维持"目标解析在源卷里"的老行为：否则同一条命令的含义会随着
+/// 注册表里恰好挂着哪个盘而变化，那是最难查的一类错。
+pub fn cross_target(
+    registry: &fmnr_core::volreg::VolumeRegistry,
+    name: &str,
+    args: &Value,
+    volume: &Arc<dyn Volume>,
+) -> Option<Arc<dyn Volume>> {
+    // 只有 copy 特判跨卷。**move 刻意不特判**（这是量出来的，不是想当然）：
+    // 先写的是"跨卷移动也拒绝、让用户自己删"，结果两个本地卷之间的 move 照样成功——
+    // `LocalVolume` 认绝对路径，源被解析到另一个盘的根之外，它本来就是一次文件系统级移动。
+    // 在这里加一层拒绝只会把本来能用的一条弄坏；源真是只读卷时，
+    // 该卷自己的 `move_entries` 会拒（消息是"归档卷是只读的"）。
+    if name != "copy" {
+        return None;
+    }
+    let dest = args.get("dest_dir").and_then(|v| v.as_str())?;
+    let t = registry.route_for_dest(dest)?;
+    (t.id() != volume.id()).then_some(t)
+}
+
+/// 与 [`dispatch_payload`] 同一张表，只是多给一个**目标卷**。
+///
+/// 只有 `copy`/`move` 会看它；其余工具一律忽略——不为第二个卷在每个臂里加判断，
+/// 那才是真正会分叉的地方。
+pub async fn dispatch_payload_to(
+    volume: Arc<dyn Volume>,
+    target: Option<Arc<dyn Volume>>,
     name: &str,
     args: Value,
 ) -> Result<Value, RpcError> {
@@ -439,14 +503,34 @@ pub async fn dispatch_payload(
             let sources: Vec<VPath> = a.sources.iter().map(|s| VPath(s.into())).collect();
             let dest = VPath(a.dest_dir.clone().into());
             let progress = Arc::new(fmnr_core::Progress::new());
-            let report = if name == "copy" {
-                volume
-                    .copy(&sources, &dest, a.conflict.to_core(), progress)
+            // 「目标是**另一个**卷」这一问只在 `cross_target` 那一处判。
+            // 这里原来还写了一遍 `target.filter(|t| t.id() != volume.id())`——同一句话写两份，
+            // 后果是变异"摘掉 cross_target 那一问"照样绿（另一份兜住了），
+            // 看着像有锁其实两处都没被钉住。留一处就够。
+            let report = match target {
+                // 只有 `cross_target` 认出来的**另一个**卷走这条；它对 `move` 一律返回 None，
+                // 所以这里不需要"move 跨卷怎么办"的分支，也不摆 unreachable!() 占位。
+                Some(dst) => {
+                    fmnr_core::transfer::copy_across(
+                        &volume,
+                        &dst,
+                        &sources,
+                        &dest,
+                        a.conflict.to_core(),
+                        &progress,
+                    )
                     .await
-            } else {
-                volume
-                    .move_entries(&sources, &dest, a.conflict.to_core(), progress)
-                    .await
+                }
+                None if name == "copy" => {
+                    volume
+                        .copy(&sources, &dest, a.conflict.to_core(), progress)
+                        .await
+                }
+                None => {
+                    volume
+                        .move_entries(&sources, &dest, a.conflict.to_core(), progress)
+                        .await
+                }
             }
             .map_err(to_rpc)?;
             Ok(json!({
@@ -749,6 +833,17 @@ fn to_rpc(e: fmnr_core::Error) -> RpcError {
 /// 只在 MCP 边界加这层信封；CLI 直接用 `dispatch_payload` 的原始 JSON。
 pub async fn dispatch(volume: Arc<dyn Volume>, name: &str, args: Value) -> Result<Value, RpcError> {
     dispatch_payload(volume, name, args).await.map(text_result)
+}
+
+/// MCP 信封版：与 [`dispatch`] 同一份 `text_result`，只是选卷交给注册表那一格。
+pub async fn dispatch_on_registry_envelope(
+    registry: &fmnr_core::volreg::VolumeRegistry,
+    name: &str,
+    args: Value,
+) -> Result<Value, RpcError> {
+    dispatch_on_registry(registry, name, args)
+        .await
+        .map(text_result)
 }
 
 fn text_result(payload: Value) -> Value {

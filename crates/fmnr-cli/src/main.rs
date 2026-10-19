@@ -101,7 +101,7 @@ enum Cmd {
         limit: usize,
     },
 
-    /// 拷贝条目到目标目录
+    /// 拷贝条目到目标目录（`--to` 可以给另一个卷：带卷名前缀或一条裸绝对路径 ⇒ 跨卷搬运）
     Cp {
         /// 源条目（至少一个）
         #[arg(required = true)]
@@ -470,9 +470,12 @@ impl Ctx {
     }
 
     /// 卷路由：路径带 `archive:`/`wsl:` 等前缀时切到对应卷，否则用默认卷。
-    fn volume_for(&self, args: &Value) -> Arc<dyn Volume> {
+    ///
+    /// `copy`/`move` 的**源**只按 `sources` 选卷（规则在 `VolumeRegistry::route_source`，
+    /// 与 MCP/HTTP 同一份）——把 `dest_dir` 也当样本会让"目标根比源根更深"时选错源卷。
+    fn volume_for(&self, tool: &str, args: &Value) -> Arc<dyn Volume> {
         self.registry
-            .route_for_args(args)
+            .route_source(tool, args)
             .unwrap_or_else(|| self.default_volume.clone())
     }
 }
@@ -487,9 +490,13 @@ fn run_tool(tool: &'static str, args: Value) {
         );
         return;
     }
-    let volume = ctx.volume_for(&args);
+    let volume = ctx.volume_for(tool, &args);
+    let target = tools::cross_target(&ctx.registry, tool, &args, &volume);
 
-    match ctx.rt.block_on(tools::dispatch_payload(volume, tool, args)) {
+    match ctx
+        .rt
+        .block_on(tools::dispatch_payload_to(volume, target, tool, args))
+    {
         Ok(payload) => {
             println!(
                 "{}",
@@ -572,8 +579,10 @@ fn run_batch() {
         let result = if tool == "list_volume" {
             Ok(volumes_payload(&ctx.registry))
         } else {
-            let volume = ctx.volume_for(&args);
-            ctx.rt.block_on(tools::dispatch_payload(volume, tool, args))
+            let volume = ctx.volume_for(tool, &args);
+            let target = tools::cross_target(&ctx.registry, tool, &args, &volume);
+            ctx.rt
+                .block_on(tools::dispatch_payload_to(volume, target, tool, args))
         };
         match result {
             Ok(payload) => emit(json!({"line": line_no, "ok": true, "result": payload})),

@@ -70,10 +70,16 @@ impl ArchiveVolume {
 
     /// 卷内路径的**规范化**key：以 `/` 分隔、无前导斜杠。
     ///
-    /// 三种入法都要认（少一种就有一条入口暗断）：
+    /// 四种入法都要认（少一种就有一条入口暗断）：
     /// - 纯卷内相对路径 `sub/dir`（UI 面包屑就是这么传的）；
     /// - 带卷前缀的完整路径 `archive:<archive_path>/sub/dir`（MCP 客户端、
     ///   CLI 卷路由都按卷 id 前缀传）；
+    /// - 🔴 `archive:<archive_path>!/sub/dir`——**这是本卷 `search` 自己吐出来的形状**。
+    ///   之前只认 `/`，于是"搜到一条 → 拿这条去读"当场废：实测
+    ///   `fmnr search archive:D:\tmp\e2e\pack.7z deep` 给
+    ///   `archive:D:\tmp\e2e\pack.7z!/dir/deep.bin`，原样喂给 `fmnr cat` 得到
+    ///   `io: 文件名、目录名或卷标语法不正确 (os error 123)`。搜索命中的用途就是被回读，
+    ///   认不下它等于这个工具对外给了个假坐标。
     /// - `archive:` 本身 = 卷根。
     ///
     /// 老实现只认 `archive:/` 前缀，在 **Windows 盘符**下剥不掉
@@ -101,7 +107,8 @@ impl ArchiveVolume {
                 return String::new();
             }
             // 归档路径后必须紧跟子路径分隔；`x.zip2` 这种同前缀名不算。
-            if let Some(sub) = tail.strip_prefix('/') {
+            // `!` 也认：它是 `search()` 的写法（`<件>!<卷内路径>`），不认就回读不了。
+            if let Some(sub) = tail.strip_prefix('/').or_else(|| tail.strip_prefix("!/")) {
                 return sub.to_string();
             }
         }
