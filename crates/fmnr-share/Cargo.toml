@@ -1,0 +1,24 @@
+[package]
+name = "fmnr-share"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.99"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# 锁文件里已有的三条，都不引新的下载：
+#   axum / tower —— fmnr-ai 的 HTTP 腿已经在用
+#   tokio-util   —— 已经经 russh-sftp ← fmnr-remote ← fmnr-mount 进了 UI 的图
+#   getrandom    —— 已经经 rsa ← russh 进了图
+axum = "0.8.9"
+fmnr-core = { path = "../fmnr-core" }
+fmnr-fs = { path = "../fmnr-fs" }
+futures = "0.3"
+getrandom = "0.4"
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util = { version = "0.7", features = ["io"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

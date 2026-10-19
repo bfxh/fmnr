@@ -69,7 +69,11 @@
 ### 明确不做（Non-goals）
 - **不做系统级 Shell 扩展**（IThumbnailProvider/IContextMenu COM 注册）：污染系统、版本管理复杂、与最小侵入冲突。改「可选 opt-in 扩展包」，独立 EXE 默认不带
 - 不做 Windows 之外平台首发（Windows 优先，Linux 次之，macOS 不在承诺）
-- 不做文件内容同步（OneDrive/Dropbox 类）
+- 不做文件内容同步（OneDrive/Dropbox 类）。**口径边界（v1.6 加）**：局域网投递
+  （`fmnr-share`）是"一次一个动作"的单向丢文件——手机把件丢进电脑的收件目录，
+  或电脑把**用户手动登记过**的几个件让手机取走。没有目录镜像、没有冲突合并、
+  没有离线队列、没有后台常驻，因此不在这条非目标之内；哪天它开始"自动保持一致"，
+  就是撞这条线，要按新增非目标承诺重新拍板
 - **不内置 FFmpeg**（§4.7.4）
 - 不做 iOS Files 的交互逻辑（只取 iOS 视觉语言）
 
@@ -392,6 +396,7 @@ egui immediate-mode **无原生 backdrop blur**。方案：
 | v1.3 | 2026-10-16 | M8 **挂载入口落地**：新建 `fmnr-mount` 聚合 crate（`MountSpec` 意图 / `mount()` / `MountTable::mount_all()` / `discover_wsl_distros()` / `discover_archives()`），UI 顶栏「📦 挂载」三选一对话框 + CLI 改走同一套计划，归档/WSL/SSH 卷首次真正能注册进 registry。顺带修掉 CLI 侧与 UI 同源的 `local:.` 硬编码 id 坑。详见 §10 M8 行 |
 | v1.4 | 2026-10-17 | 命名决策落档：产品名「终」（README 顶部标注），仓库/crate/二进制/`fmnr://` 字面量保留 `fmnr`，全量重命名推迟到发布范围确定后。同文件定稿 M9 方案：is-scan 增量扫描 + 归档预索引 + 五个小功能（文件锁/磁盘占用增量/拖放进度/插件预览/协议注册回滚），含待决策项方案 A/B 与风险清单 |
 | v1.5 | 2026-10-19 | 删掉 `IS-CONTRIBUTION.md`（M9 方案：点名的 10 个文件一个没建过，文件地图与仓内布局不符）；`UI-NEXT.md` 的 §1/§8 收档（缺口清单过半过期、六件待拍全被已上线代码回答）。M9 剩下的两条活口（增量目录扫描 / 扫描缓存）挪进 `NEXT-BATCH.md` §21 |
+| v1.6 | 2026-10-20 | **局域网投递**（新 crate `fmnr-share`）：手机↔电脑单向丢文件，URL 带 128-bit 随机 token、明文 HTTP、默认绑回环（对外要显式批准，闸从 `fmnr-ai::http` 搬进 `fmnr_core::net::bind_addr` 与 HTTP 面共用）。UI 顶栏「手机」停靠栏开关 + 收件目录 `下载/fmnr-收件`；同名不覆盖走 `#61` 那道闸 + 全仓唯一那份命名规则；`/get` **只认编号不认路径**。§「明确不做」那条"不做文件内容同步"补了口径边界。锁文件净增 1 条（就是本仓这个包），第三方 0 条 |
 
 ---
 

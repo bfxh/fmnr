@@ -135,6 +135,12 @@ pub struct App {
     /// 留着已删的行会把"还在"的假象摆在那儿，所以按这份集合把行剔掉、
     /// 凑不满两个的组整组撤下（剩下那一份不再是重复）。
     dupes_dead: std::collections::HashSet<PathBuf>,
+    /// 局域网投递（手机 ↔ 电脑，单向丢文件）。`None` = 没开端口。
+    share: Option<ShareRunning>,
+    share_open: bool,
+    /// 默认**不勾**：不勾就只绑回环，手机连不上——那是"这台机器自己看看"的档位。
+    /// 勾上意味着同一局域网里的别的机器能访问这个端口，所以它是一句要用户做的决定。
+    share_lan: bool,
     /// 这台电脑的盘。启动时枚举一次就够（盘符不会在运行中变，
     /// 而每帧 `GetLogicalDrives` 是白付的 Win32 调用）。
     drives: Vec<fmnr_fs::drives::Drive>,
@@ -198,6 +204,15 @@ enum Dock {
     Pkg,
     Settings,
     Usage,
+    Share,
+}
+
+/// 开着的局域网投递口。`seen` 记着"界面已经报过几个收件"，
+/// 用来发现手机刚投了东西（不靠轮询打日志，靠它催一次重绘 + 一句状态）。
+struct ShareRunning {
+    hub: Arc<fmnr_share::Hub>,
+    server: fmnr_share::Server,
+    seen: usize,
 }
 
 /// [App::startup_section] 想让用户做的事，攒着等闭包外再执行。
@@ -268,18 +283,28 @@ struct PkgPanel {
     /// 拖进来的快捷方式。解析要等底账，所以存路径而不是存结论——
     /// 底账晚一点读出来，这里的结果就自己变准了。
     shortcuts: Vec<PathBuf>,
+    /// 「问过一次的件数」是否已经是**答案**。刚启动时它是 `false`，
+    /// 那时页签不许写「可升级 0」——那是一句没根据的结论。
+    answered: bool,
+    ledger_answered: bool,
 }
 
-/// 页签上的计数要区分**没数出来**与**数出来是 0**（与占用视图那条 `Option<Usage>` 同形状）：
-/// 盘点是外部进程，"还在问"和"问到了 0 个"在用户眼里是两件事——
-/// 前者等就行，后者才轮到"这台机器没什么可升"这个结论。
-fn pkg_count_label(what: &str, n: usize, scanning: bool, failed: bool) -> String {
+/// 页签上的计数要区分**没数出来**、**没问过**与**数出来是 0**
+/// （与占用视图那条 `Option<Usage>` 同形状）：`可升级 0` 是一句**结论**
+/// （"这台机器没什么可升"），而盘点是个外部进程，问还没回来。
+///
+/// 🔴 四态不是三态。上一版收成"在途/失败/报数"三档时，我把"一次都没问过"
+/// 并进了"报 0"，真窗口一眼就看到侧栏写着「更新 0」而它压根没盘过——
+/// 侧栏原先那个"没问过就不写数字"的表达是对的，被我改丢了。
+fn pkg_count_label(what: &str, n: usize, scanning: bool, failed: bool, answered: bool) -> String {
     if scanning {
         format!("{what} …")
     } else if failed {
         format!("{what} ？")
-    } else {
+    } else if answered {
         format!("{what} {n}")
+    } else {
+        what.to_string()
     }
 }
 
@@ -461,6 +486,9 @@ impl App {
             dupes_remember: false,
             dupes_sel: Vec::new(),
             dupes_dead: std::collections::HashSet::new(),
+            share: None,
+            share_open: false,
+            share_lan: false,
             drives: fmnr_fs::drives::list(),
             usage_root: PathBuf::new(),
             startup: None,
@@ -1394,6 +1422,7 @@ impl App {
             Some(Ok(Ok(rows))) => {
                 let n = rows.len();
                 self.pkg.rows = rows;
+                self.pkg.answered = true;
                 self.pkg.rx = None;
                 self.pkg.error = None;
                 self.status = format!("包更新盘点完成：{n} 项可升级（只列出，不代跑）");
@@ -1419,6 +1448,7 @@ impl App {
             Some(Ok(Ok(apps))) => {
                 let n = apps.len();
                 self.pkg.ledger = apps;
+                self.pkg.ledger_answered = true;
                 self.pkg.ledger_rx = None;
                 self.pkg.ledger_error = None;
                 self.status = format!("已装底账读好了：{n} 条");
@@ -1474,13 +1504,15 @@ impl App {
         let failed = self.pkg.error.is_some();
         let ledger_scanning = self.pkg.ledger_rx.is_some();
         let ledger_failed = self.pkg.ledger_error.is_some();
+        let answered = self.pkg.answered;
+        let ledger_answered = self.pkg.ledger_answered;
 
         let keep = dock(ctx, "dock_pkg", "包管理器", 620.0, |ui| {
             ui.horizontal(|ui| {
                 if ui
                     .selectable_label(
                         tab == PkgTab::Upgrades,
-                        pkg_count_label("可升级", rows.len(), scanning, failed),
+                        pkg_count_label("可升级", rows.len(), scanning, failed, answered),
                     )
                     .clicked()
                 {
@@ -1489,7 +1521,13 @@ impl App {
                 if ui
                     .selectable_label(
                         tab == PkgTab::Ledger,
-                        pkg_count_label("已装清单", ledger.len(), ledger_scanning, ledger_failed),
+                        pkg_count_label(
+                            "已装清单",
+                            ledger.len(),
+                            ledger_scanning,
+                            ledger_failed,
+                            ledger_answered,
+                        ),
                     )
                     .clicked()
                 {
@@ -1878,6 +1916,200 @@ impl App {
         self.pkg.open = matches!(which, Dock::Pkg);
         self.settings_open = matches!(which, Dock::Settings);
         self.usage_open = matches!(which, Dock::Usage);
+        self.share_open = matches!(which, Dock::Share);
+    }
+
+    /// 收件目录：下载目录下的一个子目录。
+    ///
+    /// 不选"当前栏那个目录"是有理由的：端口开着的时候，落点应该是**固定且预期内**的
+    /// 一处，而不是"你当时恰好站在哪儿"——后者会把手机投来的件混进正在整理的目录里，
+    /// 而且栏位一变，同一个链接前后两次投的文件就散在两个地方。
+    fn share_inbox() -> PathBuf {
+        dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("fmnr-收件")
+    }
+
+    /// 开/关这个端口。开关本身要能失败并说清为什么（端口被占、没有局域网可绑）。
+    fn start_share(&mut self) {
+        if self.share.is_some() {
+            self.status = "投递口已经开着了".into();
+            return;
+        }
+        let inbox = Self::share_inbox();
+        let hub = Arc::new(fmnr_share::Hub::new(inbox.clone()));
+        // 绑哪个地址：勾了「允许局域网」就绑**本机那个局域网 IPv4**（不是 0.0.0.0——
+        // 那只监听这一张网卡，比全盘开放窄）。量不到地址就如实说，不许偷偷退回回环。
+        let (host, allow) = if self.share_lan {
+            match fmnr_core::net::lan_ipv4() {
+                Some(ip) => (ip.to_string(), true),
+                None => {
+                    self.status = "找不到这台机器的局域网地址（没连网？），开不了".into();
+                    return;
+                }
+            }
+        } else {
+            ("127.0.0.1".to_string(), false)
+        };
+        match fmnr_share::start(hub.clone(), &host, 0, allow) {
+            Ok(server) => {
+                let seen = hub.received().len();
+                self.share = Some(ShareRunning { hub, server, seen });
+                self.status = format!("投递口已开：{}（收件目录 {}）", host, inbox.display());
+            }
+            Err(e) => self.status = format!("开不了投递口：{e}"),
+        }
+    }
+
+    fn stop_share(&mut self) {
+        // `Server::drop` 负责停：这里只负责把状态说清楚。
+        self.share = None;
+        self.status = "投递口已关，那个链接立刻失效".into();
+    }
+
+    /// 手机刚投了东西 → 说一句、催一次重绘。不轮询就等于要用户自己动一下鼠标才看得见。
+    fn poll_share(&mut self, ctx: &egui::Context) {
+        let Some(running) = self.share.as_mut() else {
+            return;
+        };
+        let got = running.hub.received();
+        if got.len() != running.seen {
+            let fresh = &got[running.seen.min(got.len())..];
+            let names = fresh
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>()
+                .join("、");
+            self.status = format!("手机投来 {n} 个：{names}", n = fresh.len());
+            running.seen = got.len();
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(700));
+        }
+    }
+
+    /// 局域网投递那一栏。
+    fn render_share(&mut self, ctx: &egui::Context) {
+        if !self.share_open {
+            return;
+        }
+        let running = self.share.as_ref();
+        let link = running
+            .map(|r| r.hub.link(&r.server.host, r.server.port))
+            .unwrap_or_default();
+        let inbox = running
+            .map(|r| r.hub.inbox().to_path_buf())
+            .unwrap_or_else(Self::share_inbox);
+        let received = running.map(|r| r.hub.received()).unwrap_or_default();
+        let outbox = running.map(|r| r.hub.outbox()).unwrap_or_default();
+        let port = running.map(|r| r.server.port).unwrap_or(0);
+        let lan = self.share_lan;
+        let on = running.is_some();
+
+        let mut want_toggle = false;
+        let mut want_copy = false;
+        let mut want_register = false;
+
+        let keep = dock(ctx, "dock_share", "手机传文件", 460.0, |ui| {
+            ui.checkbox(&mut self.share_lan, "允许局域网访问");
+            ui.label(
+                egui::RichText::new(
+                    "不勾只有这台机器自己能打开（手机连不上）。勾上之后，同一局域网里的\
+                     机器拿到链接就能往「收件目录」丢文件——链接里那串 token 是唯一的门槛，\
+                     而它是明文传的。别在陌生网络（机场、咖啡店）勾。",
+                )
+                .size(12.0)
+                .weak(),
+            );
+            ui.separator();
+
+            // 开关常驻一格：开着的时候用户得能在**同一个位置**找到「关」，
+            // 而不是先找"我刚才点的那个按钮去哪了"。
+            if ui
+                .button(if on {
+                    "关掉这个口"
+                } else {
+                    "开一个收件口"
+                })
+                .clicked()
+            {
+                want_toggle = true;
+            }
+            if on {
+                ui.label(format!("端口 {port}"));
+                ui.label("手机打开这个链接：");
+                ui.label(egui::RichText::new(link.clone()).monospace());
+                if ui.button("复制链接").clicked() {
+                    want_copy = true;
+                }
+                if !lan {
+                    // 绑回环时链接印的就是 127.0.0.1（所见即所绑），
+                    // 但用户会以为手机能打开它 —— 这句必须说。
+                    ui.label(
+                        egui::RichText::new(
+                            "这个地址只有这台机器自己能打开（端口绑在回环上）。\
+                             要让手机能用，勾上「允许局域网访问」再开一次。",
+                        )
+                        .size(12.0),
+                    );
+                }
+            } else {
+                ui.label(egui::RichText::new("现在是关着的。").weak());
+            }
+
+            ui.separator();
+            ui.label(format!("收件目录：{}", inbox.display()));
+            if received.is_empty() {
+                ui.label(egui::RichText::new("还没收到件。").weak());
+            } else {
+                for r in received.iter().rev().take(8) {
+                    ui.label(format!("· {}（{} 字节）", r.name, r.bytes));
+                }
+            }
+
+            ui.separator();
+            ui.label("从手机取（只给登记过的几个件）");
+            if ui.button("把当前栏选中的登记为待取").clicked() {
+                want_register = true;
+            }
+            if outbox.is_empty() {
+                ui.label(egui::RichText::new("还没登记。").weak());
+            } else {
+                for e in &outbox {
+                    ui.label(format!("· {}（{} 字节）", e.name, e.bytes));
+                }
+            }
+        });
+        self.share_open = keep;
+        if want_toggle {
+            if self.share.is_some() {
+                self.stop_share();
+            } else {
+                self.start_share();
+            }
+        }
+        if want_copy {
+            ctx.copy_text(link.clone());
+            self.status = format!("已复制链接：{link}");
+        }
+        if want_register {
+            let paths = self.selected_paths();
+            match &self.share {
+                Some(r) => {
+                    let n = paths
+                        .iter()
+                        .filter(|p| r.hub.add_outbox(p).is_some())
+                        .count();
+                    self.status = if n == 0 {
+                        "选中的里没有可取的普通文件".into()
+                    } else {
+                        format!("已登记 {n} 个件供手机取")
+                    };
+                }
+                None => self.status = "先开一个收件口，才谈得上登记待取件".into(),
+            }
+        }
     }
 
     /// 起一次扫描。旧的那次先取消：同时跑两棵树等于把内存和磁盘带宽翻倍，
@@ -2333,6 +2565,18 @@ impl eframe::App for App {
                 if ui.button("空间").clicked() {
                     self.open_usage();
                 }
+                // 标签带状态：端口开着却看不出来，是"我以为关了其实还开着"那一类。
+                if ui
+                    .button(if self.share.is_some() {
+                        "手机 · 开"
+                    } else {
+                        "手机"
+                    })
+                    .on_hover_text("局域网投递：手机往这台电脑丢文件，或取回登记过的几个件。")
+                    .clicked()
+                {
+                    self.open_dock(Dock::Share);
+                }
                 // 入口留在顶栏常驻（用户要的是"随时能看到、随时能改"），
                 // 但它开的是设置停靠区里的那一节，不再有自己的窗。
                 if ui.button("自启动").clicked() {
@@ -2487,6 +2731,8 @@ impl eframe::App for App {
         self.render_pkg_panel(ctx);
         self.render_settings(ctx);
         self.render_usage(ctx);
+        self.render_share(ctx);
+        self.poll_share(ctx);
 
         // 搜索面板展开时接管中央区（双栏暂时让位，回来时列表状态不变）。
         if self.search_open {
@@ -3716,8 +3962,13 @@ impl App {
                     // 而且那份把"还没扫"和"扫完是 0 个"都印成光秃秃的「更新」——
                     // 正是刚在页签上修掉的同一个歧义，一处修两处才不算白修。
                     let n = self.pkg.rows.len();
-                    let label =
-                        pkg_count_label("更新", n, self.pkg.rx.is_some(), self.pkg.error.is_some());
+                    let label = pkg_count_label(
+                        "更新",
+                        n,
+                        self.pkg.rx.is_some(),
+                        self.pkg.error.is_some(),
+                        self.pkg.answered,
+                    );
                     if ui
                         .button(label)
                         .on_hover_text("问一次 winget 有哪些包可升级。只列清单，不代跑升级。")
@@ -6356,19 +6607,23 @@ mod pkg_count_label_tests {
 
     #[test]
     fn a_zero_only_appears_when_the_scan_actually_returned_zero() {
-        assert_eq!(pkg_count_label("可升级", 0, true, false), "可升级 …");
-        assert_eq!(pkg_count_label("可升级", 0, false, true), "可升级 ？");
-        assert_eq!(pkg_count_label("可升级", 0, false, false), "可升级 0");
+        assert_eq!(pkg_count_label("可升级", 0, true, false, false), "可升级 …");
+        assert_eq!(
+            pkg_count_label("可升级", 0, false, true, false),
+            "可升级 ？"
+        );
+        assert_eq!(pkg_count_label("可升级", 0, false, false, true), "可升级 0");
+        assert_eq!(pkg_count_label("更新", 0, false, false, false), "更新");
         // 在途/失败时**不许**出现裸数字：否则用户读到的是"0 项可升级"。
         for (scanning, failed) in [(true, false), (false, true), (true, true)] {
-            let s = pkg_count_label("可升级", 0, scanning, failed);
+            let s = pkg_count_label("可升级", 0, scanning, failed, true);
             assert!(
                 !s.contains('0'),
                 "还没问到结果却报了个数：{s}（scanning={scanning} failed={failed}）"
             );
         }
         assert_eq!(
-            pkg_count_label("已装清单", 273, false, false),
+            pkg_count_label("已装清单", 273, false, false, true),
             "已装清单 273",
             "真数到手时要照常报"
         );

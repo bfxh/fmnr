@@ -11,6 +11,7 @@ members = [
     "crates/fmnr-plugins",
     "crates/fmnr-ui",
     "crates/fmnr-ai",
+    "crates/fmnr-share",
     "crates/fmnr-cli",
     "crates/fmnr-bench",
 ]

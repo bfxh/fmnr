@@ -88,7 +88,7 @@ fn main() -> std::io::Result<()> {
         }
         Some(raw_addr) => {
             let (host, port) = split_addr(&raw_addr);
-            let addr = match fmnr_ai::http::bind_addr(&host, port, args.allow_remote) {
+            let addr = match fmnr_core::net::bind_addr(&host, port, args.allow_remote) {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("{e}");

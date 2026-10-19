@@ -1,4 +1,5 @@
 pub mod board;
+pub mod net;
 pub mod open;
 pub mod rename;
 pub mod search;

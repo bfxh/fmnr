@@ -4,7 +4,8 @@
 //! 不存在「HTTP 能删、MCP 不能」这种分叉。
 //!
 //! 安全边界：这个 API 能删除文件、能启动外部程序。默认只绑 `127.0.0.1`，
-//! 且**拒绝**非回环地址——除非调用方显式 `--allow-remote`。见 `bind_addr`。
+//! 且**拒绝**非回环地址——除非调用方显式 `--allow-remote`。
+//! 那条闸住在 `fmnr_core::net::bind_addr`（局域网投递 `fmnr-share` 共用同一格）。
 
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
@@ -86,28 +87,6 @@ async fn call_tool(
     }
 }
 
-/// 决定监听地址。**非回环地址必须显式放行**。
-///
-/// 理由：这个 HTTP 面能删除文件、能拉起外部程序。默认只绑回环，
-/// 把「谁能调」限死在同机。要对外提供就得由用户自己 `allow_remote = true`，
-/// 让「暴露到网络」变成一个必须写下来的决定，而不是默认行为。
-pub fn bind_addr(host: &str, port: u16, allow_remote: bool) -> Result<String, String> {
-    let loopback = host == "127.0.0.1" || host == "::1" || host == "localhost" || host == "[::1]";
-    if !loopback && !allow_remote {
-        return Err(format!(
-            "拒绝绑定非回环地址 {host}：该 API 可删除文件、可启动外部程序。\
-             确认要对外暴露请显式加 --allow-remote。"
-        ));
-    }
-    // IPv6 字面量要加方括号才能拼进 host:port
-    let h = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
-    Ok(format!("{h}:{port}"))
-}
-
 /// 起服务并阻塞（单卷）。`addr` 形如 `127.0.0.1:8787`。
 pub async fn run(volume: Arc<dyn Volume>, addr: &str) -> std::io::Result<()> {
     let registry = fmnr_core::volreg::VolumeRegistry::new();
@@ -122,32 +101,4 @@ pub async fn run_of(
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router_of(registry)).await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn loopback_addresses_are_allowed_by_default() {
-        assert!(bind_addr("127.0.0.1", 8787, false).is_ok());
-        assert!(bind_addr("localhost", 8787, false).is_ok());
-        assert!(bind_addr("::1", 8787, false).is_ok());
-    }
-
-    /// 这条是安全边界本身：不显式放行就绝不能绑到对外地址。
-    #[test]
-    fn non_loopback_is_refused_without_opt_in() {
-        let e = bind_addr("0.0.0.0", 8787, false).unwrap_err();
-        assert!(e.contains("--allow-remote"), "错误要告诉用户怎么放行：{e}");
-        assert!(bind_addr("192.168.1.10", 8787, false).is_err());
-        // 显式放行后才行
-        assert!(bind_addr("0.0.0.0", 8787, true).is_ok());
-    }
-
-    #[test]
-    fn ipv6_literal_gets_brackets() {
-        assert_eq!(bind_addr("::1", 8787, false).unwrap(), "[::1]:8787");
-        assert_eq!(bind_addr("127.0.0.1", 80, false).unwrap(), "127.0.0.1:80");
-    }
 }

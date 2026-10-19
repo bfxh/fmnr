@@ -1729,6 +1729,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fmnr-share"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "fmnr-core",
+ "fmnr-fs",
+ "futures",
+ "getrandom 0.4.3",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower",
+]
+
+[[package]]
 name = "fmnr-ui"
 version = "0.1.0"
 dependencies = [
@@ -1742,6 +1757,7 @@ dependencies = [
  "fmnr-mount",
  "fmnr-pkg",
  "fmnr-plugins",
+ "fmnr-share",
  "futures",
  "jwalk",
  "tokio",

@@ -12,6 +12,9 @@ fmnr-icons = { path = "../fmnr-icons" }
 fmnr-plugins = { path = "../fmnr-plugins" }
 fmnr-mount = { path = "../fmnr-mount" }
 fmnr-pkg = { path = "../fmnr-pkg" }
+# 局域网投递。它带 axum/tower 进来（与 fmnr-ai 的 HTTP 面同一套，锁文件里已有），
+# 代价是 UI 这个 exe 变大——变多少要量，别口头说"不大"。
+fmnr-share = { path = "../fmnr-share" }
 eframe.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
