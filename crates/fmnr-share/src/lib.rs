@@ -75,6 +75,40 @@ pub struct Hub {
     /// 用 tokio 的锁而不是 std 的：这段里有 `.await`，std 的守卫跨 await 会让
     /// 整个 handler 的 future 变 `!Send`，axum 直接不认这个 handler。
     create_lock: tokio::sync::Mutex<()>,
+    /// WebDAV 的**写锁**。钥匙是"相对路径"（`a/b.txt`），空串代表根。
+    ///
+    /// 为什么要有：挂成盘之后，客户端会先 `LOCK` 再写、写完 `UNLOCK`；
+    /// 如果 LOCK 只回一个假 token，两个客户端同时写同一路径就**没有仲裁**，
+    /// 后写的把先写的悄悄盖掉——这正是 `#61` 那道闸想挡的形状，只是换成了网络面。
+    dav_locks: Mutex<std::collections::HashMap<String, DavLock>>,
+}
+
+/// 一把 WebDAV 写锁。`depth_infinity` = 连子孙一起锁（目录锁）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DavLock {
+    pub token: String,
+    pub until: std::time::Instant,
+    pub depth_infinity: bool,
+}
+
+fn purge_expired(g: &mut std::collections::HashMap<String, DavLock>) {
+    let now = std::time::Instant::now();
+    g.retain(|_, l| l.until > now);
+}
+
+/// `lp` 这把锁盖不盖得住 `target`：同路径，或"无限深度"锁住了它的某个祖先。
+/// 根上的无限锁（`lp == ""`）盖住一切。
+fn lock_covers(lp: &str, depth_infinity: bool, target: &str) -> bool {
+    if lp == target {
+        return true;
+    }
+    if !depth_infinity {
+        return false;
+    }
+    if lp.is_empty() {
+        return true;
+    }
+    target.starts_with(lp) && target.as_bytes().get(lp.len()) == Some(&b'/')
 }
 
 impl Hub {
@@ -85,6 +119,7 @@ impl Hub {
             max_bytes: DEFAULT_MAX_BYTES,
             shared: Mutex::new(Shared::default()),
             create_lock: tokio::sync::Mutex::new(()),
+            dav_locks: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -105,6 +140,87 @@ impl Hub {
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// 申请一把**独占写锁**。`path` 是相对路径（空串 = 根），`depth_infinity`
+    /// = 连子孙一起锁（目录锁）。`seconds` 是租期，到点自动失效。
+    ///
+    /// 返回 `Err` = 已经有别人的锁盖着这条路径（或我们要锁整棵目录、而子树里
+    /// 已经有别人的锁）。**不做"等一等"**：客户端拿到 423 会自己重试。
+    pub fn lock_path(
+        &self,
+        path: &str,
+        depth_infinity: bool,
+        seconds: u64,
+    ) -> Result<String, String> {
+        let mut g = self.dav_locks.lock().unwrap_or_else(|e| e.into_inner());
+        purge_expired(&mut g);
+        for (lp, l) in g.iter() {
+            // 别人的锁盖住我们要锁的路径
+            if lock_covers(lp, l.depth_infinity, path) {
+                return Err(l.token.clone());
+            }
+            // 我们要锁整棵子树，但子树里已经有人锁了某个孩子
+            if depth_infinity && lock_covers(path, true, lp) {
+                return Err(l.token.clone());
+            }
+        }
+        let token = format!("urn:uuid:{}", new_token());
+        g.insert(
+            path.to_string(),
+            DavLock {
+                token: token.clone(),
+                until: std::time::Instant::now() + std::time::Duration::from_secs(seconds.max(1)),
+                depth_infinity,
+            },
+        );
+        Ok(token)
+    }
+
+    /// 续租。只有持有人能续。
+    pub fn refresh_lock(&self, path: &str, token: &str, seconds: u64) -> bool {
+        let mut g = self.dav_locks.lock().unwrap_or_else(|e| e.into_inner());
+        purge_expired(&mut g);
+        match g.get_mut(path) {
+            Some(l) if l.token == token => {
+                l.until =
+                    std::time::Instant::now() + std::time::Duration::from_secs(seconds.max(1));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 放锁。token 不对就当没这回事（不许猜、也不许替别人放）。
+    pub fn unlock_path(&self, path: &str, token: &str) -> bool {
+        let mut g = self.dav_locks.lock().unwrap_or_else(|e| e.into_inner());
+        purge_expired(&mut g);
+        if g.get(path).map(|l| l.token == token).unwrap_or(false) {
+            g.remove(path);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 写之前问一句：这条路径现在被谁锁着？
+    /// 调用方带上请求里的 `If:` token；持有人自己写不受限。
+    pub fn write_blocked_by(&self, path: &str, if_tokens: &[String]) -> Option<String> {
+        let mut g = self.dav_locks.lock().unwrap_or_else(|e| e.into_inner());
+        purge_expired(&mut g);
+        for (lp, l) in g.iter() {
+            if lock_covers(lp, l.depth_infinity, path) && !if_tokens.iter().any(|t| t == &l.token) {
+                return Some(l.token.clone());
+            }
+        }
+        None
+    }
+
+    /// 现在有几把活着的锁（给测试与将来的界面用）。
+    pub fn live_lock_count(&self) -> usize {
+        let mut g = self.dav_locks.lock().unwrap_or_else(|e| e.into_inner());
+        purge_expired(&mut g);
+        g.len()
     }
 
     pub fn inbox(&self) -> &Path {
@@ -1128,6 +1244,45 @@ mod tests {
         assert!(!token_ok(a.token(), Some(&b.token().to_string())));
         assert!(token_ok(a.token(), Some(&a.token().to_string())));
         assert!(!token_ok(a.token(), None));
+    }
+
+    /// 过期的锁要被扫掉、不能再挡写（不靠 sleep：直接塞一把已经过期的）。
+    #[test]
+    fn an_expired_lock_is_swept_and_does_not_block() {
+        let hub = Hub::new(PathBuf::from("x"));
+        {
+            let mut g = hub.dav_locks.lock().unwrap();
+            g.insert(
+                "a.txt".to_string(),
+                DavLock {
+                    token: "urn:uuid:old".to_string(),
+                    until: std::time::Instant::now() - std::time::Duration::from_secs(1),
+                    depth_infinity: false,
+                },
+            );
+        }
+        assert!(
+            hub.write_blocked_by("a.txt", &[]).is_none(),
+            "过期的锁不该再挡写"
+        );
+        assert_eq!(hub.live_lock_count(), 0, "过期的锁要被扫掉");
+    }
+
+    /// 覆盖判定必须按**路径段**，不能按字符串前缀：`sub` 不能盖住 `submarine.txt`。
+    #[test]
+    fn a_lock_covers_a_child_only_across_a_slash_boundary() {
+        assert!(lock_covers("sub", true, "sub/x.txt"));
+        assert!(
+            !lock_covers("sub", true, "submarine.txt"),
+            "前缀相同不是孩子"
+        );
+        assert!(
+            !lock_covers("sub", false, "sub/x.txt"),
+            "非无限深度的锁不罩孩子"
+        );
+        assert!(lock_covers("", true, "any/thing"), "根上的无限锁罩住一切");
+        assert!(lock_covers("a.txt", false, "a.txt"));
+        assert!(!lock_covers("a.txt", true, "b.txt"));
     }
 
     /// 常驻要能把上次那把 token 带回来；但**坏形状的一律不认**，退回自己生成的。

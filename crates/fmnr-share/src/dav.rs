@@ -167,6 +167,99 @@ fn multistatus(inner: String) -> Response {
         .into_response()
 }
 
+/// 从 `If:` 里掏出所有尖括号里的锁令牌。够用即可：客户端只会写成
+/// `If: (<urn:uuid:...>)` 或 `If: <http://host/path> (<urn:uuid:...>)`。
+fn if_tokens(headers: &HeaderMap) -> Vec<String> {
+    let mut out = Vec::new();
+    for v in headers.get_all("if").iter().filter_map(|v| v.to_str().ok()) {
+        let mut rest = v;
+        while let Some(a) = rest.find('<') {
+            let after = &rest[a + 1..];
+            let Some(b) = after.find('>') else { break };
+            let tok = &after[..b];
+            if tok.starts_with("urn:uuid:") {
+                out.push(tok.to_string());
+            }
+            rest = &after[b + 1..];
+        }
+    }
+    out
+}
+
+fn lock_token_header(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get("lock-token")?.to_str().ok()?.trim();
+    let t = raw.trim_start_matches('<').trim_end_matches('>');
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// 租期：`Timeout: Second-N` / `Infinite`。默认 15 分钟，最长 8 小时。
+fn timeout_secs(headers: &HeaderMap) -> u64 {
+    let raw = headers
+        .get("timeout")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.eq_ignore_ascii_case("infinite") {
+            return 8 * 3600;
+        }
+        if let Some(n) = part.strip_prefix("Second-") {
+            if let Ok(v) = n.parse::<u64>() {
+                return v.clamp(1, 8 * 3600);
+            }
+        }
+    }
+    900
+}
+
+fn locked(hub: &Hub, key: &str, headers: &HeaderMap) -> Option<Response> {
+    hub.write_blocked_by(key, &if_tokens(headers)).map(|_| {
+        (
+            StatusCode::LOCKED,
+            "这个资源被另一个客户端锁着：先 UNLOCK，或者带着匹配的 If: 锁令牌再来。",
+        )
+            .into_response()
+    })
+}
+
+fn lock_response(token: &str, segs: &[String], is_dir: bool) -> Response {
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:prop xmlns:D=\"DAV:\">         <D:lockdiscovery><D:activelock><D:locktype><D:write/></D:locktype>         <D:lockscope><D:exclusive/></D:lockscope>         <D:depth>{}</D:depth>         <D:locktoken><D:href>{}</D:href></D:locktoken>         <D:lockroot><D:href>{}</D:href></D:lockroot>         </D:activelock></D:lockdiscovery></D:prop>",
+        if is_dir { "infinity" } else { "0" },
+        xml_escape(token),
+        xml_escape(&href_of(segs, is_dir))
+    );
+    let mut resp = (StatusCode::OK, body).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "application/xml; charset=utf-8".parse().unwrap(),
+    );
+    resp.headers_mut().insert(
+        header::HeaderName::from_static("lock-token"),
+        format!("<{token}>").parse().unwrap(),
+    );
+    resp
+}
+
+fn lock_handler(hub: &Hub, segs: &[String], key: &str, headers: &HeaderMap) -> Response {
+    let secs = timeout_secs(headers);
+    // 续租：If: 里那把正好是这条路径的锁 ⇒ 直接续，不再申请新锁。
+    for t in if_tokens(headers) {
+        if hub.refresh_lock(key, &t, secs) {
+            return lock_response(&t, segs, false);
+        }
+    }
+    let depth_inf = depth_of(headers) != 0; // LOCK 的默认深度是 infinity
+    match hub.lock_path(key, depth_inf, secs) {
+        Ok(tok) => lock_response(&tok, segs, depth_inf),
+        Err(_owner) => (
+            StatusCode::LOCKED,
+            "这条路径已经被别人锁着（持有者没解锁或租期未到）。",
+        )
+            .into_response(),
+    }
+}
+
 /// `/dav` 这一面的总入口。方法分派在函数体内，因为它们是同一棵树上的同一批路径。
 pub async fn handle(State(hub): State<Arc<Hub>>, req: Request) -> Response {
     let path = req.uri().path().to_string();
@@ -196,6 +289,8 @@ pub async fn handle(State(hub): State<Arc<Hub>>, req: Request) -> Response {
 
     // `http::Method` 没有 WebDAV 那批常量（PROPFIND/MKCOL/MOVE…），按字符串分派。
     let is_head = req.method() == Method::HEAD;
+    // 锁表按"相对路径"记（空串 = 根）。
+    let key = segs.join("/");
     match req.method().as_str() {
         "OPTIONS" => (
             StatusCode::OK,
@@ -208,27 +303,47 @@ pub async fn handle(State(hub): State<Arc<Hub>>, req: Request) -> Response {
             .into_response(),
         "PROPFIND" => propfind(&target, &segs, req.headers()).await,
         "GET" | "HEAD" => get_file(&target, is_head).await,
-        "PUT" => put_file(hub, segs, req).await,
-        "DELETE" => delete_file(&target, &root).await,
-        "MKCOL" => make_collection(&target).await,
-        "MOVE" => move_entry(&target, &root, req.headers(), &hub).await,
+        "PUT" => {
+            if let Some(r) = locked(&hub, &key, req.headers()) {
+                r
+            } else {
+                put_file(hub, segs, req).await
+            }
+        }
+        "DELETE" => {
+            if let Some(r) = locked(&hub, &key, req.headers()) {
+                r
+            } else {
+                delete_file(&target, &root).await
+            }
+        }
+        "MKCOL" => {
+            if let Some(r) = locked(&hub, &key, req.headers()) {
+                r
+            } else {
+                make_collection(&target).await
+            }
+        }
+        "MOVE" => {
+            if let Some(r) = locked(&hub, &key, req.headers()) {
+                r
+            } else {
+                move_entry(&target, &root, req.headers(), &hub).await
+            }
+        }
         // 锁定是"盘"客户端的习惯动作。我们不做真锁（单人自家网），但必须**回一个
         // 像样的 lock-token**，否则有的客户端会拒绝进入写模式。
-        "LOCK" => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/xml; charset=utf-8")],
-            format!(
-                "<?xml version=\"1.0\"?><D:prop xmlns:D=\"DAV:\"><D:lockdiscovery>\
-                 <D:activelock><D:locktype><D:write/></D:locktype>\
-                 <D:locktoken><D:href>urn:uuid:{}</D:href></D:locktoken>\
-                 <D:lockroot><D:href>{}</D:href></D:lockroot>\
-                 </D:activelock></D:lockdiscovery></D:prop>",
-                crate::new_token(),
-                xml_escape(&href_of(&segs, target.is_dir()))
-            ),
-        )
-            .into_response(),
-        "UNLOCK" => StatusCode::NO_CONTENT.into_response(),
+        "LOCK" => lock_handler(&hub, &segs, &key, req.headers()),
+        "UNLOCK" => {
+            let Some(tok) = lock_token_header(req.headers()) else {
+                return (StatusCode::BAD_REQUEST, "UNLOCK 要带 Lock-Token 头。").into_response();
+            };
+            if hub.unlock_path(&key, &tok) {
+                StatusCode::NO_CONTENT.into_response()
+            } else {
+                (StatusCode::CONFLICT, "这把锁不是你的（或已经过期）。").into_response()
+            }
+        }
         // 客户端改"文件说明"之类：我们不存这些属性，但要说"收到了、没生效"，
         // 否则有的客户端会把 501 当成整个挂载不可写。
         "PROPPATCH" => multistatus(
@@ -395,14 +510,14 @@ mod tests {
     use axum::body::to_bytes;
     use tower::ServiceExt;
 
-    fn tmp(tag: &str) -> std::path::PathBuf {
+    pub(super) fn tmp(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("fmnr-dav-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
     }
 
-    fn req(method: &str, uri: &str, token: &str, body: &[u8]) -> Request {
+    pub(super) fn req(method: &str, uri: &str, token: &str, body: &[u8]) -> Request {
         use base64::Engine;
         let cred = base64::engine::general_purpose::STANDARD.encode(format!("anyone:{token}"));
         Request::builder()
@@ -413,7 +528,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn call(hub: Arc<Hub>, r: Request) -> (StatusCode, String, HeaderMap) {
+    pub(super) async fn call(hub: Arc<Hub>, r: Request) -> (StatusCode, String, HeaderMap) {
         let res = crate::router(hub).oneshot(r).await.unwrap();
         let code = res.status();
         let headers = res.headers().clone();
@@ -636,5 +751,161 @@ mod tests {
         for m in ["PROPFIND", "PUT", "GET", "DELETE", "MKCOL", "MOVE"] {
             assert!(allow.contains(m), "Allow 里少了 {m}：{allow}");
         }
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::tests::{call, req, tmp};
+    use super::*;
+
+    fn req_if(method: &str, uri: &str, token: &str, body: &[u8], if_tok: Option<&str>) -> Request {
+        let mut r = req(method, uri, token, body);
+        if let Some(t) = if_tok {
+            r.headers_mut()
+                .insert("if", format!("(<{t}>)").parse().unwrap());
+        }
+        r
+    }
+
+    fn lock_token(headers: &HeaderMap) -> String {
+        headers
+            .get("lock-token")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .to_string()
+    }
+
+    /// 🔴 这是"真锁"的核心：别人锁着的路径，没有令牌写不进去；解锁之后又能写。
+    #[tokio::test]
+    async fn a_lock_blocks_other_writers_until_it_is_released() {
+        let inbox = tmp("lock1");
+        std::fs::write(inbox.join("a.txt"), b"orig").unwrap();
+        let hub = Arc::new(Hub::new(inbox.clone()));
+        let tok = hub.token().to_string();
+
+        let (code, _, headers) = call(hub.clone(), req("LOCK", "/dav/a.txt", &tok, b"")).await;
+        assert_eq!(code, StatusCode::OK, "LOCK 要成功");
+        let lock = lock_token(&headers);
+
+        // 没有 If: 的写 → 423
+        let (code, _, _) = call(hub.clone(), req("PUT", "/dav/a.txt", &tok, b"clobber")).await;
+        assert_eq!(code, StatusCode::LOCKED, "被别人锁着还能写 = 假锁");
+        assert_eq!(
+            std::fs::read(inbox.join("a.txt")).ok().as_deref(),
+            Some(&b"orig"[..]),
+            "被拒的写不许动到盘上的旧件"
+        );
+
+        // 第二个客户端也锁不上
+        let (code, _, _) = call(hub.clone(), req("LOCK", "/dav/a.txt", &tok, b"")).await;
+        assert_eq!(code, StatusCode::LOCKED, "同一路径不许两把锁");
+
+        // 带令牌的写 → 放行
+        let (code, _, _) = call(
+            hub.clone(),
+            req_if("PUT", "/dav/a.txt", &tok, b"clobber", Some(&lock)),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED);
+        assert_eq!(
+            std::fs::read(inbox.join("a.txt")).ok().as_deref(),
+            Some(&b"clobber"[..])
+        );
+
+        // 错误的 UNLOCK 不许生效
+        let mut r = req("UNLOCK", "/dav/a.txt", &tok, b"");
+        r.headers_mut()
+            .insert("lock-token", "<urn:uuid:not-mine>".parse().unwrap());
+        let (code, _, _) = call(hub.clone(), r).await;
+        assert_eq!(code, StatusCode::CONFLICT, "别人猜个 token 就想解锁？");
+
+        // 正确的 UNLOCK → 之后不带令牌也能写
+        let mut r = req("UNLOCK", "/dav/a.txt", &tok, b"");
+        r.headers_mut()
+            .insert("lock-token", format!("<{lock}>").parse().unwrap());
+        let (code, _, _) = call(hub.clone(), r).await;
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        let (code, _, _) = call(hub.clone(), req("PUT", "/dav/a.txt", &tok, b"after")).await;
+        assert_eq!(code, StatusCode::CREATED, "解锁后应该能写");
+        assert_eq!(
+            std::fs::read(inbox.join("a.txt")).ok().as_deref(),
+            Some(&b"after"[..])
+        );
+        assert_eq!(hub.live_lock_count(), 0);
+        std::fs::remove_dir_all(&inbox).ok();
+    }
+
+    /// 目录锁要罩住孩子，但不能误伤兄弟。
+    #[tokio::test]
+    async fn a_collection_lock_covers_children_but_not_siblings() {
+        let inbox = tmp("lock2");
+        std::fs::create_dir_all(inbox.join("sub")).unwrap();
+        let hub = Arc::new(Hub::new(inbox.clone()));
+        let tok = hub.token().to_string();
+
+        let mut r = req("LOCK", "/dav/sub", &tok, b"");
+        r.headers_mut().insert("depth", "infinity".parse().unwrap());
+        let (code, _, headers) = call(hub.clone(), r).await;
+        assert_eq!(code, StatusCode::OK);
+        let lock = lock_token(&headers);
+
+        let (code, _, _) = call(hub.clone(), req("PUT", "/dav/sub/x.txt", &tok, b"1")).await;
+        assert_eq!(code, StatusCode::LOCKED, "目录锁没罩住孩子 = 假锁");
+        let (code, _, _) = call(
+            hub.clone(),
+            req_if("PUT", "/dav/sub/x.txt", &tok, b"1", Some(&lock)),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "持有人自己写要放行");
+
+        let (code, _, _) = call(hub.clone(), req("PUT", "/dav/sibling.txt", &tok, b"2")).await;
+        assert_eq!(code, StatusCode::CREATED, "兄弟路径不该被目录锁罩住");
+
+        // 祖先的无限锁要让孩子**连锁都加不上**——否则会出现"锁拿到了但写不进去"
+        // 这种自相矛盾的状态（L3 那把刀就是因为缺这条才活下来的）。
+        let (code, _, _) = call(hub.clone(), req("LOCK", "/dav/sub/x.txt", &tok, b"")).await;
+        assert_eq!(code, StatusCode::LOCKED, "祖先的无限锁没挡住孩子加锁");
+        std::fs::remove_dir_all(&inbox).ok();
+    }
+
+    /// 客户端常常先锁一个还不存在的路径再 PUT（lock-null）。这条必须能用。
+    #[tokio::test]
+    async fn a_lock_on_a_missing_file_allows_the_following_put() {
+        let inbox = tmp("lock3");
+        let hub = Arc::new(Hub::new(inbox.clone()));
+        let tok = hub.token().to_string();
+        let (code, _, headers) = call(hub.clone(), req("LOCK", "/dav/new.txt", &tok, b"")).await;
+        assert_eq!(code, StatusCode::OK, "lock-null 要允许");
+        let lock = lock_token(&headers);
+        let (code, _, _) = call(
+            hub.clone(),
+            req_if("PUT", "/dav/new.txt", &tok, b"new", Some(&lock)),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED);
+        assert!(inbox.join("new.txt").exists());
+        std::fs::remove_dir_all(&inbox).ok();
+    }
+
+    /// 续租：带 If: 的 LOCK 不换 token，也不该被判"重复加锁"。
+    #[tokio::test]
+    async fn locking_again_with_the_same_token_refreshes_instead_of_conflicting() {
+        let inbox = tmp("lock4");
+        let hub = Arc::new(Hub::new(inbox.clone()));
+        let tok = hub.token().to_string();
+        let (_, _, headers) = call(hub.clone(), req("LOCK", "/dav/r.txt", &tok, b"")).await;
+        let lock = lock_token(&headers);
+        let (code, _, headers2) = call(
+            hub.clone(),
+            req_if("LOCK", "/dav/r.txt", &tok, b"", Some(&lock)),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "续租不该 423");
+        assert_eq!(lock_token(&headers2), lock, "续租要沿用同一把 token");
+        std::fs::remove_dir_all(&inbox).ok();
     }
 }
