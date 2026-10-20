@@ -71,4 +71,16 @@ fi
 typos
 cargo machete
 cargo deny check advisories licenses sources
+# fmnr-ui 在 linux 目标上**编不了**（ring 的构建脚本过不去），但"编不了"不等于
+# 依赖可以少：把原有依赖误塞进 `cfg(windows)` 段时，本机 clippy 照样绿、
+# CI 的 ubuntu lint 直接红（2026-10-21 就这么漏过一次）。
+# `cargo tree --target` 只解析清单、不需要 C 编译器，正好补这个洞。
+for d in eframe egui fmnr-core fmnr-fs fmnr-share raw-window-handle; do
+    if ! cargo tree -p fmnr-ui --target "$LT" --depth 1 --edges normal 2>/dev/null | grep -q "── $d "; then
+        echo "fmnr-ui 在 $LT 上少了依赖：$d（多半是被塞进了 cfg(windows) 段）"
+        exit 1
+    fi
+done
+echo "依赖图核对：fmnr-ui 在 $LT 上仍有 eframe / egui / fmnr-* / raw-window-handle"
+
 echo "gate: 全绿（第 5 步若显示跳过，则跨平台那一类未覆盖）"
