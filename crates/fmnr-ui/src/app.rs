@@ -2065,6 +2065,18 @@ impl App {
         let link = running
             .map(|r| r.hub.link(&r.server.host, r.server.port))
             .unwrap_or_default();
+        // 挂盘那条腿的地址：同一个端口，路径 /dav/。
+        let dav_url = running
+            .map(|r| {
+                let h = &r.server.host;
+                let shown = if h.contains(':') && !h.starts_with('[') {
+                    format!("[{h}]")
+                } else {
+                    h.clone()
+                };
+                format!("http://{shown}:{}/dav/", r.server.port)
+            })
+            .unwrap_or_default();
         let inbox = running
             .map(|r| r.hub.inbox().to_path_buf())
             .unwrap_or_else(Self::share_inbox);
@@ -2132,6 +2144,16 @@ impl App {
                          同名都让路，不用在手机上装任何东西。",
                     )
                     .size(12.0),
+                );
+                ui.separator();
+                ui.label("也可以把收件目录挂成盘（WebDAV，双向）：");
+                ui.label(egui::RichText::new(dav_url.clone()).monospace());
+                ui.label(
+                    egui::RichText::new(
+                        "用户名随便填，密码是上面链接里的 token；地址填这个 /dav/。                         挂成盘时同名 PUT 是覆盖，不是页面那条腿的同名让路。",
+                    )
+                    .size(12.0)
+                    .weak(),
                 );
                 if !lan {
                     // 绑回环时链接印的就是 127.0.0.1（所见即所绑），

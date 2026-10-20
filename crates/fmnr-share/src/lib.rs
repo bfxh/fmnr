@@ -16,6 +16,7 @@
 //!   最要紧的不变量——一旦允许调用方给路径，手机就成了整台机器的读取口。
 
 pub mod config;
+pub mod dav;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,7 +27,7 @@ use axum::extract::{Query, Request, State};
 use axum::http::header;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::Router;
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
@@ -313,7 +314,7 @@ fn html_escape(s: &str) -> String {
 
 /// 够用的 percent-encode：token 是十六进制、编号是数字，
 /// 只有文件名要进 URL，而文件名走的是 `encodeURIComponent`（浏览器侧）。
-fn url_escape(s: &str) -> String {
+pub(crate) fn url_escape(s: &str) -> String {
     let mut out = String::new();
     for b in s.as_bytes() {
         match b {
@@ -346,6 +347,9 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/", get(page))
         .route("/put", post(put))
         .route("/send", post(send))
+        .route("/dav", any(dav::handle))
+        .route("/dav/", any(dav::handle))
+        .route("/dav/{*rest}", any(dav::handle))
         .route("/get", get(download))
         .with_state(hub)
 }
@@ -390,10 +394,57 @@ async fn put(
 /// 就把 `#61` 那道闸和全仓唯一那份命名规则废掉了。
 ///
 /// 流式写入：`/put` 一路从 socket 读，不在内存里攒整份。
-async fn ingest(
+pub(crate) async fn ingest(
     hub: Arc<Hub>,
     raw_name: &str,
-    mut stream: std::pin::Pin<
+    stream: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send + 'static>,
+    >,
+) -> Result<String, Box<Response>> {
+    ingest_by(hub, raw_name, NameRule::Unique, stream).await
+}
+
+/// 挂盘那条腿（WebDAV PUT）：**写到这个相对路径上**，已存在就整体替换。
+/// 与"丢件"的区别只在这一处：丢件同名让路，盘就是盘。
+///
+/// `rel` 的每一段都必须**已经**由调用方（`dav::segments`）验过。
+/// 这里再验一遍是为了"绕过 dav 直接调"的那条路也不至于跑出收件目录。
+pub(crate) async fn ingest_exact(
+    hub: Arc<Hub>,
+    rel: &[String],
+    stream: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send + 'static>,
+    >,
+) -> Result<String, Box<Response>> {
+    let Some(last) = rel.last() else {
+        return Err(Box::new(say(StatusCode::BAD_REQUEST, "没有文件名。")));
+    };
+    if rel
+        .iter()
+        .any(|s| sanitize_name(s).as_deref() != Some(s.as_str()))
+    {
+        return Err(Box::new(say(
+            StatusCode::FORBIDDEN,
+            "路径里有一段不是合法名字。",
+        )));
+    }
+    let dest = rel.iter().fold(hub.inbox.clone(), |p, s| p.join(s));
+    write_into(hub, last.clone(), dest, NameRule::Exact, stream).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameRule {
+    /// 丢件：同名让路（浏览器页面那两条腿）。
+    Unique,
+    /// 盘：写到这个名字上（WebDAV）。已存在的件在改名那一刻才被替换掉。
+    Exact,
+}
+
+async fn ingest_by(
+    hub: Arc<Hub>,
+    raw_name: &str,
+    rule: NameRule,
+    stream: std::pin::Pin<
         Box<dyn futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send + 'static>,
     >,
 ) -> Result<String, Box<Response>> {
@@ -406,6 +457,21 @@ async fn ingest(
             )))
         }
     };
+    let dest = unique_dest(&hub.inbox, &name);
+    write_into(hub, name, dest, rule, stream).await
+}
+
+/// 真正的写入：调用方已经把名字与目标路径定好（丢件那条走 `unique_dest`，
+/// 盘那条走 `inbox/<相对路径>`）。
+async fn write_into(
+    hub: Arc<Hub>,
+    name: String,
+    dest: PathBuf,
+    rule: NameRule,
+    mut stream: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send + 'static>,
+    >,
+) -> Result<String, Box<Response>> {
     std::fs::create_dir_all(&hub.inbox).map_err(|e| {
         Box::new(say(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -414,8 +480,17 @@ async fn ingest(
     })?;
     // 挑名字到写完，整段串行（见 `create_lock`）。
     let _guard = hub.create_lock.lock().await;
-    let dest = unique_dest(&hub.inbox, &name);
-    let std_file = fmnr_fs::ops::create_exclusive(&dest).map_err(|e| {
+    // 盘那条腿先写临时件、最后改名：直接截断目标再写，写到一半失败旧件就没了。
+    let (write_path, staged) = match rule {
+        NameRule::Unique => (dest.clone(), false),
+        NameRule::Exact => (
+            dest.parent()
+                .unwrap_or(&hub.inbox)
+                .join(format!(".part-{}", new_token())),
+            true,
+        ),
+    };
+    let std_file = fmnr_fs::ops::create_exclusive(&write_path).map_err(|e| {
         Box::new(say(
             StatusCode::CONFLICT,
             &format!("这个文件现在写不了（可能被别的程序开着）：{e}"),
@@ -427,7 +502,7 @@ async fn ingest(
         let chunk = match chunk {
             Ok(c) => c,
             Err(e) => {
-                discard(&dest).await;
+                discard(&write_path).await;
                 return Err(Box::new(say(
                     StatusCode::BAD_REQUEST,
                     &format!("读到一半断了：{e}"),
@@ -436,7 +511,7 @@ async fn ingest(
         };
         written += chunk.len() as u64;
         if written > hub.max_bytes {
-            discard(&dest).await;
+            discard(&write_path).await;
             return Err(Box::new(say(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 &format!(
@@ -446,7 +521,7 @@ async fn ingest(
             )));
         }
         if let Err(e) = file.write_all(&chunk).await {
-            discard(&dest).await;
+            discard(&write_path).await;
             return Err(Box::new(say(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("写盘失败：{e}"),
@@ -454,13 +529,22 @@ async fn ingest(
         }
     }
     if let Err(e) = file.flush().await {
-        discard(&dest).await;
+        discard(&write_path).await;
         return Err(Box::new(say(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("收尾失败：{e}"),
         )));
     }
     drop(file);
+    if staged {
+        if let Err(e) = std::fs::rename(&write_path, &dest) {
+            discard(&write_path).await;
+            return Err(Box::new(say(
+                StatusCode::CONFLICT,
+                &format!("转换不了（目标是不是正被别的程序开着？）：{e}"),
+            )));
+        }
+    }
     let saved = dest
         .file_name()
         .map(|n| n.to_string_lossy().to_string())

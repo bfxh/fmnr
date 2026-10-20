@@ -12,6 +12,8 @@ repository.workspace = true
 #   tokio-util   —— 已经经 russh-sftp ← fmnr-remote ← fmnr-mount 进了 UI 的图
 #   getrandom    —— 已经经 rsa ← russh 进了图
 axum = "0.8.9"
+# 锁文件里已有 0.22.1（rustls 那条链带进来的）⇒ 直接依赖不新增包
+base64 = "0.22"
 fmnr-core = { path = "../fmnr-core" }
 fmnr-fs = { path = "../fmnr-fs" }
 futures = "0.3"
