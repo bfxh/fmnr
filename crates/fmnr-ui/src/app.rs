@@ -141,6 +141,10 @@ pub struct App {
     /// 默认**不勾**：不勾就只绑回环，手机连不上——那是"这台机器自己看看"的档位。
     /// 勾上意味着同一局域网里的别的机器能访问这个端口，所以它是一句要用户做的决定。
     share_lan: bool,
+    /// 常驻设置：开关状态、局域网、上次绑上的端口、那把 token。落盘在 `share.json`。
+    /// `enabled` 就是那颗开/关按钮——开着 = 下次启动自己开，端口与 token 不变。
+    share_prefs: fmnr_share::config::Prefs,
+    share_prefs_path: PathBuf,
     /// 这台电脑的盘。启动时枚举一次就够（盘符不会在运行中变，
     /// 而每帧 `GetLogicalDrives` 是白付的 Win32 调用）。
     drives: Vec<fmnr_fs::drives::Drive>,
@@ -489,6 +493,8 @@ impl App {
             share: None,
             share_open: false,
             share_lan: false,
+            share_prefs: fmnr_share::config::Prefs::default(),
+            share_prefs_path: PathBuf::new(),
             drives: fmnr_fs::drives::list(),
             usage_root: PathBuf::new(),
             startup: None,
@@ -523,6 +529,14 @@ impl App {
         }
         app.refresh();
         app.reset_tree_roots();
+        // 常驻投递：上次开着就自己开一扇（token 与端口都照旧，手机上的书签还能用）。
+        // 失败只说一句、不阻塞启动——开机那一刻网卡可能还没起来。
+        app.share_prefs_path = Self::share_prefs_path();
+        app.share_prefs = fmnr_share::config::Prefs::load(&app.share_prefs_path);
+        if app.share_prefs.enabled {
+            app.share_lan = app.share_prefs.lan;
+            app.start_share();
+        }
         app
     }
 
@@ -1931,32 +1945,76 @@ impl App {
             .join("fmnr-收件")
     }
 
-    /// 开/关这个端口。开关本身要能失败并说清为什么（端口被占、没有局域网可绑）。
+    /// 常驻设置落在 `<config>/fmnr/share.json`。
+    fn share_prefs_path() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("fmnr")
+            .join("share.json")
+    }
+
+    /// 绑哪个地址。抽成纯函数是为了能对它写判决性断言：
+    /// **"常驻开着但算不出局域网地址"必须报错，不许偷偷退回回环**——
+    /// 退回回环的结果是链接看着开好了、手机永远打不开。
+    fn share_bind_target(
+        lan: bool,
+        lan_ip: Option<std::net::IpAddr>,
+    ) -> Result<(String, bool), String> {
+        if !lan {
+            return Ok(("127.0.0.1".to_string(), false));
+        }
+        match lan_ip {
+            Some(ip) => Ok((ip.to_string(), true)),
+            None => Err("找不到这台机器的局域网地址（没连网？），开不了".into()),
+        }
+    }
+
+    /// 开这个端口。开关本身要能失败并说清为什么（端口被占、没有局域网可绑）。
+    /// 开成之后把「端口 + token + 局域网」写回设置——常驻靠的就是这三样不变。
     fn start_share(&mut self) {
         if self.share.is_some() {
             self.status = "投递口已经开着了".into();
             return;
         }
         let inbox = Self::share_inbox();
-        let hub = Arc::new(fmnr_share::Hub::new(inbox.clone()));
-        // 绑哪个地址：勾了「允许局域网」就绑**本机那个局域网 IPv4**（不是 0.0.0.0——
-        // 那只监听这一张网卡，比全盘开放窄）。量不到地址就如实说，不许偷偷退回回环。
-        let (host, allow) = if self.share_lan {
-            match fmnr_core::net::lan_ipv4() {
-                Some(ip) => (ip.to_string(), true),
-                None => {
-                    self.status = "找不到这台机器的局域网地址（没连网？），开不了".into();
+        // 常驻复用的是同一把钥匙：换了钥匙，手机上的书签就废了。
+        let token = self.share_prefs.ensure_token();
+        let hub = Arc::new(fmnr_share::Hub::new(inbox.clone()).with_token(&token));
+        let (host, allow) =
+            match Self::share_bind_target(self.share_lan, fmnr_core::net::lan_ipv4()) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.status = e;
                     return;
                 }
-            }
-        } else {
-            ("127.0.0.1".to_string(), false)
+            };
+        let want_port = self.share_prefs.port;
+        let mut note = String::new();
+        // 端口记着用：端口一变，手机上那条链接就废了。上次那个被占了才退回让系统挑，
+        // 并且**说出来**——静默改端口等于用户拿着旧链接一直撞墙。
+        let started = match fmnr_share::start(hub.clone(), &host, want_port, allow) {
+            Ok(s) => Ok(s),
+            Err(e) if want_port != 0 => match fmnr_share::start(hub.clone(), &host, 0, allow) {
+                Ok(s) => {
+                    note = format!(
+                        "上次的端口 {want_port} 被占用，改用了 {}（手机上的旧链接要换）。",
+                        s.port
+                    );
+                    Ok(s)
+                }
+                Err(_) => Err(e),
+            },
+            Err(e) => Err(e),
         };
-        match fmnr_share::start(hub.clone(), &host, 0, allow) {
+        match started {
             Ok(server) => {
                 let seen = hub.received().len();
+                self.share_prefs.port = server.port;
+                self.share_prefs.enabled = true;
+                self.share_prefs.lan = self.share_lan;
+                self.save_share_prefs();
                 self.share = Some(ShareRunning { hub, server, seen });
-                self.status = format!("投递口已开：{}（收件目录 {}）", host, inbox.display());
+                self.status = format!("{note}投递口已开：{host}（收件目录 {}）", inbox.display());
             }
             Err(e) => self.status = format!("开不了投递口：{e}"),
         }
@@ -1965,7 +2023,16 @@ impl App {
     fn stop_share(&mut self) {
         // `Server::drop` 负责停：这里只负责把状态说清楚。
         self.share = None;
+        // 关掉就是"别再自动开"：否则下次启动它自己回来，用户会以为关不掉。
+        self.share_prefs.enabled = false;
+        self.save_share_prefs();
         self.status = "投递口已关，那个链接立刻失效".into();
+    }
+
+    fn save_share_prefs(&mut self) {
+        if let Err(e) = self.share_prefs.save(&self.share_prefs_path) {
+            self.status = format!("投递口的设置没存下来：{e}（下次启动不会自动开）");
+        }
     }
 
     /// 手机刚投了东西 → 说一句、催一次重绘。不轮询就等于要用户自己动一下鼠标才看得见。
@@ -2010,6 +2077,7 @@ impl App {
         let mut want_toggle = false;
         let mut want_copy = false;
         let mut want_register = false;
+        let mut want_rotate = false;
 
         let keep = dock(ctx, "dock_share", "手机传文件", 460.0, |ui| {
             ui.checkbox(&mut self.share_lan, "允许局域网访问");
@@ -2045,6 +2113,20 @@ impl App {
                 }
                 ui.label(
                     egui::RichText::new(
+                        "这个开关就是常驻：开着的话，下次打开 fmnr 会自动开同一个端口、                         同一把 token——手机上存的书签还能用。关掉就不再自动开。                         要开机就自动跑，去「设置 → 开机自启动」把它也打开。",
+                    )
+                    .size(12.0),
+                );
+                if ui.button("换一把钥匙").clicked() {
+                    want_rotate = true;
+                }
+                ui.label(
+                    egui::RichText::new("换掉之后手机上的旧链接立刻失效，新链接要重新给手机。")
+                        .size(12.0)
+                        .weak(),
+                );
+                ui.label(
+                    egui::RichText::new(
                         "手机页上有两个发送按钮：一个走脚本能看逐份进度，一个不跑脚本，\
                          套壳浏览器把 fetch 禁了也送得出去。两个都进同一个收件目录、\
                          同名都让路，不用在手机上装任何东西。",
@@ -2063,7 +2145,7 @@ impl App {
                     );
                 }
             } else {
-                ui.label(egui::RichText::new("现在是关着的。").weak());
+                ui.label(egui::RichText::new("现在是关着的（下次启动也不会自动开）。").weak());
             }
 
             ui.separator();
@@ -2095,6 +2177,18 @@ impl App {
                 self.stop_share();
             } else {
                 self.start_share();
+            }
+        }
+        if want_rotate {
+            // 换钥匙必须重启端口：旧 hub 里那把还在内存里，不重启就等于没换。
+            self.share_prefs.rotate();
+            if self.share.is_some() {
+                self.share = None; // Drop 负责停线程
+                self.start_share();
+                self.status = "换了一把新钥匙：手机上的旧链接已经失效".into();
+            } else {
+                self.save_share_prefs();
+                self.status = "换了一把新钥匙（下次开收件口时用）".into();
             }
         }
         if want_copy {
@@ -6634,6 +6728,46 @@ mod pkg_count_label_tests {
             pkg_count_label("已装清单", 273, false, false, true),
             "已装清单 273",
             "真数到手时要照常报"
+        );
+    }
+}
+
+#[cfg(test)]
+mod share_bind_tests {
+    use super::App;
+
+    /// 常驻开着而算不出局域网地址时，**必须报错**。退回回环的话，链接看着开好了、
+    /// 手机永远打不开——那是"静默降级"，比不开更坏。
+    #[test]
+    fn resident_without_a_lan_address_is_an_error_not_a_loopback_fallback() {
+        let e = App::share_bind_target(true, None).unwrap_err();
+        assert!(e.contains("局域网"), "错误要说出是局域网地址的问题：{e}");
+        // 不能出现"退回回环"这种结果
+        assert!(
+            !App::share_bind_target(true, None)
+                .map(|(h, _)| h)
+                .unwrap_or_default()
+                .contains("127.0.0.1"),
+            "不许偷偷退回回环"
+        );
+    }
+
+    #[test]
+    fn a_lan_address_is_bound_as_is() {
+        let ip: std::net::IpAddr = "192.168.1.3".parse().unwrap();
+        assert_eq!(
+            App::share_bind_target(true, Some(ip)).unwrap(),
+            ("192.168.1.3".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn without_the_lan_box_it_stays_on_loopback() {
+        let ip: std::net::IpAddr = "192.168.1.3".parse().unwrap();
+        assert_eq!(
+            App::share_bind_target(false, Some(ip)).unwrap(),
+            ("127.0.0.1".to_string(), false),
+            "没勾局域网就不该绑到对外地址上——哪怕量到了 IP"
         );
     }
 }

@@ -15,6 +15,8 @@
 //! - 电脑侧只暴露登记过的件：`/get` **只认编号，不认路径**。这条是这一格里
 //!   最要紧的不变量——一旦允许调用方给路径，手机就成了整台机器的读取口。
 
+pub mod config;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -87,6 +89,16 @@ impl Hub {
 
     pub fn with_max_bytes(mut self, max: u64) -> Self {
         self.max_bytes = max;
+        self
+    }
+
+    /// 用一把**外部给的** token（常驻时从 `share.json` 读回来的那把）。
+    /// 形状不对的直接忽略、退回自己生成的——弱 token 比没有更糟，
+    /// 见 `config::token_is_well_formed`。
+    pub fn with_token(mut self, token: &str) -> Self {
+        if config::token_is_well_formed(token) {
+            self.token = token.to_string();
+        }
         self
     }
 
@@ -1032,6 +1044,21 @@ mod tests {
         assert!(!token_ok(a.token(), Some(&b.token().to_string())));
         assert!(token_ok(a.token(), Some(&a.token().to_string())));
         assert!(!token_ok(a.token(), None));
+    }
+
+    /// 常驻要能把上次那把 token 带回来；但**坏形状的一律不认**，退回自己生成的。
+    #[test]
+    fn a_supplied_token_is_used_only_when_it_looks_right() {
+        let good = "0123456789abcdef0123456789abcdef";
+        let hub = Hub::new(PathBuf::from("x")).with_token(good);
+        assert_eq!(hub.token(), good, "好 token 没被用上");
+        assert!(hub.link("192.168.1.3", 8787).contains(good));
+
+        for bad in ["", "abc", "0123456789ABCDEF0123456789ABCDEF"] {
+            let h = Hub::new(PathBuf::from("x")).with_token(bad);
+            assert_ne!(h.token(), bad, "{bad:?} 这种形状不该被当成钥匙");
+            assert_eq!(h.token().len(), 32, "该退回自己生成的那把");
+        }
     }
 
     /// 真端口跑一遍：绑得上、答得出、关掉之后**不再应答**。
