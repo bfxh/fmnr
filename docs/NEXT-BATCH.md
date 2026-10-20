@@ -1417,3 +1417,70 @@ L5 写入口根本不查锁。脚本 `D:\tmp\mut_lock.py`（先自证基线绿�
 - 锁只在内存：**fmnr 重启后锁全丢**。客户端若在重启期间还持有 token，会拿到 423
   ——大多数客户端会重新 LOCK，但这条没在真客户端上验。
 - 没有 `LOCK` 的 `owner` 字段与 `DAV:owner` 显示（回的是固定形状）。
+
+## 32. 后期任务：点软件名 → 整份介绍（含 GitHub 仓库）
+
+用户口径（2026-10-20 提出，明确是"后期"）：**"点击软件名字就有整个软件的介绍，包含 GitHub 的仓库"**。
+
+不是现在的活，先记形状与要定的三件事，免得下轮从零想：
+
+- **入口**：包管理器面板里那一行（`r.name`）变成可点；点了开一个**详情卡**（停靠区还是弹窗？
+  本仓口径是"面板一律停靠"，所以默认进右侧停靠栏，不新开窗）。
+- **数据从哪来**：至少三源，必须标清哪一条是"读到的"、哪一条是"猜的"——
+  ① 已装信息（注册表底账：InstallLocation / DisplayName / DisplayVersion / Publisher，本地可读）；
+  ② **GitHub 仓库**（用户明确要）：靠 ① 里的 Publisher/主页/包名去搜，**搜索结果必须给链接让人判断**，
+     不能自动认定"这就是那个仓库"；
+  ③ 介绍正文：优先 README（GitHub API），其次 `DisplayName + Publisher` 做摘要——后者是**生成**的，
+     必须标"由本地信息拼的，不是官方介绍"。
+- **要定的三件事**（动手前问）：① 联网取 GitHub 信息的开关与缓存（离线时整块要能退化成"本地信息"）；
+  ② 搜索匹配策略（同名仓库很多，宁可不给也不给错）；③ 正文显示在哪里（停靠区宽度有限，
+  长 README 要滚动/截断策略）。
+- **与现有约束的关系**：这是**读**，不碰 `DESIGN` 的任何非目标；联网是新增面 ⇒ 默认关 + 显式同意，
+  与 HTTP 面 `--allow-remote` 同一档思路。
+
+## 33. CI/CD 加强：两道新门 + Dependabot，以及它们开门就挖出来的东西
+
+用户口径：**"把 CI CD 加强，本地有大量的工具"**。
+
+### 33-1 加了什么
+
+| 门 | 判什么 | 为什么值得一条独立 job |
+|---|---|---|
+| `hygiene` | `typos`（拼写=0）+ `cargo-machete`（声明的依赖都被用到） | 这两类东西**会悄悄烂**：注释里的错字没人管、未使用的依赖只增不减 |
+| `supply` | `cargo-deny`：RUSTSEC 漏洞 / 许可证白名单 / 只许 crates.io | 漏洞公告不是"某天 CI 自己红"，而是依赖换了才红；许可证是公开仓必须钉的 |
+
+配套：顶层 `permissions: contents: read`（门禁只读）；`.github/dependabot.yml`
+（cargo 补丁每周一组、actions 每月）；**工具版本钉死**（typos 1.51.1 / machete 0.9.2 /
+deny 0.20.2）——浮动版本会让门因为上游词典更新而变红，那种红不含信息。
+本地 `scripts/gate.sh` 加第 6 步跑**同一批命令**，缺工具直接判红（不跳过——跳过等于假装跑过）。
+
+### 33-2 开门就挖出来的（已修）
+
+- **9 个从未被引用的依赖**：`fmnr-core` 的 `serde_with`/`tracing`、`fmnr-fs` 的
+  `thiserror`/`tracing`、`fmnr-icons` 的 `serde`/`thiserror`/`tracing`、
+  `fmnr-plugins` 的 `fmnr-core`/`tracing`。删完 `cargo machete` 干净，592 项测试照过。
+- **2 处测试夹具拼写**：`fmnr-plugins` 那条"未知字段要被拒"的测试用了拼错的字段名
+  （改成中性的未知字段名，语义不变）；`fmnr-remote` 里那条假 SSH 公钥串的后缀同样带了个
+  拼写错（改成 `bogus`）。两处都是**夹具**，改完测试照过。
+- **yanked 版本**：`inout 0.2.3` → `0.2.5`（`cargo update -p inout`）。
+- `_typos.toml` 只放**确实不是错字**的词：Win32 的 `FOF_*`/`FO_*`、`PnP`、文献缩写 `Comput`、
+  treemap 的 `iy`、类型名 `TreCell`、crate 名 `flate2`、README 里那个 git 短哈希。
+  **没有整目录/整文件豁免**。
+
+### 33-3 `deny.toml` 里两条放宽的边界
+
+- `unmaintained = "workspace"`：只查**直接依赖**是否停止维护。传递依赖（`resvg` 拉进来的
+  `rustybuzz`/`ttf-parser`）判红只会每天亮灯、没人看，责任在上游。
+- `ignore = ["RUSTSEC-2023-0071"]`：`rsa 0.10.0-rc.18` 经 `russh` 进来。这条公告打的是
+  RSA **解密**的时序侧信道；我们作为 SSH 客户端不做 RSA 私钥解密（会话密钥走对称）。
+  **上游发版就删这条**——它是豁免，不是"以后都不管"。
+- `multiple-versions = "warn"`：锁里本来就有三份 `base64`、多份 `windows-sys`，判红只会训练人忽略红灯。
+- 许可证白名单补了 `OFL-1.1` / `Ubuntu-font-1.0`（egui 默认字体包）与 `bzip2-1.0.6`
+  （纯 Rust bzip2 实现）。
+
+### 33-4 未证
+
+- 两个新 job **还没在 GitHub 上跑过**（本条提交后才有 run）。本地同一批命令全绿，
+  但"CI 上 `cargo install` 的时间与依赖"没量：按经验 typos ~1–2 min、machete ~20 s、
+  deny ~3–5 min，都设了 `timeout-minutes`。
+- Dependabot 第一次真正开 PR 的行为没验（要等下一个周期）。

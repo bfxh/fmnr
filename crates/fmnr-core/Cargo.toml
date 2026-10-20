@@ -7,10 +7,8 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
-tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 async-trait = "0.1"
 futures = "0.3"
-serde_with = "3.24.0"

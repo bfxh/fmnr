@@ -1,0 +1,22 @@
+# 依赖与 action 的例行升级（CD 的一半：让"有新版本"变成一条能看的 PR，
+# 而不是等某天门因为一个 yanked 版本变红才去查）。
+#
+# 刻意分开的两件事：
+# - cargo 的**补丁**升级每周自动开一条 PR；次版本/主版本只开单条、留人工判断。
+# - actions 的升级按月，且单独一类——它不该和依赖升级混在一条里。
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      patch-updates:
+        patterns: ["*"]
+        update-types: ["patch"]
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2

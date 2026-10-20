@@ -117,8 +117,9 @@ mod tests {
     /// 用户看到的是「插件装上了但不生效」，那种排查成本很高。
     #[test]
     fn unknown_manifest_field_is_rejected() {
-        let e = Manifest::parse(br#"{"name":"a","version":"1","extensions":[],"extentions":[]}"#)
-            .unwrap_err();
+        let e =
+            Manifest::parse(br#"{"name":"a","version":"1","extensions":[],"unknown_field":[]}"#)
+                .unwrap_err();
         assert!(
             matches!(e, PluginError::BadManifest(_)),
             "应报清单错误：{e}"

@@ -12,16 +12,16 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-echo "── 1/5 fmt ──"
+echo "── 1/6 fmt ──"
 cargo fmt --all --check
 
-echo "── 2/5 clippy（--keep-going：不带它时第一个判红的 crate 会挡住所有下游）──"
+echo "── 2/6 clippy（--keep-going：不带它时第一个判红的 crate 会挡住所有下游）──"
 cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
 
-echo "── 3/5 test ──"
+echo "── 3/6 test ──"
 cargo test --workspace --locked
 
-echo "── 4/5 暂存区内容自己过得了 fmt ──"
+echo "── 4/6 暂存区内容自己过得了 fmt ──"
 TMPD=$(mktemp -d)
 trap 'rm -rf "$TMPD"' EXIT
 git checkout-index -a -f --prefix="$TMPD/"
@@ -32,7 +32,7 @@ if ! (cd "$TMPD" && cargo fmt --all --check); then
     exit 1
 fi
 
-echo "── 5/5 跨平台编译（抓 cfg 门控漏出来的死代码）──"
+echo "── 5/6 跨平台编译（抓 cfg 门控漏出来的死代码）──"
 # 本机是 windows-gnu，第 2 步看不见"只在非 Windows 上成为 dead_code"这类错——
 # `space::existing_ancestor` 就是这么让 CI 的 ubuntu lint 门判红、而本地全绿的。
 #
@@ -55,4 +55,20 @@ else
     echo "      要补上这条能力：rustup target add $LT"
 fi
 
+echo "── 6/6 仓库卫生 + 供应链（与 CI 的 hygiene / supply 两个 job 同一批命令）──"
+# 这三条都是"会悄悄烂"的东西：拼写错在注释里没人管、依赖只增不减、
+# 漏洞公告出来了没人看。工具版本与 CI 一致（钉死），本机没装就直接判红——
+# **不跳过**：跳过等于假装这条门跑过了。
+need=""
+command -v typos >/dev/null 2>&1 || need="$need typos-cli(1.51.1)"
+command -v cargo-machete >/dev/null 2>&1 || need="$need cargo-machete(0.9.2)"
+command -v cargo-deny >/dev/null 2>&1 || need="$need cargo-deny(0.20.2)"
+if [ -n "$need" ]; then
+    echo "缺工具：$need"
+    echo "    装法：cargo install typos-cli --version 1.51.1 --locked 等（版本要与 CI 对齐）"
+    exit 1
+fi
+typos
+cargo machete
+cargo deny check advisories licenses sources
 echo "gate: 全绿（第 5 步若显示跳过，则跨平台那一类未覆盖）"

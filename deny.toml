@@ -1,0 +1,63 @@
+# 供应链门禁（cargo-deny）。这里只放**会判红**的三件事：
+#   1) 已知漏洞（RUSTSEC advisory）——包括 yanked 的版本；
+#   2) 许可证必须在白名单里（本仓是 MIT、公开仓）；
+#   3) 依赖只许来自 crates.io（不许混 git / 私有 registry）。
+#
+# 刻意**不**把重复版本（multiple-versions）做成判红：本仓锁文件里同时存在
+# 三份 base64、多份 windows-sys，这是上游各自锁版本的结果，判红只会训练人
+# 去忽略红灯。它降级成 warning，读日志时能看到，但不挡合并。
+#
+# 升级依赖时若这里判红：先看是"真漏洞"还是"白名单缺一条许可"，不要直接加 ignore。
+
+[graph]
+targets = []
+
+[advisories]
+version = 2
+yanked = "deny"
+# 只看**我们自己的直接依赖**是否停止维护。传递依赖（resvg 拉进来的 rustybuzz /
+# ttf-parser 那类）由上游负责，全量判红只会每天亮灯、没人看。
+unmaintained = "workspace"
+ignore = [
+  # RUSTSEC-2023-0071（Marvin Attack）落在 rsa 0.10.0-rc.18 上，而 rsa 是
+  # **russh 传进来的**（SSH 客户端）。这条公告打的是 RSA **解密**的时序侧信道，
+  # 而客户端路径不拿 RSA 私钥解密（会话密钥走对称、RSA 只用于签名/校验主机键）。
+  # 上游发版后应立刻删掉这条 ignore —— 它是一条有范围的豁免，不是"以后都不管"。
+  "RUSTSEC-2023-0071",
+]
+
+[licenses]
+version = 2
+# 2.0 起用 allow 列表 + 置信阈值；0.9 是官方建议值（避免猜错的许可被判过）。
+confidence-threshold = 0.9
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "MPL-2.0",
+  "CC0-1.0",
+  "Unlicense",
+  "BSL-1.0",
+  "CDLA-Permissive-2.0",
+  "OpenSSL",
+  # 字体与 bzip2：都是 egui 默认字体包 / 纯 Rust bzip2 的实现许可，条款是宽松的。
+  "OFL-1.1",
+  "Ubuntu-font-1.0",
+  "bzip2-1.0.6",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -151,7 +151,7 @@ plugins/md-outline   示例真 Rust WASM 插件（Markdown 大纲预览）
 | 跨卷互传 | 源卷 `read_stream` → 目标卷 `write_stream`，一块一次写、两边都不整份进内存；目标是**另一个卷**时（带 `local:` 前缀或一条裸绝对路径）走这条 | ✅ 真 CLI 进程：`fmnr cp archive:D:\tmp\e2e\pack.7z/hello.txt --to D:\tmp\e2e\out` → `done:1 · bytes:9`、盘上文件逐字节相等（修前这条报「归档卷是只读的」，四条入口都取不出包内文件）。🔴 **只搬文件**（整目录有 §21-2 那条 O(N×D) 禁区，加上本地卷的 `search` 只按"名字以 `.` 开头"跳隐藏项这一条前置），**界面里的跨栏拖放仍走单卷** |
 | 特殊文件夹 | 目录树起点下挂 下载/文档/图片/桌面（走系统已知文件夹，不拼 `home\Downloads`） | ✅ 真跑点过：点「下载」→ 栏头/面包屑/状态栏三处都是 `C:\Users\lbx13\Downloads`；被重定向的文件夹也拿得到真实位置 |
 | 路径串 | 面包屑/栏头与列出的内容必须指向同一个目录 | ✅ 已确诊并修：旧面包屑按 `components()` 取前 N 个重拼，Windows 上第一跳给的是 `E:`（盘相对，按该盘 CWD 解析）。现在标签与目标同源走 `ancestors()`，枚举层 `LocalVolume::resolve` 把 `E:` 补成 `E:\`（MCP/HTTP/CLI 那条腿客户端可以直接传 `"path":"E:"`）。真跑验过：`E:\tmp\adv-mut` 点「tmp」→ 栏头 `E:\tmp`、列的是 tmp 的内容。机制与实测见 `docs/UI-NEXT.md` §10 |
-| CI | 五道门禁（lint / 双平台测试 / 插件行为 / 插件字节可复现 / 客户端契约） | ✅ `85f8ba9`（run 38979552946）全绿 |
+| CI | 七道门禁（lint / 双平台测试 / 插件行为 / 插件字节可复现 / **仓库卫生** / **供应链** / 客户端契约） | ⏳ 下一轮推送后按 run 回填 |
 
 本地跑门用 [`scripts/gate.sh`](scripts/gate.sh)：按 CI 的顺序跑，最后一步
 把**索引**物化成干净的树再查 fmt——因为本轮真实踩过一次"本地全绿但 CI 红"，

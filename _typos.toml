@@ -1,0 +1,8 @@
+# typos 的白名单：只放**确实不是错字**的词。
+# 判据：它在代码/文档里指代一个真实标识符、Win32 常量或文献缩写，
+# 改成 typos 建议的写法反而会让代码编不过、或把引用改错。
+# 注意 typos 会把驼峰/下划线拆开判（PnP → Pn + P，TreCell → Tre + Cell），
+# 所以要放的是**拆开后的那一段**。
+[default]
+extend-words = { FOF = "FOF", FO = "FO", Pn = "Pn", Comput = "Comput", Tre = "Tre" }
+extend-identifiers = { iy = "iy", flate2 = "flate2", "85f8ba9" = "85f8ba9" }

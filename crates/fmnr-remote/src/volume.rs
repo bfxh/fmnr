@@ -507,7 +507,7 @@ mod tests {
             !accept_host_key(
                 HostKeyPolicy::VerifyKnownHosts,
                 &stored,
-                key("ssh-rsa AAAAother")
+                key("ssh-rsa AAAAbogus")
             ),
             "键变了还放行就是 MITM 洞"
         );

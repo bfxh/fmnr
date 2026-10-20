@@ -15,6 +15,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# 最小权限：门禁只需要读代码。写权限留给 release.yml，按需在那份里声明。
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -144,6 +148,47 @@ jobs:
             exit 1
           fi
           echo "同工具链下逐字节可复现。"
+
+  # ── 门禁 4a：仓库卫生（拼写 + 未使用依赖）──────────────────────────
+  # 钉的结论：仓里的英文拼写错误 = 0；每个 crate 声明的依赖都真的被用到。
+  # 这两条都是**会悄悄烂掉**的东西：拼写错在注释里没人管，未使用的依赖
+  # 只增不减（本仓上线时就有 9 个，删掉后编译图少了一圈）。
+  # 工具版本**钉死**：typos 的词典会随版本变，浮动版本会让门某天自己变红。
+  hygiene:
+    name: 仓库卫生（拼写 + 未使用依赖）
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 拼写（typos）
+        run: |
+          cargo install typos-cli --version 1.51.1 --locked
+          typos
+      - name: 未使用的依赖（cargo-machete）
+        run: |
+          cargo install cargo-machete --version 0.9.2 --locked
+          cargo machete
+
+  # ── 门禁 4b：供应链（漏洞 / 许可证 / 来源）────────────────────────
+  # 钉的结论：RUSTSEC 没有**可利用的**漏洞、所有依赖的许可证都在 deny.toml
+  # 的白名单里、依赖只来自 crates.io。
+  # 配置在 `deny.toml`：unmaintained 只查直接依赖；重复版本降成 warning
+  # （锁里本来就有多份 base64/windows-sys，判红只会训练人忽略红灯）。
+  # 唯一一条 ignore 是 RUSTSEC-2023-0071（rsa，russh 传进来的），
+  # 理由与"上游发版就删"的约定写在 deny.toml 里。
+  supply:
+    name: 供应链（漏洞 + 许可证 + 来源）
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo-deny
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo deny check advisories licenses sources
 
   # ── 门禁 4：外部客户端契约（MCP / HTTP / CLI）──────────────────────
   # 钉的结论：三个前端共用同一个内核分发表，不会出现「CLI 能删、MCP 不能」。

@@ -9,8 +9,6 @@ license.workspace = true
 sha2 = "0.10"
 fmnr-core = { path = "../fmnr-core" }
 tokio = { version = "1", features = ["full"] }
-thiserror.workspace = true
-tracing.workspace = true
 jwalk.workspace = true
 async-trait = "0.1"
 futures = "0.3"

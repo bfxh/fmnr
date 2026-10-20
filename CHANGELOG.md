@@ -154,8 +154,19 @@
 
 ### 质量门
 
-- CI 四道门禁：`fmt` + `clippy -D warnings`（两平台）、workspace 构建与测试（两平台）、
-  插件「源码 → 真宿主能跑」+ 钉死工具链的字节可复现、外部客户端契约（MCP / HTTP / CLI 真子进程）。
+- CI **七道**门禁：`fmt` + `clippy -D warnings`（两平台）、workspace 构建与测试（两平台）、
+  插件「源码 → 真宿主能跑」+ 钉死工具链的字节可复现、外部客户端契约（MCP / HTTP / CLI 真子进程）、
+  **仓库卫生**（`typos` 拼写 + `cargo-machete` 未使用依赖，工具版本钉死）、
+  **供应链**（`cargo-deny`：RUSTSEC 漏洞 / 许可证白名单 / 只许 crates.io，配置在 `deny.toml`）。
+  另有 Dependabot：cargo 补丁升级每周一条、actions 升级每月一条。
+  这两道新门**先把本仓自己的问题挖了出来并修掉**：9 个从未被引用的依赖
+  （`fmnr-core` 的 `serde_with`/`tracing`、`fmnr-fs` 的 `thiserror`/`tracing`、
+  `fmnr-icons` 的 `serde`/`thiserror`/`tracing`、`fmnr-plugins` 的 `fmnr-core`/`tracing`）
+  与 2 处测试夹具里的拼写；另把锁文件里一个 **yanked** 的 `inout 0.2.3` 升到 0.2.5。
+  `deny.toml` 只留两条**有范围**的说明：`unmaintained` 只查直接依赖（传递依赖由上游负责），
+  以及 `RUSTSEC-2023-0071`（`rsa` 经 `russh` 进来；打的是 RSA **解密**的时序侧信道，
+  客户端路径不做这件事）——上游发版即删。
+  本地 `scripts/gate.sh` 加了第 6 步跑同一批命令，缺工具**判红而不是跳过**。
 - 592 项测试（本轮实测计数，`scripts/gate.sh` 全绿口径；比上一版的 548 多 44 =
   `fmnr-share` 从 14 条涨到 55 条（无脚本腿 + 常驻设置 + WebDAV + 真锁）+ `fmnr-ui` 的绑定目标 3 条）。
   UI 那 9 条：行为门 1 + 输入框静态尺 1 + `text_edit` 两向焦点门 1 + 冲突预筛问卷 2 +
