@@ -4,7 +4,10 @@
 //!
 //! - 一次一个动作。手机把件投进电脑的收件目录，或电脑把**你手动登记过**的几个件
 //!   取回手机。没有目录镜像、没有冲突合并、没有离线队列 ⇒ 不碰
-//!   `docs/DESIGN.md` 第 70 行那句「不做文件内容同步」。
+//!   `docs/DESIGN.md` 那句「不做文件内容同步」。
+//! - 收件有**两条腿**：`/put`（请求体就是文件，流式）和 `/send`（原生 `<form>` 的
+//!   `multipart/form-data`，**不需要 JS**）。两条腿必须都进 `ingest`，
+//!   新通道自己 `inbox.join(name)` 就是在绕开 `#61` 那道闸。
 //! - 鉴权只有一把挂在 URL 里的随机 token（128 bit），**明文 HTTP**。
 //!   同网段抓包就能拿到它，所以这是"自己家/办公室网"档位，不是公网服务。
 //!   默认绑回环，对外开放要显式批准（闸在 `fmnr_core::net::bind_addr`，
@@ -250,6 +253,11 @@ pub fn page_html(token: &str, outbox: &[OutEntry]) -> String {
          <input id=f type=file multiple>\
          <br><button onclick=up()>发送</button>\
          <div id=log></div>\
+         <form method=post action=\"/send?k={}\" enctype=multipart/form-data>\
+         <input id=f2 type=file name=f multiple>\
+         <button type=submit>不用脚本发送</button></form>\
+         <p class=muted>上面两个按钮同一个去处：都进电脑的收件目录，同名都让路。\
+         第二个不跑脚本，浏览器坏了 JS、套壳浏览器禁了 fetch 也能送。</p>\
          {out}\
          <p class=muted>关掉电脑上的开关，这个链接立刻失效。</p>\
          <script>var K='{}';\
@@ -260,6 +268,7 @@ pub fn page_html(token: &str, outbox: &[OutEntry]) -> String {
          catch(e){{log+='✗ '+fl.name+' → '+e+'\\n';}}d().textContent=log;}}}}\
          function d(){{return document.getElementById('log')}}\
          </script>",
+        url_escape(token),
         url_escape(token)
     )
 }
@@ -318,6 +327,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
     Router::new()
         .route("/", get(page))
         .route("/put", post(put))
+        .route("/send", post(send))
         .route("/get", get(download))
         .with_state(hub)
 }
@@ -336,7 +346,8 @@ async fn page(State(hub): State<Arc<Hub>>, Query(q): Query<HashMap<String, Strin
     Html(page_html(&hub.token, &hub.outbox())).into_response()
 }
 
-/// 收件：请求体**就是文件本身**（不引 multipart 解析器），名字走 `n=`。
+/// 收件（流式那条腿）：请求体**就是文件本身**，名字走 `n=`。
+/// 页面里有 JS 时走这条；没有 JS 时走 `/send`。两条腿最后同进 `ingest`。
 async fn put(
     State(hub): State<Arc<Hub>>,
     Query(q): Query<HashMap<String, String>>,
@@ -348,60 +359,88 @@ async fn put(
     let Some(raw) = q.get("n") else {
         return say(StatusCode::BAD_REQUEST, "没给文件名（n=）。");
     };
-    let Some(name) = sanitize_name(raw) else {
-        return say(
-            StatusCode::BAD_REQUEST,
-            "这个名字我不能用：只收纯文件名，不带路径、盘符或控制字符。",
-        );
+    let stream = req.into_body().into_data_stream();
+    match ingest(hub, raw, Box::pin(stream)).await {
+        Ok(msg) => (StatusCode::OK, msg).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// 🔴 **所有投递通道共用的那一个收口**。浏览器页面、不带 JS 的表单、任何第三方
+/// app 的 POST，最后都必须走这里——因为「同名让路 + 拒写共享 + 不留半截 + 报给
+/// 界面」这四条只在这一处实现。新通道若绕过它自己 `inbox.join(name)`，
+/// 就把 `#61` 那道闸和全仓唯一那份命名规则废掉了。
+///
+/// 流式写入：`/put` 一路从 socket 读，不在内存里攒整份。
+async fn ingest(
+    hub: Arc<Hub>,
+    raw_name: &str,
+    mut stream: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send + 'static>,
+    >,
+) -> Result<String, Box<Response>> {
+    let name = match sanitize_name(raw_name) {
+        Some(n) => n,
+        None => {
+            return Err(Box::new(say(
+                StatusCode::BAD_REQUEST,
+                "这个名字我不能用：只收纯文件名，不带路径、盘符或控制字符。",
+            )))
+        }
     };
-    if let Err(e) = std::fs::create_dir_all(&hub.inbox) {
-        return say(
+    std::fs::create_dir_all(&hub.inbox).map_err(|e| {
+        Box::new(say(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("收件目录建不出来：{e}"),
-        );
-    }
+        ))
+    })?;
     // 挑名字到写完，整段串行（见 `create_lock`）。
     let _guard = hub.create_lock.lock().await;
     let dest = unique_dest(&hub.inbox, &name);
-    let std_file = match fmnr_fs::ops::create_exclusive(&dest) {
-        Ok(f) => f,
-        Err(e) => {
-            return say(
-                StatusCode::CONFLICT,
-                &format!("这个文件现在写不了（可能被别的程序开着）：{e}"),
-            )
-        }
-    };
+    let std_file = fmnr_fs::ops::create_exclusive(&dest).map_err(|e| {
+        Box::new(say(
+            StatusCode::CONFLICT,
+            &format!("这个文件现在写不了（可能被别的程序开着）：{e}"),
+        ))
+    })?;
     let mut file = tokio::fs::File::from_std(std_file);
-    let mut stream = req.into_body().into_data_stream();
     let mut written: u64 = 0;
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(c) => c,
             Err(e) => {
                 discard(&dest).await;
-                return say(StatusCode::BAD_REQUEST, &format!("读到一半断了：{e}"));
+                return Err(Box::new(say(
+                    StatusCode::BAD_REQUEST,
+                    &format!("读到一半断了：{e}"),
+                )));
             }
         };
         written += chunk.len() as u64;
         if written > hub.max_bytes {
             discard(&dest).await;
-            return say(
+            return Err(Box::new(say(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 &format!(
                     "超过上限 {}，这份没收（半截的已删掉）。",
                     human_bytes(hub.max_bytes)
                 ),
-            );
+            )));
         }
         if let Err(e) = file.write_all(&chunk).await {
             discard(&dest).await;
-            return say(StatusCode::INTERNAL_SERVER_ERROR, &format!("写盘失败：{e}"));
+            return Err(Box::new(say(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("写盘失败：{e}"),
+            )));
         }
     }
     if let Err(e) = file.flush().await {
         discard(&dest).await;
-        return say(StatusCode::INTERNAL_SERVER_ERROR, &format!("收尾失败：{e}"));
+        return Err(Box::new(say(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("收尾失败：{e}"),
+        )));
     }
     drop(file);
     let saved = dest
@@ -409,11 +448,7 @@ async fn put(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or(name);
     hub.note_received(saved.clone(), written);
-    (
-        StatusCode::OK,
-        format!("已存为 {saved}（{}）", human_bytes(written)),
-    )
-        .into_response()
+    Ok(format!("已存为 {saved}（{}）", human_bytes(written)))
 }
 
 /// 失败时**不许留半截文件**：留了下一轮同名让路会把它当成"已存在的件"。
@@ -425,6 +460,196 @@ async fn discard(dest: &Path) {
             eprintln!("fmnr-share: 半截文件删不掉 {}: {e}", dest.display());
         }
     }
+}
+
+/// 从 `Content-Type` 里取 multipart 的 boundary。浏览器给的是
+/// `multipart/form-data; boundary=----WebKitFormBoundaryXX`，带引号的形式也要认。
+pub fn multipart_boundary(content_type: &str) -> Option<String> {
+    let lower = content_type.to_ascii_lowercase();
+    if !lower.starts_with("multipart/form-data") {
+        return None;
+    }
+    let (_, rest) = content_type.split_once(';')?;
+    let rest = rest.trim_start();
+    let after = match rest.strip_prefix("boundary=") {
+        Some(a) => a.trim_start(),
+        None => {
+            let rest_lower = rest.to_ascii_lowercase();
+            let idx = rest_lower.find("boundary=")?;
+            rest.get(idx + "boundary=".len()..)?
+        }
+    };
+    if after.starts_with('"') {
+        let inner = after.get(1..)?.split_once('"')?.0;
+        Some(inner.to_string())
+    } else {
+        Some(after.split(';').next()?.trim().to_string())
+    }
+}
+
+/// 解析出来的一块。有 `filename` 的才是文件，其余（隐藏域）`filename` 为 `None`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormPart {
+    pub filename: Option<String>,
+    pub data: Vec<u8>,
+}
+
+/// **不引第三方 multipart 库**的严格解析器：按 RFC 7578 的分隔符切。
+///
+/// 刻意做成"整块进内存再切"（`/put` 那条才是流式）：这条通道是给**没有 JS 的
+/// 原生表单**兜底的，一次一两兆的文档，换掉一个下载依赖值得。天花板仍由
+/// `max_bytes` 卡在解析之前。
+///
+/// 只信分隔符，不信长度字段；看不懂的块直接丢，不猜。
+pub fn parse_multipart(boundary: &str, body: &[u8]) -> Vec<FormPart> {
+    let dash = format!("--{boundary}");
+    let dash = dash.as_bytes();
+    let mut parts = Vec::new();
+    let mut at = 0usize;
+    while at <= body.len() && parts.len() < 64 {
+        // 分隔符必须出现在一行的开头：串首，或紧跟在一个 CRLF 之后。
+        // 🔴 只找 `\r\n--` 是不够的——文件内容里完全可能出现 `--B` 这样的行
+        // （测试就是这么打出来的）。后面必须是 CRLF、或 `--`（收尾），才算分隔符。
+        let start = if body[at..].starts_with(dash) {
+            at
+        } else {
+            match find_crlf_delim(&body[at..], dash) {
+                // 返回的是分隔符**前面那个 CRLF** 的偏移，+2 才落到 `--` 上。
+                Some(k) => at + k + 2,
+                None => break,
+            }
+        };
+        let after = start + dash.len();
+        match &body[after..] {
+            [b'-', b'-', ..] => break, // 结尾的 `--boundary--`
+            [b'\r', b'\n', ..] => {}
+            _ => break, // 看不懂的形状：不猜，停
+        }
+        let nl = match find_bytes(&body[after..], b"\r\n") {
+            Some(k) => after + k + 2,
+            None => break,
+        };
+        let next = match find_crlf_delim(&body[nl..], dash) {
+            Some(k) => nl + k,
+            None => body.len(), // 收尾被截断：收下这一块，别丢
+        };
+        let block = &body[nl..next];
+        let head_end = match find_bytes(block, b"\r\n\r\n") {
+            Some(k) => k,
+            None => block.len(),
+        };
+        let head = String::from_utf8_lossy(&block[..head_end]).to_string();
+        let data = if head_end + 4 <= block.len() {
+            block[head_end + 4..].to_vec()
+        } else {
+            Vec::new()
+        };
+        parts.push(FormPart {
+            filename: quoted_value(&head, "filename"),
+            data,
+        });
+        // 停在下一个分隔符**前面的那个 CRLF** 上（不是 `--` 上）：
+        // 🔴 多走 2 个字节就会从分隔符中间起跑，第二块永远认不出来（真红过）。
+        at = next + 2;
+    }
+    parts
+}
+
+/// 从 `hay` 里找下一个「真分隔符」的偏移：`\r\n` + `--boundary`，
+/// 且其后紧跟 CRLF 或 `--`。返回的是那个 `\r\n` 的偏移。
+fn find_crlf_delim(hay: &[u8], dash: &[u8]) -> Option<usize> {
+    let mut i = 0usize;
+    while let Some(k) = find_bytes(&hay[i..], b"\r\n") {
+        let at = i + k;
+        if hay[at + 2..].starts_with(dash) {
+            match &hay[at + 2 + dash.len()..] {
+                [b'\r', b'\n', ..] | [b'-', b'-', ..] => return Some(at),
+                _ => {}
+            }
+        }
+        i = at + 1;
+    }
+    None
+}
+
+/// 在 `hay` 里从前往后找 `needle`，返回偏移。
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+/// 从一段头部里取 `key="value"` 的值（只认带引号那种，够浏览器用）。
+fn quoted_value(head: &str, key: &str) -> Option<String> {
+    let at = head.to_ascii_lowercase().find(&format!("{key}=\""))?;
+    let rest = head[at + key.len() + 2..].split('"').next()?;
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
+/// 不带 JS 的那条腿：原生表单 `POST /send?k=`，体是 `multipart/form-data`。
+/// 每一个带 `filename` 的块都走 `ingest`——**包括同名让路、拒写共享、不留半截**。
+async fn send(
+    State(hub): State<Arc<Hub>>,
+    Query(q): Query<HashMap<String, String>>,
+    req: Request,
+) -> Response {
+    if !token_ok(&hub.token, qtoken(&q)) {
+        return say(StatusCode::UNAUTHORIZED, "没有 token，不收。");
+    }
+    let Some(ct) = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return say(
+            StatusCode::BAD_REQUEST,
+            "这个表单没带 Content-Type，切不开。",
+        );
+    };
+    let ct = ct.to_string();
+    let Some(boundary) = multipart_boundary(&ct) else {
+        return say(
+            StatusCode::BAD_REQUEST,
+            "不是 multipart/form-data，这一条腿走不通。",
+        );
+    };
+    let max = hub.max_bytes as usize;
+    let body = match axum::body::to_bytes(req.into_body(), max).await {
+        Ok(b) => b,
+        Err(_) => {
+            return say(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &format!("整单超过 {}，没收。", human_bytes(hub.max_bytes)),
+            )
+        }
+    };
+    let mut lines = String::new();
+    let mut landed = 0usize;
+    for part in parse_multipart(&boundary, &body) {
+        let Some(raw) = part.filename else { continue };
+        let stream = futures::stream::once(async move { Ok(axum::body::Bytes::from(part.data)) });
+        match ingest(hub.clone(), &raw, Box::pin(stream)).await {
+            Ok(msg) => {
+                landed += 1;
+                lines.push_str(&format!("✓ {msg}<br>"));
+            }
+            Err(e) => {
+                let why = e.status().as_u16();
+                lines.push_str(&format!("✗ {} 没收下（{why}）<br>", html_escape(&raw)));
+            }
+        }
+    }
+    if landed == 0 && lines.is_empty() {
+        return say(StatusCode::BAD_REQUEST, "这一单里没有文件。");
+    }
+    Html(format!(
+        "<!doctype html><meta charset=utf-8><title>fmnr 收件</title>\
+         <body style=\"font:16px/1.6 system-ui;margin:20px\">{lines}\
+         <p><a href=\"?k={}\">再来一次</a></p>",
+        url_escape(hub.token())
+    ))
+    .into_response()
 }
 
 /// 取件：只认编号。这里**没有**任何接受路径的入口。
@@ -915,13 +1140,445 @@ mod tests {
         assert!(html.contains("var K='TOK'"), "token 没递给页面脚本：{html}");
     }
 
+    /// 没有 JS 的那条腿要能落。这是本轮的核心断言：原生表单送的多部分体，
+    /// 必须和 `/put` 走**同一个收口**（同名让路、报给界面都成立）。
+    #[tokio::test]
+    async fn a_plain_form_without_javascript_lands_in_the_same_inbox() {
+        let inbox = tmp("nojs");
+        let hub = Arc::new(Hub::new(inbox.clone()));
+        let tok = hub.token().to_string();
+        let body = concat!(
+            "--B\r\n",
+            "Content-Disposition: form-data; name=\"f\"; filename=\"手机里的文档.txt\"\r\n",
+            "Content-Type: text/plain\r\n\r\n",
+            "bytes from the form\r\n",
+            "--B--\r\n",
+        );
+        let (code, text) = ask_form(hub.clone(), &format!("/send?k={tok}"), body.as_bytes()).await;
+        assert_eq!(code, StatusCode::OK, "原生表单没被收：{text}");
+        assert_eq!(
+            std::fs::read(inbox.join("手机里的文档.txt"))
+                .ok()
+                .as_deref(),
+            Some(&b"bytes from the form"[..]),
+            "落盘的字节与表单里的不等"
+        );
+        assert_eq!(hub.received().len(), 1, "这条腿也要报给界面");
+
+        // 同名再来一份：让路，不许洗掉第一份。
+        let (code2, _) = ask_form(hub.clone(), &format!("/send?k={tok}"), body.as_bytes()).await;
+        assert_eq!(code2, StatusCode::OK, "第二份没让路：{code2}");
+        assert_eq!(
+            std::fs::read(inbox.join("手机里的文档.txt"))
+                .ok()
+                .as_deref(),
+            Some(&b"bytes from the form"[..]),
+            "第二份把第一份洗掉了"
+        );
+        assert_eq!(hub.received().len(), 2, "两份都要报给界面");
+        std::fs::remove_dir_all(&inbox).ok();
+    }
+
+    /// 两个文件一块送。分隔符的搜索必须**从每一块自己的位置**起——
+    /// 写成从 0 起的话第二块永远找不到，还悄悄只收第一块。
+    #[tokio::test]
+    async fn two_files_in_one_form_both_land() {
+        let inbox = tmp("two");
+        let hub = Arc::new(Hub::new(inbox.clone()));
+        let tok = hub.token().to_string();
+        let body = concat!(
+            "--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"一.txt\"\r\n\r\n1\r\n",
+            "--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"二.txt\"\r\n\r\n2\r\n",
+            "--B--\r\n",
+        );
+        let (code, _) = ask_form(hub.clone(), &format!("/send?k={tok}"), body.as_bytes()).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            std::fs::read(inbox.join("一.txt")).ok().as_deref(),
+            Some(&b"1"[..])
+        );
+        assert_eq!(
+            std::fs::read(inbox.join("二.txt")).ok().as_deref(),
+            Some(&b"2"[..]),
+            "一单里第二个文件没落地"
+        );
+        assert_eq!(hub.received().len(), 2, "两份都要报给界面");
+        std::fs::remove_dir_all(&inbox).ok();
+    }
+
+    #[test]
+    fn the_form_posts_to_the_route_that_exists() {
+        let html = page_html("TOK", &[]);
+        assert!(
+            html.contains("enctype=multipart/form-data"),
+            "这条腿不是原生表单发的 enctype：{html}"
+        );
+        assert!(
+            html.contains("action=\"/send?k=TOK\""),
+            "表单没指向 /send，或没带 token：{html}"
+        );
+        // 没有 name= 的 input 在 multipart 里根本不会出现，等于静默丢件。
+        assert!(
+            html.contains("name=f"),
+            "表单的文件框没有 name，浏览器不会把它放进单子里：{html}"
+        );
+    }
+
+    /// 路由挂没挂上：挂错的地方会回 404，而不是我们对单子内容的抱怨。
+    #[tokio::test]
+    async fn the_send_route_is_mounted() {
+        let hub = Arc::new(Hub::new(tmp("mount")));
+        let tok = hub.token().to_string();
+        let (code, _) = ask_form(hub, &format!("/send?k={tok}"), b"--B--\r\n").await;
+        assert_ne!(
+            code,
+            StatusCode::NOT_FOUND,
+            "/send 没挂上路由（404 就是没挂）"
+        );
+    }
+
+    /// 这条腿同样得先过 token：不然"不装 app 也能送"就变成了"不装 app 也能偷投"。
+    #[tokio::test]
+    async fn the_form_leg_still_needs_the_token() {
+        let inbox = tmp("formtoken");
+        let hub = Arc::new(Hub::new(inbox.clone()));
+        let body = concat!(
+            "--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"偷投.txt\"\r\n\r\nx\r\n",
+            "--B--\r\n",
+        );
+        let (code, _) = ask_form(hub.clone(), "/send", body.as_bytes()).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED, "没 token 的表单居然收了");
+        assert!(
+            std::fs::read_dir(&inbox).map(|rd| rd.count()).unwrap_or(0) == 0,
+            "没收下却动了收件目录"
+        );
+        std::fs::remove_dir_all(&inbox).ok();
+    }
+
+    /// 文件名是 `Content-Disposition` 里的外部输入，必须走同一个 `sanitize_name`。
+    #[tokio::test]
+    async fn a_traversal_filename_from_the_form_cannot_escape_the_inbox() {
+        let inbox = tmp("formpath");
+        let hub = Arc::new(Hub::new(inbox.clone()));
+        let tok = hub.token().to_string();
+        let body = concat!(
+            "--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"..\\\\win.txt\"\r\n\r\nx\r\n",
+            "--B--\r\n",
+        );
+        let (code, _) = ask_form(hub.clone(), &format!("/send?k={tok}"), body.as_bytes()).await;
+        assert_eq!(code, StatusCode::OK, "带路径的名字应被压平后收下：{code}");
+        assert!(inbox.join("win.txt").exists(), "压平后要落在收件目录里");
+        let mut names: Vec<String> = std::fs::read_dir(&inbox)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["win.txt".to_string()],
+            "收件目录里只该有那一个压平后的件，多一个就说明名字跑出去了"
+        );
+        std::fs::remove_dir_all(&inbox).ok();
+    }
+
+    #[test]
+    fn boundary_survives_the_shapes_browsers_actually_send() {
+        assert_eq!(
+            multipart_boundary("multipart/form-data; boundary=B").as_deref(),
+            Some("B")
+        );
+        assert_eq!(
+            multipart_boundary("multipart/form-data; boundary=\"QQ\"").as_deref(),
+            Some("QQ")
+        );
+        // 安卓上常见的就是这种又长又带额外参数的串
+        assert_eq!(
+            multipart_boundary(
+                "Multipart/Form-Data; charset=utf-8; boundary=----WebKitFormBoundaryAb12"
+            )
+            .as_deref(),
+            Some("----WebKitFormBoundaryAb12")
+        );
+        assert_eq!(multipart_boundary("text/plain"), None);
+        assert_eq!(multipart_boundary("multipart/form-data"), None);
+    }
+
+    /// 纯函数层的那把锁：body 里出现 `--B` 但不带前导 CRLF，不许被当成分隔符切开。
+    #[test]
+    fn content_that_looks_like_a_boundary_does_not_split_early() {
+        let body = concat!(
+            "--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.txt\"\r\n\r\n",
+            "line one\r\n--B is inside the file\r\nline two\r\n",
+            "--B--\r\n",
+        );
+        let parts = parse_multipart("B", body.as_bytes());
+        assert_eq!(parts.len(), 1, "内容里的伪分隔符把一块切开了：{parts:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&parts[0].data),
+            "line one\r\n--B is inside the file\r\nline two",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_multipart_body_on_the_form_leg_is_refused_not_guessed() {
+        let hub = Arc::new(Hub::new(tmp("ct")));
+        let tok = hub.token().to_string();
+        let req = Request::builder()
+            .uri(format!("/send?k={tok}"))
+            .method("POST")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from("x"))
+            .unwrap();
+        let res = router(hub).oneshot(req).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::BAD_REQUEST,
+            "不是 multipart 要明说"
+        );
+    }
+
+    /// 这条腿是**整块进内存**的，所以天花板必须生效——写成 `usize::MAX`
+    /// 就等于让对面一句 POST 把这台机器撑爆。
+    #[tokio::test]
+    async fn the_form_leg_refuses_a_whole_order_over_the_cap() {
+        let inbox = tmp("formcap");
+        let hub = Arc::new(Hub::new(inbox.clone()).with_max_bytes(8));
+        let tok = hub.token().to_string();
+        let body = concat!(
+            "--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"大.txt\"\r\n\r\n",
+            "0123456789ABCDEF\r\n--B--\r\n",
+        );
+        let (code, _) = ask_form(hub.clone(), &format!("/send?k={tok}"), body.as_bytes()).await;
+        assert_eq!(
+            code,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "整单超上限必须当场拒，不许缓冲下来再写"
+        );
+        assert!(
+            std::fs::read_dir(&inbox).map(|rd| rd.count()).unwrap_or(0) == 0,
+            "拒了却还在收件目录里留了东西"
+        );
+        std::fs::remove_dir_all(&inbox).ok();
+    }
+
+    /// 浏览器与手机之间那一跳随时断。收尾的 `--B--` 没送到时，**已经到达的那份**
+    /// 必须收下——写成"整单作废"会把手机已经发完的件吞掉。
+    #[tokio::test]
+    async fn a_form_cut_off_before_the_closing_delimiter_keeps_the_arrived_file() {
+        let inbox = tmp("trunc");
+        let hub = Arc::new(Hub::new(inbox.clone()));
+        let tok = hub.token().to_string();
+        // 注意：没有结尾的 `--B--`，第二块直接断在体里。
+        let body = concat!(
+            "--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"半截.txt\"\r\n\r\n",
+            "已经到齐的字节",
+        );
+        let (code, _) = ask_form(hub.clone(), &format!("/send?k={tok}"), body.as_bytes()).await;
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "收尾没送到不该作废已经到齐的件：{code}"
+        );
+        assert_eq!(
+            std::fs::read(inbox.join("半截.txt")).ok().as_deref(),
+            Some("已经到齐的字节".as_bytes()),
+            "半截判定要的是**内容整份在**，不是文件在不在"
+        );
+        std::fs::remove_dir_all(&inbox).ok();
+    }
+
+    /// `filename=""` 不是文件。把它当文件收，就会往收件目录写一个空名字件。
+    #[tokio::test]
+    async fn an_empty_filename_in_the_form_is_not_treated_as_a_file() {
+        let inbox = tmp("emptyname");
+        let hub = Arc::new(Hub::new(inbox.clone()));
+        let tok = hub.token().to_string();
+        let body = concat!(
+            "--B\r\nContent-Disposition: form-data; name=\"k\"; filename=\"\"\r\n\r\nv\r\n",
+            "--B--\r\n",
+        );
+        let (code, _) = ask_form(hub.clone(), &format!("/send?k={tok}"), body.as_bytes()).await;
+        assert_eq!(
+            code,
+            StatusCode::BAD_REQUEST,
+            "整单里只有非文件块，要说\"这一单里没有文件\"，不许当收下了"
+        );
+        assert!(
+            std::fs::read_dir(&inbox).map(|rd| rd.count()).unwrap_or(0) == 0,
+            "空名字那块被当成文件落盘了"
+        );
+        std::fs::remove_dir_all(&inbox).ok();
+    }
+
+    /// 游标推进的口径：停在下一个分隔符**前面的 CRLF** 上。
+    /// 多走一步就从分隔符中间起跑，后面的块全瞎——单块样本看不出来，所以单独钉。
+    #[test]
+    fn the_cursor_lands_where_the_next_delimiter_is_recognisable() {
+        let crlf = "\r\n";
+        let h1 = "Content-Disposition: form-data; name=\"f\"; filename=\"c1.txt\"\r\n\r\n";
+        let h2 = "Content-Disposition: form-data; name=\"f\"; filename=\"c2.txt\"\r\n\r\n";
+        let one = format!("--B{crlf}{h1}A{crlf}--B{crlf}{h2}B{crlf}--B--{crlf}");
+        assert_eq!(
+            parse_multipart("B", one.as_bytes()).len(),
+            2,
+            "两块都得认出来"
+        );
+        // 同一段内容但分隔符长不一样：推进量若是写死的常数，这里就会错位。
+        let two = format!("--LONG-B{crlf}{h1}A{crlf}--LONG-B{crlf}{h2}B{crlf}--LONG-B--{crlf}");
+        let got = parse_multipart("LONG-B", two.as_bytes());
+        assert_eq!(got.len(), 2, "长分隔符下推进量算错就只剩一块：{got:?}");
+        assert_eq!(got[1].data, b"B", "第二块的内容错位了：{:?}", got[1].data);
+    }
+
+    /// 分隔符偏移 `+2` 的判决性样本：**带前言的**单子才走得到那条分支
+    /// （游标正常时总是正好停在 `--` 上，另一条支路被 if 吃掉——所以单靠
+    /// 两块的样本杀不掉这把刀，这是本轮补的）。
+    #[test]
+    fn a_body_with_a_preamble_still_splits_at_the_first_real_delimiter() {
+        let crlf = "\r\n";
+        let b = format!(
+            "this is the preamble a mailer may prepend{crlf}--B{crlf}\
+             Content-Disposition: form-data; name=\"f\"; filename=\"q1.txt\"{crlf}{crlf}\
+             7{crlf}--B--{crlf}"
+        );
+        let got = parse_multipart("B", b.as_bytes());
+        assert_eq!(got.len(), 1, "前言之后的第一个分隔符没被认出：{got:?}");
+        assert_eq!(got[0].filename.as_deref(), Some("q1.txt"));
+        assert_eq!(got[0].data, b"7", "内容错位了：{:?}", got[0].data);
+    }
+
+    /// 分隔符后面必须紧跟 CRLF 或 `--`。只有裸 LF 的（有人手工改过的、非 RFC 的）
+    /// 单子要**判死**，不许靠后面的碰巧对齐蒙出一块来。
+    #[test]
+    fn a_malformed_delimiter_tail_is_refused_not_resynthesised() {
+        let b = "--B\nContent-Disposition: form-data; name=\"f\"; filename=\"m1.txt\"\n\ndata\n";
+        assert!(
+            parse_multipart("B", b.as_bytes()).is_empty(),
+            "非 RFC 的换行形状不该被切成块：{:?}",
+            parse_multipart("B", b.as_bytes())
+        );
+    }
+
+    /// 前言（有的邮件器/壳子浏览器会塞一行说明）之后收尾又断了：
+    /// 这时**不许**把前言当成一块收下来——判红的事要报 400，不是静默写个怪件。
+    #[tokio::test]
+    async fn a_preamble_followed_by_a_cut_off_tail_is_not_a_file() {
+        let inbox = tmp("pretrunc");
+        let hub = Arc::new(Hub::new(inbox.clone()));
+        let tok = hub.token().to_string();
+        let body = "this is a preamble\r\n--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"q.txt\"\r\n\r\nhello";
+        let (code, _) = ask_form(hub.clone(), &format!("/send?k={tok}"), body.as_bytes()).await;
+        assert_eq!(code, StatusCode::OK, "到了尾块的件该收下：{code}");
+        assert_eq!(
+            std::fs::read(inbox.join("q.txt")).ok().as_deref(),
+            Some("hello".as_bytes()),
+            "前言被当成内容吃进来了，或者件没落地"
+        );
+        std::fs::remove_dir_all(&inbox).ok();
+    }
+
+    /// 真 socket 上的原生表单：这一条替掉了"手机浏览器点一次"里**能在本机造出来的
+    /// 那一半**（分块传输、Content-Type 头、 multipart 体走完整个 HTTP 栈）。
+    /// 真机上还剩的只有：ROM 自带的壳子浏览器行为、以及第二台机器 + 防火墙。
+    #[test]
+    fn a_real_form_over_the_socket_lands_in_the_inbox() {
+        let dir = tmp("sockform");
+        let inbox = dir.join("inbox");
+        let hub = Arc::new(Hub::new(inbox.clone()));
+        let tok = hub.token().to_string();
+        let srv = start(hub.clone(), "127.0.0.1", 0, false).expect("测试前提：要起得来");
+        let boundary = "----QoderFormBoundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"f\"; \
+             filename=\"真表单.txt\"\r\nContent-Type: text/plain\r\n\r\n\
+             over the socket\r\n--{boundary}--\r\n"
+        );
+        let (status, resp) = http_post_with(
+            srv.port,
+            &format!("/send?k={tok}"),
+            body.as_bytes(),
+            &format!("multipart/form-data; boundary={boundary}"),
+        );
+        assert!(
+            status.starts_with("HTTP/1.1 200"),
+            "真表单没被收：{status} {resp}"
+        );
+        assert_eq!(
+            std::fs::read(inbox.join("真表单.txt")).ok().as_deref(),
+            Some("over the socket".as_bytes()),
+            "落盘的字节与表单里的不等"
+        );
+        // 没有 token 的那一次：当场拒，而且收件目录里不许多出一个件。
+        let (status2, _) = http_post_with(
+            srv.port,
+            "/send",
+            body.as_bytes(),
+            &format!("multipart/form-data; boundary={boundary}"),
+        );
+        assert!(
+            status2.starts_with("HTTP/1.1 401"),
+            "没 token 的表单要拒：{status2}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&inbox).map(|rd| rd.count()).unwrap_or(0),
+            1,
+            "拒掉的那一单不该在收件目录里留东西"
+        );
+        drop(srv);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 回执页会把文件名拼进 HTML。名字是外部输入，**必须转义**——
+    /// 否则手机侧一个 `<script>` 文件名就成了这台电脑浏览器里的脚本。
+    #[tokio::test]
+    async fn the_receipt_page_escapes_the_reported_name() {
+        let hub = Arc::new(Hub::new(tmp("xss")));
+        let tok = hub.token().to_string();
+        let body = concat!(
+            "--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"<script>alert(1)</script>.txt\"\r\n\r\nx\r\n",
+            "--B--\r\n",
+        );
+        let (code, html) = ask_form(hub, &format!("/send?k={tok}"), body.as_bytes()).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(
+            !html.contains("<script>alert(1)"),
+            "回执页把文件名原样拼进了 HTML：{html}"
+        );
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "转义过的名字才该出现在页面上：{html}"
+        );
+    }
+
+    /// 一条带 Content-Type 的 POST（模拟原生表单提交）。
+    async fn ask_form(hub: Arc<Hub>, uri: &str, body: &[u8]) -> (StatusCode, String) {
+        let req = Request::builder()
+            .uri(uri)
+            .method("POST")
+            .header(header::CONTENT_TYPE, "multipart/form-data; boundary=B")
+            .body(Body::from(body.to_vec()))
+            .unwrap();
+        let res = router(hub).oneshot(req).await.unwrap();
+        let code = res.status();
+        let text =
+            String::from_utf8_lossy(&to_bytes(res.into_body(), 1 << 20).await.unwrap()).to_string();
+        (code, text)
+    }
+
     /// 一行 HTTP/1.1 POST。返回（状态行, 响应体）。
     fn http_post(port: u16, path: &str, body: &[u8]) -> (String, String) {
+        http_post_with(port, path, body, "application/octet-stream")
+    }
+
+    /// 同上，但 Content-Type 自己给——原生表单那条腿必须是 `multipart/form-data`，
+    /// 这一条走的是真 socket，不经 tower 的 `oneshot`。
+    fn http_post_with(port: u16, path: &str, body: &[u8], content_type: &str) -> (String, String) {
         use std::io::{Read, Write};
         let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("连不上");
         let head = format!(
             "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\
-             Content-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+             Content-Type: {content_type}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         s.write_all(head.as_bytes()).unwrap();
