@@ -13,6 +13,7 @@ mod theme;
 mod tree;
 mod treemap;
 mod usage;
+mod win_drop;
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt::init();

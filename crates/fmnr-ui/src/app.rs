@@ -145,6 +145,8 @@ pub struct App {
     /// "掉在栏头还是列表上、掉进哪一栏"——拖放事件只给路径，不给落点语义。
     pane_rects: [egui::Rect; 2],
     pane_head_rects: [egui::Rect; 2],
+    /// OLE 拖放接管只试一次（成功或失败都别再试）。
+    drop_hooked: bool,
     /// 常驻设置：开关状态、局域网、上次绑上的端口、那把 token。落盘在 `share.json`。
     /// `enabled` 就是那颗开/关按钮——开着 = 下次启动自己开，端口与 token 不变。
     share_prefs: fmnr_share::config::Prefs,
@@ -517,6 +519,7 @@ impl App {
             share_lan: false,
             pane_rects: [egui::Rect::NOTHING; 2],
             pane_head_rects: [egui::Rect::NOTHING; 2],
+            drop_hooked: false,
             share_prefs: fmnr_share::config::Prefs::default(),
             share_prefs_path: PathBuf::new(),
             drives: fmnr_fs::drives::list(),
@@ -817,15 +820,54 @@ impl App {
     ///
     /// 判定逻辑在 `plan_drop`（纯函数，可单测）；这里只负责取输入与执行。
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
+        let mut dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
                 .iter()
                 .filter_map(|f| f.path.clone())
                 .collect()
         });
-        if dropped.is_empty() {
+        // OLE 接管成功时，文件与文本都在我们自己的队列里（winit 那条收不到了）；
+        // 接管失败时这个队列是空的，下面照旧用 egui 的文件拖放。
+        let mut texts: Vec<String> = Vec::new();
+        for item in crate::win_drop::take() {
+            match item {
+                crate::win_drop::DropItem::Files(v) => dropped.extend(v),
+                crate::win_drop::DropItem::Text(t) => texts.push(t),
+            }
+        }
+        if dropped.is_empty() && texts.is_empty() {
             return;
+        }
+
+        // 文本/URL：拖进哪一栏就落到哪一栏（栏头与列表都算"打开"，文本没有"拷贝"语义）。
+        if !texts.is_empty() {
+            let pointer = ctx.input(|i| i.pointer.hover_pos());
+            let which = match drop_intent(
+                pointer,
+                &self.pane_rects,
+                &self.pane_head_rects,
+                self.active_pane,
+            ) {
+                DropIntent::Open(i) | DropIntent::Copy(i) => Pane::from_index(i),
+            };
+            self.active_pane = which;
+            for t in &texts {
+                match crate::win_drop::classify_text(t) {
+                    crate::win_drop::DroppedText::Target(raw) => {
+                        self.goto_path(which, &raw);
+                    }
+                    crate::win_drop::DroppedText::Web(url) => {
+                        // 不开网页（DESIGN：不 ShellExecute），把链接交回剪贴板并说清。
+                        self.clipboard_text = Some(url.clone());
+                        self.status = format!("这是网页链接（本程序不开网页，已复制）：{url}");
+                    }
+                    crate::win_drop::DroppedText::Nothing => {}
+                }
+            }
+            if dropped.is_empty() {
+                return;
+            }
         }
 
         // 快捷方式不是"要搬进来的文件"，是"要认一下的入口"。
@@ -880,6 +922,28 @@ impl App {
                     fmnr_core::ConflictPolicy::Skip,
                     Some(&receipt),
                 );
+            }
+        }
+    }
+
+    /// 只试一次：把窗口的 OLE 拖放目标换成我们自己的，好收到文本/URL。
+    /// 失败不影响文件拖放（winit 那条还在）。
+    fn install_drop_hook(&mut self, frame: &eframe::Frame) {
+        if self.drop_hooked {
+            return;
+        }
+        self.drop_hooked = true;
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let Ok(wh) = frame.window_handle() else {
+            self.status = "拖放：拿不到窗口句柄，文本/URL 拖入不可用（文件照旧）".into();
+            return;
+        };
+        if let RawWindowHandle::Win32(h) = wh.as_raw() {
+            let ok = unsafe { crate::win_drop::install(h.hwnd.get() as *mut core::ffi::c_void) };
+            // 一次性，写进日志：真机核对"接管到底成没成"只能靠它（拖拽没法自动注入）。
+            eprintln!("fmnr: OLE 拖放接管 = {ok}（FMNR_NO_OLE_DROP 可关）");
+            if !ok {
+                self.status = "拖放：文本/URL 接管没成功，退回只收文件".into();
             }
         }
     }
@@ -2688,12 +2752,13 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // 系统剪贴板：上一帧右键"复制完整路径"攒下的文本在这里落地。
         if let Some(text) = self.clipboard_text.take() {
             ctx.copy_text(text);
         }
         self.handle_keys(ctx);
+        self.install_drop_hook(frame);
         self.handle_dropped_files(ctx);
         self.poll_running();
         self.poll_search(ctx);

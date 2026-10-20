@@ -5,4 +5,4 @@
 # 所以要放的是**拆开后的那一段**。
 [default]
 extend-words = { FOF = "FOF", FO = "FO", Pn = "Pn", Comput = "Comput", Tre = "Tre" }
-extend-identifiers = { iy = "iy", flate2 = "flate2", "85f8ba9" = "85f8ba9" }
+extend-identifiers = { iy = "iy", flate2 = "flate2", "85f8ba9" = "85f8ba9", ptd = "ptd", tymed = "tymed", hGlobal = "hGlobal" }

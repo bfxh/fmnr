@@ -1662,10 +1662,13 @@ dependencies = [
  "fmnr-share",
  "futures",
  "jwalk",
+ "raw-window-handle",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "wat",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]

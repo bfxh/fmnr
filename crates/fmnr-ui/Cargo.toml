@@ -6,6 +6,22 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# OLE 拖放（收文本/URL）。windows 包已在图里（fmnr-fs 在用），只加 feature。
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62.2"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
+    "Win32_System_DataExchange",
+    "Win32_UI_Shell",
+] }
+# 取 HWND 用；eframe 已经把它带进图，这里只是直接引用（不新增包）。
+raw-window-handle = "0.6"
 fmnr-core = { path = "../fmnr-core" }
 fmnr-fs = { path = "../fmnr-fs" }
 fmnr-icons = { path = "../fmnr-icons" }
