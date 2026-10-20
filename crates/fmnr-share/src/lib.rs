@@ -33,6 +33,11 @@ use tokio::io::AsyncWriteExt;
 /// 没有天花板等于让对面把这台机器的盘写满。
 pub const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// 无脚本那条腿（`/send`）的整单上限。它**整块进内存**再切，所以不能沿用
+/// `DEFAULT_MAX_BYTES`——那等于允许对面一句 POST 让本机缓冲 2 GiB。
+/// 这条腿是给"壳子浏览器禁了 fetch"时送文档/图片兜底的，大文件走 `/put`（流式）。
+pub const SEND_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
 /// 一个登记给手机取的件。`id` 是它在这份清单里的编号——**外部只能引用编号**。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutEntry {
@@ -257,7 +262,8 @@ pub fn page_html(token: &str, outbox: &[OutEntry]) -> String {
          <input id=f2 type=file name=f multiple>\
          <button type=submit>不用脚本发送</button></form>\
          <p class=muted>上面两个按钮同一个去处：都进电脑的收件目录，同名都让路。\
-         第二个不跑脚本，浏览器坏了 JS、套壳浏览器禁了 fetch 也能送。</p>\
+         第二个不跑脚本，浏览器坏了 JS、套壳浏览器禁了 fetch 也能送；\
+         但它要整单收进内存，所以上限低——手机拍的长视频请走第一个，它边收边写盘。</p>\
          {out}\
          <p class=muted>关掉电脑上的开关，这个链接立刻失效。</p>\
          <script>var K='{}';\
@@ -614,13 +620,18 @@ async fn send(
             "不是 multipart/form-data，这一条腿走不通。",
         );
     };
-    let max = hub.max_bytes as usize;
-    let body = match axum::body::to_bytes(req.into_body(), max).await {
+    // 整块进内存的那条腿用自己的天花板（见 `SEND_MAX_BYTES`）。
+    let cap = hub.max_bytes.min(SEND_MAX_BYTES);
+    let body = match axum::body::to_bytes(req.into_body(), cap as usize).await {
         Ok(b) => b,
         Err(_) => {
             return say(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                &format!("整单超过 {}，没收。", human_bytes(hub.max_bytes)),
+                &format!(
+                    "这一单超过 {}，没收。这条腿要整单收进内存，所以上限比另一条低：\
+                     大文件请用页面上那个「发送」按钮（它是边收边写盘的）。",
+                    human_bytes(cap)
+                ),
             )
         }
     };
@@ -632,7 +643,11 @@ async fn send(
         match ingest(hub.clone(), &raw, Box::pin(stream)).await {
             Ok(msg) => {
                 landed += 1;
-                lines.push_str(&format!("✓ {msg}<br>"));
+                // 🔴 成功分支也要转义：`msg` 里带着**落地后的文件名**，而
+                // `sanitize_name` 只挡路径/控制字符，挡不住 `<`（`<img src=x onerror=...>.txt`
+                // 是合法文件名）。上一版只转义了失败分支，而门里的载荷带 `/`，
+                // 被 sanitize 从最后一段截掉了 ⇒ 门是**碰巧绿**的。
+                lines.push_str(&format!("✓ {}<br>", html_escape(&msg)));
             }
             Err(e) => {
                 let why = e.status().as_u16();
@@ -1529,25 +1544,83 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 回执页会把文件名拼进 HTML。名字是外部输入，**必须转义**——
-    /// 否则手机侧一个 `<script>` 文件名就成了这台电脑浏览器里的脚本。
+    /// 回执页会把文件名拼进 HTML，两个分支都必须转义。
+    ///
+    /// 🔴 两个坑都在这条门里量过：
+    /// ① 上一版只转义了失败分支；成功分支是**碰巧安全**的——Windows 文件名不允许
+    ///    `< > " | ? *`，带 `<script>` 的名字根本建不出文件，于是走的是失败分支。
+    ///    换个平台（Linux）就不成立了，所以转义照加。
+    /// ② 第一版载荷 `<script>a</script>.txt` 带 `/`，被 `sanitize_name` 从最后一段截成
+    ///    `script>.txt`，载荷自己先死 ⇒ 门看着绿、其实什么都没证。
+    /// 所以这里用**Windows 合法**的 `&` 证明成功分支确实转义了，再用带 `:` 的名字
+    /// （会被 sanitize 拒）打失败分支。
     #[tokio::test]
     async fn the_receipt_page_escapes_the_reported_name() {
-        let hub = Arc::new(Hub::new(tmp("xss")));
+        let inbox = tmp("xss");
+        let hub = Arc::new(Hub::new(inbox.clone()));
         let tok = hub.token().to_string();
+        // `&` 在 Windows 文件名里合法 ⇒ 真能落地；转义后必须是 `&amp;`。
         let body = concat!(
-            "--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"<script>alert(1)</script>.txt\"\r\n\r\nx\r\n",
+            "--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a&b.txt\"\r\n\r\nx\r\n",
             "--B--\r\n",
         );
-        let (code, html) = ask_form(hub, &format!("/send?k={tok}"), body.as_bytes()).await;
+        let (code, html) = ask_form(hub.clone(), &format!("/send?k={tok}"), body.as_bytes()).await;
         assert_eq!(code, StatusCode::OK);
-        assert!(
-            !html.contains("<script>alert(1)"),
-            "回执页把文件名原样拼进了 HTML：{html}"
+        assert_eq!(
+            std::fs::read_dir(&inbox).map(|rd| rd.count()).unwrap_or(0),
+            1,
+            "载荷没落地 ⇒ 这条门证不到东西，别当它绿了"
         );
         assert!(
-            html.contains("&lt;script&gt;"),
-            "转义过的名字才该出现在页面上：{html}"
+            !html.contains("a&b.txt"),
+            "成功分支把文件名原样拼进了 HTML：{html}"
+        );
+        assert!(
+            html.contains("a&amp;b.txt"),
+            "成功分支要的是转义过的名字：{html}"
+        );
+
+        // 失败分支：带 `:` 的名字会被 sanitize 拒，而 `raw` 在这里被原样打印过。
+        let body2 = concat!(
+            "--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"<b>x</b>:bad\"\r\n\r\nx\r\n",
+            "--B--\r\n",
+        );
+        let (_, html2) = ask_form(hub, &format!("/send?k={tok}"), body2.as_bytes()).await;
+        assert!(
+            !html2.contains("<b>x"),
+            "失败分支把原样的名字拼进了 HTML：{html2}"
+        );
+        assert!(
+            html2.contains("&lt;b&gt;"),
+            "失败分支也要给转义过的名字：{html2}"
+        );
+        std::fs::remove_dir_all(&inbox).ok();
+    }
+
+    /// 这条腿的上限**不跟着** `/put` 的 2 GiB 走：它是整块进内存的。
+    /// 用真常数打一发，别让 `min(SEND_MAX_BYTES)` 写成一句注释。
+    /// （不另写 `SEND_MAX_BYTES < DEFAULT_MAX_BYTES` 那种断言：clippy 会说它是常量断言，
+    /// 而且这条行为门本身就能把三个方向的变异都判红。）
+    #[tokio::test]
+    async fn the_form_leg_has_its_own_lower_ceiling() {
+        let hub = Arc::new(Hub::new(tmp("sendcap")));
+        let tok = hub.token().to_string();
+        let req = Request::builder()
+            .uri(format!("/send?k={tok}"))
+            .method("POST")
+            .header(header::CONTENT_TYPE, "multipart/form-data; boundary=B")
+            .body(Body::from(axum::body::Bytes::from(vec![
+                b'x';
+                SEND_MAX_BYTES
+                    as usize
+                    + 1
+            ])))
+            .unwrap();
+        let res = router(hub).oneshot(req).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "超过这条腿的上限要当场拒，不许先缓冲下来"
         );
     }
 

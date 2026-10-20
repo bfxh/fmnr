@@ -1219,13 +1219,22 @@ SMB 客户端：未证**，要用户在手机上验（入口 / 能否用 Windows
 - 多部分体是仓内手写的严格解析器：分隔符必须成行（串首或紧跟 CRLF）**且**尾随 CRLF/`--`，
   看不懂的形状当场停不猜；收尾截断只丢最后那块。**不引 `multipart` crate**（它的 default-on
   feature 会拖进 `multer`）。`/send` 是整块进内存（给小文档兜底），`/put` 才是流式 —— 这条
-  差异写在函数注释里，天花板仍由 `max_bytes` 卡在解析之前。
-- 顺手抓到一个自伤：回执页把**文件名原样拼进 HTML**，`<script>alert(1)</script>.txt`
-  就成了这台电脑浏览器里的脚本。已 `html_escape` 并补门。
+  差异写在函数注释里。**天花板分开**：`/send` 取 `min(hub.max_bytes, SEND_MAX_BYTES=64 MiB)`
+  ——原来跟 `/put` 共用 2 GiB，那等于允许对面一句 POST 让本机缓冲 2 GiB；
+  页面把"长视频走第一个按钮"直接写出来。
+- 顺手抓到一个自伤：回执页把**文件名原样拼进 HTML**。已 `html_escape` 并补门。
+  🔴 **上一版这条写重了，此处更正**（原文说"`<script>alert(1)</script>.txt` 就成了这台电脑
+  浏览器里的脚本"）：① 回执页是**手机浏览器**在渲染，不是电脑；② Windows 文件名不允许
+  `< > " | ? *`，带 `<script>` 的名字根本建不出文件 ⇒ 成功分支在本机是**碰巧安全**的
+  （换 Linux 就不成立，所以转义照加）。真正可被利用的是**失败分支**：名字被 sanitize 拒
+  （如带 `:`）时原样打印，那才是能在手机浏览器里跑起来的一条。
+  🔴 而且第一版门是**碰巧绿**的：载荷 `<script>a</script>.txt` 带 `/`，被 `sanitize_name`
+  取最后一段截成 `script>.txt`，载荷自己先死了。现在的门用 Windows 合法的 `&`
+  证成功分支（`a&b.txt` → `a&amp;b.txt`），用带 `:` 的 `<b>x</b>:bad` 打失败分支。
 
-### 28-3 这轮新加的 18 把锁
+### 28-3 这轮新加的 19 把锁
 
-`fmnr-share` 14 → 32 条。新增的都是行为门不是尺：单块/两块/长分隔符/伪分隔符/前言/
+`fmnr-share` 14 → 33 条。新增的都是行为门不是尺：单块/两块/长分隔符/伪分隔符/前言/
 收尾截断/空 `filename`/非 multipart/无 token/路径穿越/整单超上限/**真 socket 上的表单**/
 页面静态断言（enctype、action 带 token、文件框有 `name=`）/回执页转义。
 另有 3 条纯函数门直接打 `parse_multipart`（多行体不被提前切开、长边界推进量、非法尾随）。
@@ -1252,9 +1261,9 @@ SMB 客户端：未证**，要用户在手机上验（入口 / 能否用 Windows
 
 ### 28-5 门与尺（含一次对账）
 
-- `scripts/gate.sh` 五步全绿；各 suite `passed` 之和 **548 → 566（+18）**。
+- `scripts/gate.sh` 五步全绿；各 suite `passed` 之和 **548 → 567（+19）**。
   这轮**没有凭记录**：把 `ca9072b` 单独 `git worktree` 到 `D:/tmp/head_check`
-  复跑一遍 `cargo test --workspace`，独立计数就是 **548**；差值 18 与
+  复跑一遍 `cargo test --workspace`，独立计数就是 **548**；差值 19 与
   `git diff -- crates/fmnr-share` 里新增 `#[test]`/`#[tokio::test]` 属性数一致。
   临时 worktree 与 `head_check_target` 已删（`git worktree list` 回到 2 项）。
 - 依赖账：`git status` 只有两个源文件 + 三份文档，`Cargo.lock` **零改动** ⇒ 第三方净增 0。
