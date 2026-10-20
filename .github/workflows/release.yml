@@ -121,7 +121,7 @@ jobs:
           # 随包说明：装在哪、插件放哪、怎么起 MCP。文案在仓库里可评审，不埋在 YAML 里。
           cp packaging/RUNNING.md out/RUNNING.md
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bins-${{ matrix.os }}
           path: out/
