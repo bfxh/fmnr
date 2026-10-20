@@ -141,6 +141,10 @@ pub struct App {
     /// 默认**不勾**：不勾就只绑回环，手机连不上——那是"这台机器自己看看"的档位。
     /// 勾上意味着同一局域网里的别的机器能访问这个端口，所以它是一句要用户做的决定。
     share_lan: bool,
+    /// 两栏与各自**栏头**的屏幕矩形（上一帧画的）。外部拖放落地时用它判断
+    /// "掉在栏头还是列表上、掉进哪一栏"——拖放事件只给路径，不给落点语义。
+    pane_rects: [egui::Rect; 2],
+    pane_head_rects: [egui::Rect; 2],
     /// 常驻设置：开关状态、局域网、上次绑上的端口、那把 token。落盘在 `share.json`。
     /// `enabled` 就是那颗开/关按钮——开着 = 下次启动自己开，端口与 token 不变。
     share_prefs: fmnr_share::config::Prefs,
@@ -197,6 +201,24 @@ enum ViewMode {
 enum Pane {
     Left,
     Right,
+}
+
+/// 两栏的矩形数组按这个下标存。写死成 0/1 是为了让 `drop_intent` 能当纯函数测。
+fn pane_index(p: Pane) -> usize {
+    match p {
+        Pane::Left => 0,
+        Pane::Right => 1,
+    }
+}
+
+impl Pane {
+    fn from_index(i: usize) -> Pane {
+        if i == 1 {
+            Pane::Right
+        } else {
+            Pane::Left
+        }
+    }
 }
 
 /// 右侧停靠区当前放哪一个工作区视图。
@@ -493,6 +515,8 @@ impl App {
             share: None,
             share_open: false,
             share_lan: false,
+            pane_rects: [egui::Rect::NOTHING; 2],
+            pane_head_rects: [egui::Rect::NOTHING; 2],
             share_prefs: fmnr_share::config::Prefs::default(),
             share_prefs_path: PathBuf::new(),
             drives: fmnr_fs::drives::list(),
@@ -818,7 +842,31 @@ impl App {
         }
         let dropped = files;
 
-        let dest = self.active_path().clone();
+        // 落点语义：掉在**栏头** = 打开；掉在列表 = 拷进这一栏。
+        // 以前不管掉在哪儿都拷进活动栏——用户把文件夹拖进来想看内容，得到的是副本。
+        let pointer = ctx.input(|i| i.pointer.hover_pos());
+        let intent = drop_intent(
+            pointer,
+            &self.pane_rects,
+            &self.pane_head_rects,
+            self.active_pane,
+        );
+        let which = match intent {
+            DropIntent::Open(i) | DropIntent::Copy(i) => Pane::from_index(i),
+        };
+        // 落点那一栏成为当前栏：接下来所有操作都跟着指针走，而不是"我上次点过哪"。
+        self.active_pane = which;
+
+        if let DropIntent::Open(_) = intent {
+            if dropped.len() == 1 {
+                self.open_dropped(which, &dropped[0]);
+                return;
+            }
+            // 栏头只收一个路径。多项还按拷贝走——静默只打开第一个会丢东西。
+            self.status = "栏头只接受单个路径；多项目按拷贝处理".to_string();
+        }
+
+        let dest = self.path_of(which).clone();
         match plan_drop(&dropped, &dest) {
             DropPlan::Ignore(reason) => self.status = reason,
             DropPlan::Copy(sources) => {
@@ -834,6 +882,26 @@ impl App {
                 );
             }
         }
+    }
+
+    /// 拖到栏头的那一下：目录就进去，文件就**定位并选中**它的父目录。
+    ///
+    /// 刻意**不自动启动**拖进来的文件：拖一个 `.exe` 过来就运行，等于把
+    /// "误拖"变成"执行任意程序"。要看内容双击即可，语义边界在界面上写得清。
+    fn open_dropped(&mut self, which: Pane, path: &Path) {
+        if path.is_dir() {
+            self.goto_path(which, &path.to_string_lossy());
+            self.status = format!("已打开 {}", path.display());
+            return;
+        }
+        let parent = path.parent().unwrap_or(path);
+        self.goto_path(which, &parent.to_string_lossy());
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string());
+        match which {
+            Pane::Left => self.left_selected = name.clone(),
+            Pane::Right => self.right_selected = name.clone(),
+        }
+        self.status = format!("已定位 {}", path.display());
     }
 
     /// 打开一个条目：目录在当前栏进入，文件走外部程序（内部会先试预览）。
@@ -2870,8 +2938,10 @@ impl eframe::App for App {
                 let avail = ui.available_size();
                 let half = avail.x / 2.0;
                 ui.horizontal_top(|ui| {
-                    self.pane(ui, Pane::Left, half);
-                    self.pane(ui, Pane::Right, half);
+                    let l = self.pane(ui, Pane::Left, half);
+                    let r = self.pane(ui, Pane::Right, half);
+                    // 下一帧外部拖放落地时要用这两个矩形判断"掉进哪一栏、掉在栏头还是列表"。
+                    self.pane_rects = [l, r];
                 });
             });
         }
@@ -4276,12 +4346,15 @@ impl App {
     ///
     /// 整行可点。原来只有文件名那几个像素是 `selectable_label` 的命中区，
     /// 点图标或行尾空白没有反应，可那一行看上去明明是一整条。
-    fn pane(&mut self, ui: &mut egui::Ui, which: Pane, width: f32) {
+    fn pane(&mut self, ui: &mut egui::Ui, which: Pane, width: f32) -> egui::Rect {
         let path = self.path_of(which).clone();
+        let idx = pane_index(which);
+        let mut drawn = egui::Rect::NOTHING;
 
         ui.push_id(which, |ui| {
             ui.vertical(|ui| {
                 ui.set_width(width);
+                let head_top = ui.cursor().min;
 
                 // 栏头：活动栏是实心点 + 强调色。用 Tab 在两栏间切换时，
                 // 这是唯一说明"现在操作的是哪一边"的可见信号。
@@ -4430,6 +4503,12 @@ impl App {
                         }
                     });
                 }
+                // 栏头 = 分隔线以上的整块（路径行 + 面包屑 + 过滤框 + 提示）。
+                // 拖放掉在这块里 = "打开"；掉在线以下 = "拷进来"。
+                self.pane_head_rects[idx] = egui::Rect::from_min_max(
+                    head_top,
+                    egui::pos2(ui.min_rect().right(), ui.min_rect().bottom()),
+                );
                 ui.separator();
 
                 // 列视图
@@ -4731,8 +4810,10 @@ impl App {
                     };
                     ui.label(egui::RichText::new(msg).weak());
                 }
+                drawn = ui.min_rect();
             });
         });
+        drawn
     }
 
     fn render_preview(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -4772,6 +4853,42 @@ impl App {
             }
         }
     }
+}
+
+/// 外部拖放掉在哪儿、要干什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropIntent {
+    /// 掉在栏头：打开（目录=进入，文件=定位并选中）。带的是栏下标。
+    Open(usize),
+    /// 掉在列表/空白处：拷进这一栏。带的是栏下标。
+    Copy(usize),
+}
+
+/// 拖放落点判定。**纯函数**，因为拖拽没法在 headless 里注入——只能把规则
+/// 钉在单测上，接线那半靠真窗口（见 §34 的诚实说明）。
+///
+/// 规则只有三条：
+/// 1. 栏头优先：它本来就在栏矩形里，但它要的是"打开"，不是"拷进来"；
+/// 2. 掉了两栏之外（比如落在侧栏/停靠区）⇒ 仍然按**活动栏**拷贝——
+///    这是原来的行为，不因为有了新落点就把它弄丢；
+/// 3. 拿不到指针（键盘触发/坐标缺失）⇒ 活动栏拷贝。
+fn drop_intent(
+    pointer: Option<egui::Pos2>,
+    panes: &[egui::Rect; 2],
+    heads: &[egui::Rect; 2],
+    active: Pane,
+) -> DropIntent {
+    let active = pane_index(active);
+    let Some(p) = pointer else {
+        return DropIntent::Copy(active);
+    };
+    if let Some(i) = (0..2).find(|&i| heads[i].contains(p)) {
+        return DropIntent::Open(i);
+    }
+    if let Some(i) = (0..2).find(|&i| panes[i].contains(p)) {
+        return DropIntent::Copy(i);
+    }
+    DropIntent::Copy(active)
 }
 
 /// 一次拖放该怎么处理。
@@ -6790,6 +6907,97 @@ mod share_bind_tests {
             App::share_bind_target(false, Some(ip)).unwrap(),
             ("127.0.0.1".to_string(), false),
             "没勾局域网就不该绑到对外地址上——哪怕量到了 IP"
+        );
+    }
+}
+
+#[cfg(test)]
+mod drop_intent_tests {
+    use super::*;
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h))
+    }
+
+    fn panes() -> [egui::Rect; 2] {
+        [rect(0.0, 0.0, 100.0, 400.0), rect(100.0, 0.0, 100.0, 400.0)]
+    }
+
+    fn heads() -> [egui::Rect; 2] {
+        [rect(0.0, 0.0, 100.0, 40.0), rect(100.0, 0.0, 100.0, 40.0)]
+    }
+
+    /// 栏头在栏矩形里，语义却是"打开"——优先级不能反。
+    #[test]
+    fn the_header_wins_over_the_list_below_it() {
+        assert_eq!(
+            drop_intent(
+                Some(egui::pos2(50.0, 20.0)),
+                &panes(),
+                &heads(),
+                Pane::Right
+            ),
+            DropIntent::Open(0)
+        );
+        assert_eq!(
+            drop_intent(
+                Some(egui::pos2(150.0, 20.0)),
+                &panes(),
+                &heads(),
+                Pane::Left
+            ),
+            DropIntent::Open(1)
+        );
+    }
+
+    /// 掉在列表上：拷进**指针所在的**那一栏，而不是上次点过的那栏。
+    #[test]
+    fn the_list_copies_into_the_pane_under_the_pointer() {
+        assert_eq!(
+            drop_intent(
+                Some(egui::pos2(150.0, 200.0)),
+                &panes(),
+                &heads(),
+                Pane::Left
+            ),
+            DropIntent::Copy(1)
+        );
+        assert_eq!(
+            drop_intent(
+                Some(egui::pos2(10.0, 300.0)),
+                &panes(),
+                &heads(),
+                Pane::Right
+            ),
+            DropIntent::Copy(0)
+        );
+    }
+
+    /// 两栏之外（侧栏、停靠区、窗外）与"没有指针"，都退回活动栏拷贝——这是老行为。
+    #[test]
+    fn outside_or_without_a_pointer_falls_back_to_the_active_pane() {
+        assert_eq!(
+            drop_intent(
+                Some(egui::pos2(900.0, 500.0)),
+                &panes(),
+                &heads(),
+                Pane::Right
+            ),
+            DropIntent::Copy(1)
+        );
+        assert_eq!(
+            drop_intent(None, &panes(), &heads(), Pane::Left),
+            DropIntent::Copy(0)
+        );
+    }
+
+    /// 第一帧还没画，两栏矩形都是 `NOTHING`；这时**不许**判成"打开"。
+    #[test]
+    fn before_the_first_frame_nothing_is_treated_as_open() {
+        let empty = [egui::Rect::NOTHING; 2];
+        assert_eq!(
+            drop_intent(Some(egui::pos2(10.0, 10.0)), &empty, &empty, Pane::Left),
+            DropIntent::Copy(0)
         );
     }
 }
