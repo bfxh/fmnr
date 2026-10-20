@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 /// 一次拖放里我们认得的两种载荷。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))] // Files 只有 Windows 的 OLE 路径会构造
 pub enum DropItem {
     Files(Vec<PathBuf>),
     /// 文本或 URI-list（浏览器拖链接时通常两样都给，优先取 uri-list）。
@@ -34,20 +35,6 @@ pub fn take() -> Vec<DropItem> {
     }
 }
 
-/// 逃生开关：想回到 winit 原生拖放（只收文件）时设 `FMNR_NO_OLE_DROP=1`。
-pub fn enabled_by_env() -> bool {
-    std::env::var_os("FMNR_NO_OLE_DROP").is_none()
-}
-
-fn push_all(items: Vec<DropItem>) {
-    if items.is_empty() {
-        return;
-    }
-    if let Ok(mut q) = queue().lock() {
-        q.extend(items);
-    }
-}
-
 #[cfg(not(windows))]
 pub unsafe fn install(_hwnd: *mut core::ffi::c_void) -> bool {
     false
@@ -55,7 +42,7 @@ pub unsafe fn install(_hwnd: *mut core::ffi::c_void) -> bool {
 
 #[cfg(windows)]
 mod imp {
-    use super::{enabled_by_env, push_all, DropItem};
+    use super::{queue, DropItem};
     use std::path::PathBuf;
     use std::sync::OnceLock;
 
@@ -75,6 +62,20 @@ mod imp {
     /// 标准剪贴板格式（Win32 ABI 常量，几十年没变）。
     const CF_UNICODETEXT: u16 = 13;
     const CF_HDROP: u16 = 15;
+
+    /// 逃生开关：想回到 winit 原生拖放（只收文件）时设 `FMNR_NO_OLE_DROP=1`。
+    fn enabled_by_env() -> bool {
+        std::env::var_os("FMNR_NO_OLE_DROP").is_none()
+    }
+
+    fn push_all(items: Vec<DropItem>) {
+        if items.is_empty() {
+            return;
+        }
+        if let Ok(mut q) = queue().lock() {
+            q.extend(items);
+        }
+    }
 
     #[implement(IDropTarget)]
     struct Target;
