@@ -55,3 +55,25 @@ opt-level = 2
 lto = true
 codegen-units = 1
 strip = true
+
+# ---------------------------------------------------------------------------
+# 构建缓存（2026-10-25）
+#
+# 只设了 [profile.release]，dev/test 走 Cargo 默认 `debug = 2`（完整调试信息）。
+# 本工作区依赖树里有 egui / image / 各类解压与网络库，DWARF 会嵌进每个 rlib，
+# target/debug 会膨胀到与源码规模不成比例。
+#
+# 取舍：依赖一律不带调试信息；本仓库自己的 crate 保留行号级（debug = 1），
+# backtrace 仍有 file:line，只有「单步进依赖内部看局部变量」这一种场景会缺信息。
+# ---------------------------------------------------------------------------
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test]
+debug = 1
+
+[profile.test.package."*"]
+debug = false
