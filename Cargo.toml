@@ -42,7 +42,7 @@ eframe = { version = "0.31", default-features = false, features = [
     "x11",
 ] }
 egui_extras = { version = "0.31", features = ["image", "svg"] }
-wasmi = "0.47"
+wasmi = "2.0"
 
 # 这里刻意**不留**「将来要用的」占位依赖。原先挂着 toml / notify / image / rayon
 # 四条，没有任何成员引用（`Cargo.lock` 里查得到是 0 个），代码里也用不到——
